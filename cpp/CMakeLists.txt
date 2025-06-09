@@ -30,6 +30,9 @@ project(tensorrt_llm LANGUAGES CXX)
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
        ON)
+option(BUILD_NANOBIND
+       "Build Python bindings for C++ runtime and batch manager using NANOBIND"
+       ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -170,6 +173,7 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+add_subdirectory(${3RDPARTY_DIR}/nanobind ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
 
 # include as system to suppress warnings
 include_directories(
@@ -181,7 +185,8 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${3RDPARTY_DIR}/pybind11/include
+  ${3RDPARTY_DIR}/nanobind/include)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")

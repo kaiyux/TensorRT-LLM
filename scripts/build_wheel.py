@@ -410,7 +410,7 @@ def main(*,
         build_pyt = "OFF"
         build_pybind = "OFF"
     else:
-        targets.extend(["bindings", "th_common"])
+        targets.extend(["bindings", "nano_bindings", "th_common"])
         build_pyt = "ON"
         build_pybind = "ON"
 

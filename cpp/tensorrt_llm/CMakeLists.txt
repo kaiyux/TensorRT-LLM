@@ -274,4 +274,7 @@ if(BUILD_PYBIND)
   add_subdirectory(pybind)
 endif()
 
+add_subdirectory(nanobind)
+message(STATUS "add_subdirectory(nanobind)")
+
 add_subdirectory(plugins)
