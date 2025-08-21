@@ -110,6 +110,7 @@ fi
 
 nsys_on=""
 # nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
+
 # start the container
 srun -l --container-image=${container_image} \
         --container-name=${container_name} \
@@ -124,29 +125,28 @@ if [ -n "${trtllm_repo}" ]; then
         bash -c "cd ${trtllm_repo} && echo 'Running install operation...' && pip install -e .  " 2>&1 | tee ${full_logdir}/install.log
 fi
 
-# generate the yaml file
-srun -l --container-name=${container_name} \
+echo "Generating YAML file for workers."
+srun -l -N 1 -n 1 \
+        --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap \
-        python3 ${workdir}/gen_yaml.py --config ${full_logdir}/config.yaml \
-            --model ${model_dir} \
-            --num_ctx_servers ${num_ctx_servers} \
-            --ctx_tp_size ${ctx_tp_size} \
-            --ctx_batch_size ${ctx_batch_size} \
-            --ctx_max_num_tokens ${ctx_max_num_tokens} \
-            --ctx_max_seq_len ${ctx_max_seq_len} \
-            --ctx_free_gpu_memory_fraction ${ctx_gpu_frac} \
-            --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
-            --num_gen_servers ${num_gen_servers} \
-            --gen_tp_size ${gen_tp_size} \
-            --gen_batch_size ${gen_batch_size} \
-            --gen_max_num_tokens ${gen_max_num_tokens} \
-            --gen_max_seq_len ${gen_max_seq_len} \
-            --gen_gpu_memory_fraction ${gen_gpu_memory_fraction} \
-            --eplb_num_slots ${eplb_num_slots} \
-            $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
-            $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
-            $(if [ "${mtp_size}" -gt 0 ]; then echo "--mtp_size ${mtp_size}"; fi)
+        python3 ${workdir}/gen_yaml.py \
+                --work_dir ${full_logdir} \
+                --ctx_tp_size ${ctx_tp_size} \
+                --ctx_batch_size ${ctx_batch_size} \
+                --ctx_max_num_tokens ${ctx_max_num_tokens} \
+                --ctx_max_seq_len ${ctx_max_seq_len} \
+                --ctx_free_gpu_memory_fraction ${ctx_gpu_frac} \
+                --gen_tp_size ${gen_tp_size} \
+                --gen_batch_size ${gen_batch_size} \
+                --gen_max_num_tokens ${gen_max_num_tokens} \
+                --gen_max_seq_len ${gen_max_seq_len} \
+                --gen_gpu_memory_fraction ${gen_gpu_memory_fraction} \
+                --eplb_num_slots ${eplb_num_slots} \
+                --mtp_size ${mtp_size} \
+                --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
+                $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
+                $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi)
 
 echo "YAML file generated."
 
@@ -155,17 +155,45 @@ echo "server host name: $hostname_value"
 
 
 # start the workers
-srun -l --container-name=${container_name} \
+pid_list=""
+
+# start the ctx workers
+for i in $(seq 0 $((num_ctx_servers - 1))); do
+    srun -l -N ${ctx_nodes_num} \
+        --ntasks=${ctx_tp_size} \
+        --ntasks-per-node=${gpus_per_node} \
+        --segment=${ctx_nodes_num} \
+        --container-image=${container_image} \
+        --container-name=${container_name}_ctx_${i} \
         --container-mounts=${mounts} \
-        --mpi=pmix --overlap \
-        bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${benchmark_mode} ${concurrency} ${nsys_on} &> ${full_logdir}/output_workers.log &
+        --mpi=pmix \
+        bash ${work_dir}/start_worker.sh "CTX" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_folder} \
+            &> ${full_logdir}/output_ctx_${i}.log &
+    pid_list="${pid_list} $!"
+done
+
+# start the gen workers
+for i in $(seq 0 $((num_gen_servers - 1))); do
+    srun -l -N ${gen_nodes_num} \
+        --ntasks=${gen_tp_size} \
+        --ntasks-per-node=${gpus_per_node} \
+        --segment=${gen_nodes_num} \
+        --container-image=${container_image} \
+        --container-name=${container_name}_gen_${i} \
+        --container-mounts=${mounts} \
+        --mpi=pmix \
+        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_folder} \
+            &> ${full_logdir}/output_gen_${i}.log &
+    pid_list="${pid_list} $!"
+done
 
 # start the server
-srun -l --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix --overlap -N 1 -n 1 \
-        -w ${hostname_value} \
-        bash ${workdir}/start_server.sh ${full_logdir}/config.yaml &> ${full_logdir}/output_server.log &
+srun -l --container-name=${container_name}_server \
+    --container-image=${container_image} \
+    --container-mounts=${mounts} \
+    --mpi=pmix --overlap -N 1 -n 1 \
+    bash ${workdir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
+        &> ${full_logdir}/output_server.log &
 
 # start benchmarking
 srun -l --container-name=${container_name} \
