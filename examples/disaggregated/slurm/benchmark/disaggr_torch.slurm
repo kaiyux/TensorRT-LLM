@@ -151,26 +151,33 @@ srun -l -N 1 -n 1 \
 
 echo "YAML file generated."
 
-# start the workers
+ctx_nodes_num=$(((ctx_tp_size + gpus_per_node - 1) / gpus_per_node))
+gen_nodes_num=$(((gen_tp_size + gpus_per_node - 1) / gpus_per_node))
+
+all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
+total_nodes_num=${#all_nodes[@]}
+echo "all_nodes: ${all_nodes[@]}, total_nodes_num: ${total_nodes_num}"
+
+# get the node list for the gen workers
+total_gen_nodes_num=$((gen_nodes_num * num_gen_servers))
+gen_nodes=(${all_nodes[@]:0:${total_gen_nodes_num}})
+echo "gen_nodes: ${gen_nodes[@]}, total_gen_nodes_num: ${total_gen_nodes_num}"
+
+# get the node list for the ctx workers
+total_ctx_nodes_num=$((ctx_nodes_num * num_ctx_servers))
+ctx_nodes=(${all_nodes[@]:${total_gen_nodes_num}:${total_nodes_num}})
+echo "ctx_nodes: ${ctx_nodes[@]}, total_ctx_nodes_num: ${total_ctx_nodes_num}"
+
 pid_list=""
 
-# start the ctx workers
-for i in $(seq 0 $((num_ctx_servers - 1))); do
-    srun -l -N ${ctx_nodes_num} \
-        --ntasks=${ctx_tp_size} \
-        --ntasks-per-node=${gpus_per_node} \
-        --segment=${ctx_nodes_num} \
-        --container-image=${container_image} \
-        --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix \
-        bash ${work_dir}/start_worker.sh "CTX" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_folder} \
-            &> ${full_logdir}/output_ctx_${i}.log &
-    pid_list="${pid_list} $!"
-done
+rm -rf ${full_logdir}/hostnames
 
+node_list_start=0
 # start the gen workers
 for i in $(seq 0 $((num_gen_servers - 1))); do
+    node_list_start=$((i * gen_nodes_num))
+    node_list=(${gen_nodes[@]:${node_list_start}:${gen_nodes_num}})
+    echo "gen node_list index ${i}: ${node_list[@]}"
     srun -l -N ${gen_nodes_num} \
         --ntasks=${gen_tp_size} \
         --ntasks-per-node=${gpus_per_node} \
@@ -178,11 +185,33 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${mounts} \
+        --nodelist=$(IFS=,; echo "${node_list[*]}") \
         --mpi=pmix \
-        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_folder} \
-            &> ${full_logdir}/output_gen_${i}.log &
+        bash ${work_dir}/start_worker.sh "GEN" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
+        &> ${full_logdir}/output_gen_${i}.log &
     pid_list="${pid_list} $!"
 done
+
+# start the ctx workers
+for i in $(seq 0 $((num_ctx_servers - 1))); do
+    node_list_start=$((i * ctx_nodes_num))
+    node_list=(${ctx_nodes[@]:${node_list_start}:${ctx_nodes_num}})
+    echo "ctx node_list index ${i}: ${node_list[@]}"
+    srun -l -N ${ctx_nodes_num} \
+        --ntasks=${ctx_tp_size} \
+        --ntasks-per-node=${gpus_per_node} \
+        --segment=${ctx_nodes_num} \
+        --container-image=${container_image} \
+        --container-name=${container_name} \
+        --container-mounts=${mounts} \
+        --nodelist=$(IFS=,; echo "${node_list[*]}") \
+        --mpi=pmix \
+        bash ${work_dir}/start_worker.sh "CTX" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
+            &> ${full_logdir}/output_ctx_${i}.log &
+    pid_list="${pid_list} $!"
+done
+
+echo "pid_list: ${pid_list}"
 
 # start the server
 srun -l --container-name=${container_name} \
