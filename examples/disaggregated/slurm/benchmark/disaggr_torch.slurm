@@ -76,7 +76,7 @@ gen_max_seq_len=$((isl + osl))
 ctx_gpu_frac=${ctx_gpu_memory_fraction}
 cache_transceiver_max_num_tokens=8448
 
-container_name=disaggr
+container_name=disaggregated_serving
 logdir=${workdir}/benchmark-${isl}-${osl}
 mkdir -p ${logdir}
 full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
@@ -146,13 +146,10 @@ srun -l -N 1 -n 1 \
                 --mtp_size ${mtp_size} \
                 --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
                 $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
-                $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi)
+                $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
+                2>&1 | tee ${full_logdir}/gen_yaml.log
 
 echo "YAML file generated."
-
-hostname_value=$(grep '^hostname:' ${full_logdir}/config.yaml | awk -F': ' '{print $2}')
-echo "server host name: $hostname_value"
-
 
 # start the workers
 pid_list=""
@@ -164,7 +161,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --ntasks-per-node=${gpus_per_node} \
         --segment=${ctx_nodes_num} \
         --container-image=${container_image} \
-        --container-name=${container_name}_ctx_${i} \
+        --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh "CTX" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_folder} \
@@ -179,7 +176,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --ntasks-per-node=${gpus_per_node} \
         --segment=${gen_nodes_num} \
         --container-image=${container_image} \
-        --container-name=${container_name}_gen_${i} \
+        --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix \
         bash ${workdir}/start_worker.sh "GEN" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_folder} \
@@ -188,7 +185,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
 done
 
 # start the server
-srun -l --container-name=${container_name}_server \
+srun -l --container-name=${container_name} \
     --container-image=${container_image} \
     --container-mounts=${mounts} \
     --mpi=pmix --overlap -N 1 -n 1 \
