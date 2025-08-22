@@ -42,6 +42,8 @@ model_dir=${23}
 benchmark_mode=${24}
 trtllm_repo=${25}
 
+gpus_per_node=4
+
 echo "================= parameters ================="
 echo "num_ctx_servers: ${num_ctx_servers}"
 echo "ctx_tp_size: ${ctx_tp_size}"
@@ -187,7 +189,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-mounts=${mounts} \
         --nodelist=$(IFS=,; echo "${node_list[*]}") \
         --mpi=pmix \
-        bash ${work_dir}/start_worker.sh "GEN" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
+        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
         &> ${full_logdir}/output_gen_${i}.log &
     pid_list="${pid_list} $!"
 done
@@ -206,7 +208,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-mounts=${mounts} \
         --nodelist=$(IFS=,; echo "${node_list[*]}") \
         --mpi=pmix \
-        bash ${work_dir}/start_worker.sh "CTX" ${i} ${model_path} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
+        bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
             &> ${full_logdir}/output_ctx_${i}.log &
     pid_list="${pid_list} $!"
 done
@@ -218,7 +220,7 @@ srun -l --container-name=${container_name} \
     --container-image=${container_image} \
     --container-mounts=${mounts} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
+    bash ${workdir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${workdir} \
         &> ${full_logdir}/output_server.log &
 
 # start benchmarking
