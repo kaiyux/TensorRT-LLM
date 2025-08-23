@@ -14,7 +14,7 @@ work_dir=$8
 nsys_folder=${9:-}
 
 unset UCX_TLS
-echo "config_file: ${config_file}, concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
+echo "concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 
 export TLLM_LOG_LEVEL=INFO
