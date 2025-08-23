@@ -5,7 +5,7 @@ num_gen_servers=$2
 work_dir=$3
 script_dir=$4
 
-python3 ${script_dir}/get_server_config.py \
+python3 ${script_dir}/gen_server_config.py \
     --num_ctx_servers ${num_ctx_servers} \
     --num_gen_servers ${num_gen_servers} \
     --work_dir ${work_dir}

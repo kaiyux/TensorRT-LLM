@@ -134,7 +134,7 @@ srun -l -N 1 -n 1 \
         --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap \
-        python3 ${workdir}/gen_yaml.py \
+        python3 ${workdir}/gen_worker_config.py \
                 --work_dir ${full_logdir} \
                 --ctx_tp_size ${ctx_tp_size} \
                 --ctx_batch_size ${ctx_batch_size} \
@@ -151,7 +151,7 @@ srun -l -N 1 -n 1 \
                 --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
                 $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
                 $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
-                2>&1 | tee ${full_logdir}/gen_yaml.log
+                2>&1 | tee ${full_logdir}/gen_worker_config.log
 
 echo "YAML file generated."
 
