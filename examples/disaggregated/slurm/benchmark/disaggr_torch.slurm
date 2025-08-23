@@ -111,7 +111,7 @@ if [ "${benchmark_mode}" != "gen_only" ] && [ "${benchmark_mode}" != "e2e" ]; th
     benchmark_mode="e2e"
 fi
 
-if [ -z "${TRT_LLM_GIT_COMMIT}" ]; then
+if [ -z "${TRT_LLM_GIT_COMMIT:-}" ]; then
     export TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
 fi
