@@ -42,7 +42,8 @@ model_dir=${23}
 benchmark_mode=${24}
 trtllm_repo=${25}
 
-gpus_per_node=4
+# Get GPUs per node dynamically from SLURM
+ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
 
 echo "================= parameters ================="
 echo "num_ctx_servers: ${num_ctx_servers}"
@@ -70,6 +71,7 @@ echo "workdir: ${workdir}"
 echo "model_dir: ${model_dir}"
 echo "benchmark_mode: ${benchmark_mode}"
 echo "trtllm_repo: ${trtllm_repo}"
+echo "ntasks_per_node: ${ntasks_per_node}"
 echo "==========================================="
 
 
@@ -79,7 +81,7 @@ ctx_gpu_frac=${ctx_gpu_memory_fraction}
 cache_transceiver_max_num_tokens=8448
 
 container_name=disaggregated_serving
-logdir=${workdir}/benchmark-${isl}-${osl}
+logdir=${workdir}/slurm-${SLURM_JOB_ID}/benchmark-${isl}-${osl}
 mkdir -p ${logdir}
 full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
 
@@ -153,8 +155,8 @@ srun -l -N 1 -n 1 \
 
 echo "YAML file generated."
 
-ctx_nodes_num=$(((ctx_tp_size + gpus_per_node - 1) / gpus_per_node))
-gen_nodes_num=$(((gen_tp_size + gpus_per_node - 1) / gpus_per_node))
+ctx_nodes_num=$(((ctx_tp_size + ntasks_per_node - 1) / ntasks_per_node))
+gen_nodes_num=$(((gen_tp_size + ntasks_per_node - 1) / ntasks_per_node))
 
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
@@ -182,7 +184,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
     echo "gen node_list index ${i}: ${node_list[@]}"
     srun -l -N ${gen_nodes_num} \
         --ntasks=${gen_tp_size} \
-        --ntasks-per-node=${gpus_per_node} \
+        --ntasks-per-node=${ntasks_per_node} \
         --segment=${gen_nodes_num} \
         --container-image=${container_image} \
         --container-name=${container_name} \
@@ -201,7 +203,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
     echo "ctx node_list index ${i}: ${node_list[@]}"
     srun -l -N ${ctx_nodes_num} \
         --ntasks=${ctx_tp_size} \
-        --ntasks-per-node=${gpus_per_node} \
+        --ntasks-per-node=${ntasks_per_node} \
         --segment=${ctx_nodes_num} \
         --container-image=${container_image} \
         --container-name=${container_name} \
