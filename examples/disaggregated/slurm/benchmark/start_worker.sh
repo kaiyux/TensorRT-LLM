@@ -11,7 +11,7 @@ benchmark_mode=$5
 concurrency=$6
 enable_pdl=$7
 work_dir=$8
-nsys_folder=$9
+nsys_folder=${9:-}
 
 unset UCX_TLS
 echo "config_file: ${config_file}, concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
@@ -48,7 +48,7 @@ if [ "${SLURM_NODEID}" = "0" ]; then
 fi
 
 #check if nsys_folder is provided
-if [ -z "${nsys_folder}" ]; then
+if [ -z "${nsys_folder:-}" ]; then
     echo "nsys is not enabled, start normal flow"
     trtllm-llmapi-launch trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
 else
