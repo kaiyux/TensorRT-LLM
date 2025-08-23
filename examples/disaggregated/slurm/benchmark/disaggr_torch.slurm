@@ -7,6 +7,10 @@
 #SBATCH --job-name=${job_name} # add your job name here or specify in the sbatch command
 #SBATCH --time=02:00:00
 
+set -u
+set -e
+set -x
+
 # Context servers arguments
 num_ctx_servers=${1}
 ctx_tp_size=${2}
@@ -227,9 +231,10 @@ srun -l --container-name=${container_name} \
 
 # start benchmarking
 srun -l --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix --overlap -N 1 -n 1 \
-        bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} > ${full_logdir}/benchmark.log 2>&1
+    --container-mounts=${mounts} \
+    --mpi=pmix --overlap -N 1 -n 1 \
+    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} \
+        &> ${full_logdir}/benchmark.log 2>&1
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \

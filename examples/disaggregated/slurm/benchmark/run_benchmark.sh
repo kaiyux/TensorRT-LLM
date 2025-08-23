@@ -1,8 +1,7 @@
 #!/bin/bash
-
-# Add error handling
-set -e
 set -u
+set -e
+set -x
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 # Add parameter validation
@@ -26,7 +25,6 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-set -x
 config_file=${log_path}/server_config.yaml
 
 # check if the config file exists every 10 seconds timeout 1800 seconds

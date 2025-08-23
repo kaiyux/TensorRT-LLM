@@ -1,4 +1,7 @@
 #!/bin/bash
+set -u
+set -e
+set -x
 
 num_ctx_servers=$1
 num_gen_servers=$2
