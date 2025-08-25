@@ -176,8 +176,6 @@ total_ctx_nodes_num=$((ctx_nodes_num * num_ctx_servers))
 ctx_nodes=(${all_nodes[@]:${total_gen_nodes_num}:${total_nodes_num}})
 echo "ctx_nodes: ${ctx_nodes[@]}, total_ctx_nodes_num: ${total_ctx_nodes_num}"
 
-pid_list=""
-
 rm -rf ${full_logdir}/hostnames
 
 node_list_start=0
@@ -197,7 +195,6 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --mpi=pmix \
         bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
         &> ${full_logdir}/output_gen_${i}.log &
-    pid_list="${pid_list} $!"
 done
 
 # start the ctx workers
@@ -216,10 +213,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --mpi=pmix \
         bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
             &> ${full_logdir}/output_ctx_${i}.log &
-    pid_list="${pid_list} $!"
 done
-
-echo "pid_list: ${pid_list}"
 
 # start the server
 srun -l --container-name=${container_name} \
@@ -236,9 +230,4 @@ srun -l --container-name=${container_name} \
     bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} \
         &> ${full_logdir}/benchmark.log 2>&1
 
-# try to kill the server and workers
-srun -l --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix --overlap \
-        kill -9 $(ps aux | grep '[t]rtllm-serve' | awk '{print $2}') >/dev/null 2>&1 || true
-wait
+scancel ${SLURM_JOB_ID}
