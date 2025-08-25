@@ -178,20 +178,14 @@ echo "ctx_nodes: ${ctx_nodes[@]}, total_ctx_nodes_num: ${total_ctx_nodes_num}"
 
 rm -rf ${full_logdir}/hostnames
 
-node_list_start=0
 # start the gen workers
 for i in $(seq 0 $((num_gen_servers - 1))); do
-    node_list_start=$((i * gen_nodes_num))
-    node_list=(${gen_nodes[@]:${node_list_start}:${gen_nodes_num}})
-    echo "gen node_list index ${i}: ${node_list[@]}"
     srun -l -N ${gen_nodes_num} \
         --ntasks=${gen_tp_size} \
         --ntasks-per-node=${ntasks_per_node} \
-        --segment=${gen_nodes_num} \
         --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${mounts} \
-        --nodelist=$(IFS=,; echo "${node_list[*]}") \
         --mpi=pmix \
         bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
         &> ${full_logdir}/output_gen_${i}.log &
@@ -199,17 +193,12 @@ done
 
 # start the ctx workers
 for i in $(seq 0 $((num_ctx_servers - 1))); do
-    node_list_start=$((i * ctx_nodes_num))
-    node_list=(${ctx_nodes[@]:${node_list_start}:${ctx_nodes_num}})
-    echo "ctx node_list index ${i}: ${node_list[@]}"
     srun -l -N ${ctx_nodes_num} \
         --ntasks=${ctx_tp_size} \
         --ntasks-per-node=${ntasks_per_node} \
-        --segment=${ctx_nodes_num} \
         --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${mounts} \
-        --nodelist=$(IFS=,; echo "${node_list[*]}") \
         --mpi=pmix \
         bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
             &> ${full_logdir}/output_ctx_${i}.log &
