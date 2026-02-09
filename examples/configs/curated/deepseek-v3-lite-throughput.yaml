@@ -1,0 +1,68 @@
+# DeepSeek V3 Lite - Throughput Optimized Configuration
+# Target: B200 single GPU (178GB HBM) with NVFP4 quantization
+# Optimized for maximum throughput (tokens/second) in high-load scenarios
+#
+# Profiling Results Reference:
+# - Prefill (ISL=512, batch=32): 22,222 tok/s, TTFT=404ms
+# - Decode (ISL=128, OSL=512, batch=8): 1,311 tok/s, TPOT=5.4ms
+# - Bottleneck: Compute-bound prefill (MoE ~49% GPU time), Memory-bound decode
+#
+# Key optimizations:
+# - Large batch sizes (64-128) to maximize GPU utilization
+# - CUDA graphs with padding for efficient batching
+# - MTP speculative decoding (1 layer) for decode acceleration
+# - FP8 KV cache for maximum memory efficiency
+# - CUTLASS MoE backend for high-throughput compute
+# - Overlap scheduler enabled for 4% additional throughput
+# - Optimized stream interval for batch efficiency
+
+# Batch size configuration - large for throughput
+max_batch_size: 128
+max_num_tokens: 16384
+
+# Model loading
+trust_remote_code: true
+
+# Single GPU configuration for B200
+tensor_parallel_size: 1
+
+# CUDA Graph configuration
+# Padding enabled for efficient graph reuse across varying batch sizes
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 128
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+
+# KV Cache configuration
+# FP8 for memory efficiency - critical for large batches
+# Higher memory fraction to support large batch sizes
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.90
+
+# MoE configuration - CUTLASS for best SM100 performance
+# Low precision combine for improved NVFP4 throughput
+moe_config:
+  backend: CUTLASS
+  use_low_precision_moe_combine: true
+  max_num_tokens: 16384
+
+# NVFP4 GEMM backend selection
+# Include cutedsl for extreme performance (longer launch time acceptable for throughput)
+nvfp4_gemm_config:
+  allowed_backends: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
+
+# Scheduler configuration
+# Enable overlap scheduler for 4% additional throughput
+disable_overlap_scheduler: false
+
+# Stream interval - optimized for batch efficiency
+# Higher value reduces streaming overhead for throughput workloads
+stream_interval: 10
+
+# MTP Speculative Decoding - 1 layer for throughput optimization
+# Single layer provides good speedup with minimal overhead at high batch sizes
+# More layers would increase memory pressure with diminishing returns
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1

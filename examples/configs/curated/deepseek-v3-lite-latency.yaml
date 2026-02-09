@@ -1,0 +1,61 @@
+# DeepSeek V3 Lite - Latency Optimized Configuration
+# Target: B200 single GPU (178GB HBM) with NVFP4 quantization
+# Optimized for lowest latency on short-to-medium length requests
+#
+# Profiling Results Reference:
+# - Prefill (ISL=512, batch=32): 22,222 tok/s, TTFT=404ms
+# - Decode (ISL=128, OSL=512, batch=8): 1,311 tok/s, TPOT=5.4ms
+# - Bottleneck: Compute-bound prefill (MoE ~49% GPU time), Memory-bound decode
+#
+# Key optimizations:
+# - Small batch size (4-8) for minimal queuing latency
+# - CUDA graphs enabled for fast kernel dispatch (~22% decode speedup)
+# - FP8 KV cache for memory efficiency
+# - CUTLASS MoE backend optimized for compute-bound workloads
+# - No speculative decoding (adds latency overhead for short requests)
+# - Overlap scheduler disabled to reduce complexity
+
+# Batch size configuration - small for latency
+max_batch_size: 8
+max_num_tokens: 8192
+
+# Model loading
+trust_remote_code: true
+
+# Single GPU configuration for B200
+tensor_parallel_size: 1
+
+# CUDA Graph configuration - essential for low latency decode
+# Padding enabled for efficient graph reuse with 22% decode speedup
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+  batch_sizes: [1, 2, 4, 8]
+
+# KV Cache configuration
+# FP8 for memory efficiency on memory-bound decode phase
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.85
+
+# MoE configuration - CUTLASS backend for compute-bound workloads
+# Best performance on SM100 Blackwell architecture
+moe_config:
+  backend: CUTLASS
+  use_low_precision_moe_combine: true
+
+# NVFP4 GEMM backend selection
+# Prioritize low-latency backends
+nvfp4_gemm_config:
+  allowed_backends: ['cutlass', 'cublaslt', 'cuda_core']
+
+# Scheduler configuration
+# Disable overlap scheduler for simpler, more predictable latency
+disable_overlap_scheduler: true
+
+# Stream interval - minimal for fast response
+stream_interval: 1
+
+# No speculative decoding for latency-optimized config
+# MTP adds overhead that hurts latency for short requests
+# speculative_config: null  # Explicitly disabled

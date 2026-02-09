@@ -1,0 +1,70 @@
+# DeepSeek V3 Lite - Balanced Configuration
+# Target: B200 single GPU (178GB HBM) with NVFP4 quantization
+# Optimized for good balance between latency and throughput
+# Recommended for general-purpose deployment and mixed workloads
+#
+# Profiling Results Reference:
+# - Prefill (ISL=512, batch=32): 22,222 tok/s, TTFT=404ms
+# - Decode (ISL=128, OSL=512, batch=8): 1,311 tok/s, TPOT=5.4ms
+# - Bottleneck: Compute-bound prefill (MoE ~49% GPU time), Memory-bound decode
+#
+# Key optimizations:
+# - Medium batch size (32) balancing latency and throughput
+# - All performance optimizations enabled
+# - CUDA graphs with padding for consistent performance
+# - MTP speculative decoding (2 layers) for moderate speedup
+# - FP8 KV cache for memory efficiency
+# - CUTLASS MoE backend for best SM100 performance
+# - Overlap scheduler enabled
+# - Moderate stream interval for responsiveness
+
+# Batch size configuration - medium for balance
+max_batch_size: 32
+max_num_tokens: 12288
+
+# Model loading
+trust_remote_code: true
+
+# Single GPU configuration for B200
+tensor_parallel_size: 1
+
+# CUDA Graph configuration
+# Padding enabled for efficient graph reuse
+# Batch sizes cover common request patterns
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32]
+
+# KV Cache configuration
+# FP8 for memory efficiency with balanced memory allocation
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.88
+
+# MoE configuration - CUTLASS for best SM100 performance
+# Low precision combine enabled for NVFP4 efficiency
+moe_config:
+  backend: CUTLASS
+  use_low_precision_moe_combine: true
+  max_num_tokens: 12288
+
+# NVFP4 GEMM backend selection
+# Standard high-performance backends
+nvfp4_gemm_config:
+  allowed_backends: ['cutlass', 'cublaslt', 'cuda_core']
+
+# Scheduler configuration
+# Enable overlap scheduler for better throughput
+disable_overlap_scheduler: false
+
+# Stream interval - moderate for good responsiveness
+# Balance between streaming overhead and user experience
+stream_interval: 5
+
+# MTP Speculative Decoding - 2 layers for balanced speedup
+# Provides good decode acceleration without excessive memory overhead
+# Good tradeoff between single-request latency and batch throughput
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 2
