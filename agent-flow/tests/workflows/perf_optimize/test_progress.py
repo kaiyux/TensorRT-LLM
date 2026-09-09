@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from agent_flow.workflows.perf_optimize import progress as progress_module
 _ROLES = (
     "benchmarker",
     "projector",
+    "profiler",
     "analyzer",
     "optimizer",
     "evaluator",
@@ -180,6 +182,30 @@ def test_summary_tool_handlers_stamp_loop_position(tmp_path):
     assert entries[3]["item_id"] == "opt-001"
     for e in entries:
         assert "T" in e["timestamp"]
+
+
+def test_analyzer_reads_independent_profiler_progress(tmp_path: Path) -> None:
+    """Capture completion has its own role and remains readable on an analysis retry."""
+    path = tmp_path / "progress.yaml"
+    progress_module.init_progress_file(path)
+    ctx = progress_module.ProgressContext(path=path, current_step=3, current_round=1)
+    tools = progress_module.build_progress_tools(ctx)
+    _call(
+        _tool(tools, "profiler", "append_profiler_progress").handler,
+        {"summary": "Captured nsys; ncu unavailable. Saved round_1/profile/profile_manifest.json."},
+    )
+    ctx.current_step = 4
+    output = _call(
+        _tool(tools, "analyzer", "read_latest_progress").handler,
+        {"agent": "profiler"},
+    )
+    (entry,) = yaml.safe_load(output["content"][0]["text"])
+    assert entry["agent"] == "profiler"
+    assert entry["step"] == 3
+    assert entry["round"] == 1
+    assert "profile_manifest.json" in entry["summary"]
+    assert "attempt" not in entry
+    assert progress_module.latest_entry(path, "analyzer") is None
 
 
 def test_evaluator_tool_requires_and_records_structured_fields(tmp_path):

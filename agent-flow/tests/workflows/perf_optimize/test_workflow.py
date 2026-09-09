@@ -30,6 +30,7 @@ Workflow = workflow_module.PerfOptimizeWorkflow
 _ROLES = (
     "benchmarker",
     "projector",
+    "profiler",
     "analyzer",
     "optimizer",
     "evaluator",
@@ -164,6 +165,39 @@ def _write_baseline_result_json(baseline_dir, value: float = 100.0) -> None:
     )
 
 
+def _write_profile_capture(
+    profile_dir: Path,
+    *,
+    methods: list[str] | None = None,
+    capture_id: str = "capture-1",
+) -> None:
+    """Write a completed profiler handoff with immutable raw evidence."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    reports = {"nsys": "server_nsys.nsys-rep", "ncu": "server_ncu.ncu-rep"}
+    method_records = {}
+    for method in methods if methods is not None else ["nsys", "ncu"]:
+        report = reports[method]
+        (profile_dir / report).write_bytes(f"raw {method} capture\n".encode())
+        method_records[method] = {
+            "status": "captured",
+            "command": f"{method} profile server",
+            "artifacts": [report],
+        }
+    manifest = {
+        "schema_version": 1,
+        "capture_id": capture_id,
+        "runtime": {
+            "serve_command": "trtllm-serve model",
+            "benchmark_command": "benchmark_serving.py",
+            "config": "default",
+            "build": "b" * 40,
+            "import_path": "/repo/tensorrt_llm/__init__.py",
+        },
+        "methods": method_records,
+    }
+    (profile_dir / "profile_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def _stub_agents(
     workflow,
     *,
@@ -217,6 +251,17 @@ def _stub_agents(
         trace.append("projector")
         workflow.sol_projection_path.write_text("# SOL Projection\n", encoding="utf-8")
         _append({"step": 1, "agent": "projector", "summary": "p"})
+
+    def profiler(state):
+        trace.append("profiler")
+        profile_dir = workflow._profile_dir(state)
+        methods = task_schema.load_and_validate_task_yaml(str(workflow.task_path))["profile"][
+            "methods"
+        ]
+        _write_profile_capture(
+            profile_dir, methods=methods, capture_id=f"round-{state.round_index + 1}"
+        )
+        _append({"step": 1, "agent": "profiler", "summary": "capture complete"})
 
     def analyzer(state):
         trace.append("analyzer")
@@ -339,6 +384,7 @@ def _stub_agents(
 
     workflow._run_benchmarker = benchmarker
     workflow._run_projector = projector
+    workflow._run_profiler = profiler
     workflow._run_analyzer = analyzer
     workflow._run_optimizer = optimizer
     workflow._run_evaluator = evaluator
@@ -349,6 +395,93 @@ def _stub_agents(
 
 
 # ------------------------------------------------------- stubbed orchestration
+
+
+def test_profiler_missing_manifest_blocks_analysis_and_retries_capture(tmp_path, fake_git):
+    """An incomplete capture remains at the profiler checkpoint."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+
+    def incomplete_profiler(state):
+        trace.append("profiler")
+        (workflow._profile_dir(state) / "server_nsys.nsys-rep").write_bytes(b"partial capture")
+
+    workflow._run_profiler = incomplete_profiler
+    try:
+        with pytest.raises(RuntimeError, match="profile_manifest.json"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace == ["benchmarker", "projector", "profiler"]
+    state = state_module.load_state(workflow.state_path)
+    assert state.stage == state_module.STAGE_PROFILER
+    assert state.last_profile_dir == ""
+
+    resumed = Workflow(workspace=ws)
+    resumed_trace = _stub_agents(resumed, analyzer_items=[[]])
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert resumed_trace == ["profiler", "analyzer", "reporter"]
+    assert state_module.load_state(resumed.state_path).done is True
+
+
+@pytest.mark.parametrize("failure", ["exception", "missing_findings"])
+def test_analyzer_failure_resumes_from_preserved_capture(tmp_path, fake_git, failure):
+    """A completed capture survives analysis failure without another GPU pass."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+
+    def broken_analyzer(state):
+        trace.append("analyzer")
+        if failure == "exception":
+            raise RuntimeError("analysis interrupted")
+
+    workflow._run_analyzer = broken_analyzer
+    expected = "analysis interrupted" if failure == "exception" else "profile_findings.md"
+    try:
+        with pytest.raises(RuntimeError, match=expected):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace == ["benchmarker", "projector", "profiler", "analyzer"]
+    state = state_module.load_state(workflow.state_path)
+    assert state.stage == state_module.STAGE_ANALYZER
+    assert state.profile_required is True
+    assert state.last_profiled_analysis_dir == ""
+    capture_dir = ws / "rounds" / "round_1" / "profile"
+    assert state.last_profile_dir == str(capture_dir)
+    captures = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in capture_dir.iterdir()
+    }
+
+    resumed = Workflow(workspace=ws)
+    resumed_trace = _stub_agents(resumed, analyzer_items=[[]])
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+
+    assert resumed_trace == ["analyzer", "reporter"]
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in capture_dir.iterdir()
+    } == captures
+    completed = state_module.load_state(resumed.state_path)
+    assert completed.done is True
+    assert completed.last_profile_dir == str(capture_dir)
+    analysis_dir = ws / "rounds" / "round_1" / "analysis"
+    assert completed.last_profiled_analysis_dir == str(analysis_dir)
+    analysis_manifest = yaml.safe_load((analysis_dir / "analysis_manifest.yaml").read_text())
+    assert analysis_manifest["capture_id"] == "round-1"
+    assert analysis_manifest["profile_dir"] == "rounds/round_1/profile"
+    assert analysis_manifest["imported"] is False
 
 
 def test_happy_path_one_accepted_item(tmp_path, fake_git):
@@ -370,9 +503,11 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -535,12 +670,15 @@ def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -609,9 +747,11 @@ def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):
 
     assert trace == [
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -676,7 +816,16 @@ def test_resume_parked_at_projector_when_disabled_skips_forward(tmp_path, fake_g
     finally:
         workflow.close()
 
-    assert trace == ["analyzer", "optimizer", "evaluator", "analyzer", "qa", "reporter"]
+    assert trace == [
+        "profiler",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "profiler",
+        "analyzer",
+        "qa",
+        "reporter",
+    ]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.projector_done is False
     assert state.done is True
@@ -701,11 +850,13 @@ def test_evaluator_pushback_then_approve_retries_optimizer(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -749,6 +900,7 @@ def test_evaluator_reject_is_terminal_and_skips_final_verification(tmp_path, fak
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -788,6 +940,7 @@ def test_pushback_attempts_exhausted_marks_failed(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -833,6 +986,7 @@ def test_missing_evaluator_decision_counts_as_pushback(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -878,12 +1032,15 @@ def test_fixed_rounds_run_until_roadmap_exhausted(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -936,12 +1093,14 @@ def test_round_that_accepts_nothing_opens_the_next_one_replan_only(tmp_path, fak
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -996,6 +1155,7 @@ def test_dry_roadmap_without_accepts_replans_once_before_concluding(tmp_path, fa
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -1047,6 +1207,7 @@ def test_rejected_isolated_code_attempt_keeps_campaign_profile_current(tmp_path,
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -1074,7 +1235,15 @@ def test_a_dry_roadmap_out_of_rounds_concludes_without_another_turn(tmp_path, fa
     finally:
         workflow.close()
 
-    assert trace == ["benchmarker", "projector", "analyzer", "optimizer", "evaluator", "reporter"]
+    assert trace == [
+        "benchmarker",
+        "projector",
+        "profiler",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "reporter",
+    ]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.round_index == 1
 
@@ -1099,6 +1268,7 @@ def test_dry_roadmap_after_an_accept_respects_the_round_budget(tmp_path, fake_gi
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -1128,7 +1298,7 @@ def test_target_improvement_reached_concludes_loop(tmp_path, fake_git):
         workflow.close()
 
     # The whole selected batch runs before the target is checked.
-    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace[0:4] == ["benchmarker", "projector", "profiler", "analyzer"]
     assert trace.count("optimizer") == 2
     assert trace.count("evaluator") == 2
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
@@ -1161,7 +1331,7 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
 
     # Both items share round 1's profile; the integrated accept makes round
     # 2 profile the resulting campaign state before final verification.
-    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace[0:4] == ["benchmarker", "projector", "profiler", "analyzer"]
     assert trace.count("analyzer") == 2
     assert trace.count("optimizer") == 2
     assert trace.count("evaluator") == 2
@@ -1221,6 +1391,7 @@ def test_serial_items_reuse_worker_and_accept_directly(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -1402,6 +1573,7 @@ def test_item_and_round_budgets_cap_the_campaign(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -1438,7 +1610,7 @@ def test_rejected_item_advances_to_next_item_in_same_round(tmp_path, fake_git):
     # opt-001's REJECT is terminal (no retries despite the attempt
     # budget); the round continued with opt-002 without a fresh analyzer
     # profile.
-    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace[0:4] == ["benchmarker", "projector", "profiler", "analyzer"]
     assert trace.count("analyzer") == 2
     assert trace.count("optimizer") == 2
     assert trace.count("evaluator") == 2
@@ -1475,7 +1647,7 @@ def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace[0:4] == ["benchmarker", "projector", "profiler", "analyzer"]
     assert trace.count("optimizer") == 3
     assert trace.count("evaluator") == 3
     # The legacy campaign-wide optimizer is not used/reset; each worker owns
@@ -1513,7 +1685,7 @@ def test_no_actionable_items_goes_straight_to_reporter(tmp_path, fake_git):
 
     # Nothing actionable, nothing accepted: no optimizer, no final
     # verification — straight to the reporter.
-    assert trace == ["benchmarker", "projector", "analyzer", "reporter"]
+    assert trace == ["benchmarker", "projector", "profiler", "analyzer", "reporter"]
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "pending"
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
@@ -1550,9 +1722,11 @@ def test_exhausted_roadmap_after_accepts_still_runs_final_verification(tmp_path,
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -1591,9 +1765,11 @@ def test_restricted_run_never_dispatches_disallowed_items(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -1615,7 +1791,7 @@ def test_only_disallowed_pending_items_goes_straight_to_reporter(tmp_path, fake_
     finally:
         workflow.close()
 
-    assert trace == ["benchmarker", "projector", "analyzer", "reporter"]
+    assert trace == ["benchmarker", "projector", "profiler", "analyzer", "reporter"]
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "pending"
 
@@ -1649,6 +1825,7 @@ def test_tuning_edit_in_code_only_run_is_auto_rejected(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "optimizer",
@@ -1695,10 +1872,12 @@ def test_auto_reject_then_clean_retry_reaches_evaluator(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -1732,6 +1911,7 @@ def test_code_edit_in_config_only_run_is_auto_rejected(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "analyzer",
@@ -1756,9 +1936,11 @@ def test_clean_config_only_run_reaches_evaluator(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -1790,7 +1972,7 @@ def test_invalid_roadmap_blocks_advance(tmp_path, fake_git):
 
     # The optimizer never ran, and the checkpoint stays parked at the
     # analyzer so a re-run retries it rather than skipping ahead.
-    assert trace == ["benchmarker", "projector", "analyzer"]
+    assert trace == ["benchmarker", "projector", "profiler", "analyzer"]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.stage == state_module.STAGE_ANALYZER
     assert state.done is False
@@ -1970,7 +2152,7 @@ def test_curve_mode_validate_roadmap_rejects_point_mismatch(tmp_path, fake_git):
     finally:
         workflow.close()
     # Parked at the analyzer for a retry, like any roadmap-validation failure.
-    assert trace == ["benchmarker", "projector", "analyzer"]
+    assert trace == ["benchmarker", "projector", "profiler", "analyzer"]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.stage == state_module.STAGE_ANALYZER
 
@@ -2110,7 +2292,7 @@ def test_resume_mid_round_starts_at_evaluator(tmp_path, monkeypatch):
     finally:
         workflow.close()
 
-    assert trace == ["evaluator", "analyzer", "qa", "reporter"]
+    assert trace == ["evaluator", "profiler", "analyzer", "qa", "reporter"]
     # The seeded branch was checked out, never re-created.
     assert fake.count("checkout") == 1
     assert ("checkout", "perf-optimize/seeded") in fake.calls
@@ -2227,7 +2409,7 @@ def test_resume_redispatch_purges_stale_attempt_benchmark_results(tmp_path, monk
     finally:
         workflow.close()
 
-    assert trace == ["evaluator", "analyzer", "qa", "reporter"]
+    assert trace == ["evaluator", "profiler", "analyzer", "qa", "reporter"]
     assert not stale_point_dir.exists()
     assert not stale_json.exists()
     assert summary.is_file()
@@ -2400,62 +2582,67 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         workflow.close()
 
 
-def test_profiling_round_names_what_moved_the_build_since_the_last_analysis(tmp_path, fake_git):
-    """A round only re-profiles because something was accepted — say how much."""
+def test_full_analysis_round_reads_new_captures_and_prior_verdicts(tmp_path, fake_git):
+    """Analyzing a new runtime also incorporates previously rejected ideas."""
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     recorder = _RecordingAgent()
     workflow.analyzer = recorder
+    profile_dir = ws / "rounds" / "round_2" / "profile"
     try:
         (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
-        workflow._run_analyzer(_analyzer_state(ws, profile_required=True))
+        workflow._run_analyzer(
+            _analyzer_state(ws, profile_required=True, last_profile_dir=str(profile_dir))
+        )
         message = recorder.messages[0]
 
-        assert "**replan only**" not in message
-        assert "Re-profile the **current** build" in message
-        # Failed items are measurements too — the round should not re-propose
-        # what the evaluator already disproved.
+        assert "**offline analysis**" in message
+        assert "Source profile directory (read-only)" in message
+        assert str(profile_dir) in message
+        assert "the profiler has captured the current runtime" in message
         assert 'read_latest_progress` with `agent: "evaluator"' in message
+        assert "Do not launch servers, replay workloads, run benchmarks" in message
     finally:
         workflow.close()
 
 
-def test_profiling_round_does_not_invent_an_accept_for_unknown_runtime(tmp_path, fake_git):
-    """The conservative profile gate is distinct from the measured accept count."""
+def test_profiler_round_records_runtime_without_inventing_an_accept(tmp_path, fake_git):
+    """A conservative capture can establish provenance without accepted items."""
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     recorder = _RecordingAgent()
-    workflow.analyzer = recorder
+    workflow.profiler = recorder
     try:
         (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
-        workflow._run_analyzer(_analyzer_state(ws, profile_required=True))
+        workflow._run_profiler(_analyzer_state(ws, profile_required=True))
         message = recorder.messages[0]
 
-        assert "**replan only**" not in message
         assert "**0 item(s) have been accepted" not in message
-        assert "standing profile is stale or unproven" in message
-        assert "checkpoint has not established a current local profile" in message
-        assert "Re-profile the **current** build" in message
+        assert "actual build, import path" in message
+        assert "replay the canonical benchmark load" in message
+        assert "profile_manifest.json" in message
+        assert "tear every server down" in message
+        assert "append_profiler_progress" in message
     finally:
         workflow.close()
 
 
 def test_accept_records_last_nsys_dir_from_captures(tmp_path, fake_git):
-    """The analyzer profile, then each accept's capture, advance the pointer."""
+    """Only campaign profiler captures become the standing nsys reference."""
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(workflow)
 
-    original_analyzer = workflow._run_analyzer
+    original_profiler = workflow._run_profiler
     original_evaluator = workflow._run_evaluator
     seen_at_evaluation_time: list[str] = []
-    seen_at_analysis_time: list[str] = []
+    seen_at_capture_time: list[str] = []
 
-    def analyzer_with_capture(state):
-        seen_at_analysis_time.append(state.last_nsys_dir)
-        original_analyzer(state)
-        (workflow._analysis_dir(state) / "nsys_stats.txt").write_text("k\n", encoding="utf-8")
+    def profiler_with_capture(state):
+        seen_at_capture_time.append(state.last_nsys_dir)
+        original_profiler(state)
+        (workflow._profile_dir(state) / "nsys_stats.txt").write_text("k\n", encoding="utf-8")
 
     def evaluator_with_capture(state, **kwargs):
         seen_at_evaluation_time.append(state.last_nsys_dir)
@@ -2464,7 +2651,7 @@ def test_accept_records_last_nsys_dir_from_captures(tmp_path, fake_git):
         profile_dir.mkdir(parents=True, exist_ok=True)
         (profile_dir / "nsys_stats.txt").write_text("k\n", encoding="utf-8")
 
-    workflow._run_analyzer = analyzer_with_capture
+    workflow._run_profiler = profiler_with_capture
     workflow._run_evaluator = evaluator_with_capture
     try:
         workflow.run(str(task))
@@ -2472,14 +2659,14 @@ def test_accept_records_last_nsys_dir_from_captures(tmp_path, fake_git):
         workflow.close()
 
     assert trace[-1] == "reporter"
-    # The evaluator judged with the analyzer's round profile as reference…
-    assert seen_at_evaluation_time == [str(ws / "rounds" / "round_1" / "analysis")]
-    # Item-local captures are candidates only. The closing analyzer sees the
+    # The evaluator judged with the profiler's round capture as reference…
+    assert seen_at_evaluation_time == [str(ws / "rounds" / "round_1" / "profile")]
+    # Item-local captures are candidates only. The closing profiler sees the
     # last accepted campaign capture, then records round 2 as the freshest.
-    round_1_analysis = ws / "rounds" / "round_1" / "analysis"
-    assert seen_at_analysis_time == ["", str(round_1_analysis)]
+    round_1_profile = ws / "rounds" / "round_1" / "profile"
+    assert seen_at_capture_time == ["", str(round_1_profile)]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    expected = ws / "rounds" / "round_2" / "analysis"
+    expected = ws / "rounds" / "round_2" / "profile"
     assert state.last_nsys_dir == str(expected)
 
 
@@ -2569,7 +2756,7 @@ def test_optimizer_without_summary_blocks_advance(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    assert trace == ["benchmarker", "projector", "analyzer", "optimizer"]
+    assert trace == ["benchmarker", "projector", "profiler", "analyzer", "optimizer"]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.stage == state_module.STAGE_OPTIMIZER_EVALUATOR
     assert state.item_batch[0]["phase"] == state_module.STAGE_OPTIMIZER
@@ -2728,12 +2915,14 @@ def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
             assert layer.config.backend.kind == "claude-code", role
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL, role
             assert layer.config.backend.hooks is not None, role
-            # The judges are stateless (fresh eyes per verdict); the
+            # Captures and judges are stateless; the
             # optimizer's persistent session is additionally reset per
             # item by the orchestrator (covered by
             # test_optimizer_session_resets_at_item_boundaries_not_retries).
             expected_mode = (
-                "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
+                "stateless"
+                if role in ("profiler", "qa", "evaluator", "integrator")
+                else "persistent"
             )
             assert layer.config.session.mode == expected_mode, role
     finally:
@@ -2801,6 +2990,7 @@ def test_max_rounds_override_applies_on_fresh_run(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -2898,9 +3088,11 @@ def test_accept_survives_installed_precommit_hook(tmp_path):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -2987,6 +3179,30 @@ def _capture_driving_prompts(
             setattr(workflow, role, original)
         workflow.close()
     return captured
+
+
+def test_profiler_and_analyzer_prompts_keep_capture_and_analysis_separate(tmp_path):
+    """The handoff confines runtime capture and derived analysis to their roles."""
+    captured = _capture_driving_prompts(tmp_path)
+    profiler = captured["profiler"]
+    analyzer = captured["analyzer"]
+
+    assert "replay the canonical benchmark load" in profiler
+    assert "canonical `nsys profile` command" in profiler
+    assert "capture_preprocessing" in profiler
+    assert "select ncu targets" in profiler
+    assert "tear every server down" in profiler
+    assert "profile_manifest.json" in profiler
+    assert "append_profiler_progress" in profiler
+
+    assert "**offline analysis**" in analyzer
+    assert "Source profile directory (read-only)" in analyzer
+    assert "Analysis directory (write derived artifacts here)" in analyzer
+    assert "Do not launch servers, replay workloads, run benchmarks" in analyzer
+    assert "profile_manifest.json" in analyzer
+    assert "additional capture in findings; do not obtain it this turn" in analyzer
+    assert "append_analyzer_progress" in analyzer
+    assert "canonical `nsys profile` command" not in analyzer
 
 
 def test_driving_prompts_avoid_removed_builtin_tools(tmp_path):
@@ -3252,7 +3468,7 @@ def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
         assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
         assert "nsys export --type sqlite" in prompt
         assert "analysis/nsys_analysis" in prompt
-        assert "nsys_analysis/` directory" in prompt
+        assert "analysis/nsys_analysis/items.json" in prompt
         # Ranking a host-exposure item and a slow-kernel item needs the
         # split, not the kernel-sum table alone.
         assert "not from the `nsys stats` table alone" in prompt
@@ -3261,10 +3477,8 @@ def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
     with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
-    # The ncu deep dive is not SOL-gated — every *profiling* prompt covers
-    # the top nsys kernels under ncu with the skill as capture +
-    # interpretation methodology, saves the report next to the other
-    # traces, and the findings carry the dedicated section.
+    # Offline ncu interpretation applies with or without SOL correlation.
+    # Capture ownership stays with the profiler.
     for prompt in (without, with_sol):
         assert "perf-nsight-compute-analysis" in prompt
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
@@ -3272,11 +3486,11 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
         assert "ncu kernel analysis" in prompt
         # Roadmap items are grounded across the analyses, not the
         # timeline alone.
-        assert "nsys timeline, ncu kernel analysis" in prompt
+        assert "nsys timeline / ncu kernel analysis" in prompt
     # The SOL correlation joins the grounding list only when the
     # projector stage ran.
-    assert "nsys timeline, ncu kernel analysis, SOL correlation" not in without
-    assert "nsys timeline, ncu kernel analysis, SOL correlation" in with_sol
+    assert "nsys timeline / ncu kernel analysis / SOL correlation" not in without
+    assert "nsys timeline / ncu kernel analysis / SOL correlation" in with_sol
 
 
 def test_optimizer_retry_prompt_distinguishes_auto_reject_from_evaluator_reject(tmp_path):
@@ -3403,9 +3617,11 @@ def test_kernel_coverage_run_completes_with_valid_ledger(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -3457,6 +3673,7 @@ def test_kernel_coverage_waives_the_ledger_on_a_replan_only_round(tmp_path, fake
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -3783,12 +4000,15 @@ def test_max_items_per_round_one_reprofiles_each_item(tmp_path, fake_git):
     assert trace == [
         "benchmarker",
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -3814,6 +4034,175 @@ def _analyze_workspace(root: Path, *, baseline: bool = True, findings: bool = Tr
     return root
 
 
+def test_reanalyze_rebuilds_findings_from_imported_capture_without_profiling(tmp_path, fake_git):
+    """Fresh analyses get their own output while retaining the capture identity."""
+    source = _analyze_workspace(tmp_path / "prior")
+    _write_profile_capture(source, capture_id="original-capture")
+    original = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in source.iterdir()
+    }
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws, reuse_analysis=source, reanalyze=True)
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+    original_analyzer = workflow._run_analyzer
+    modes = []
+
+    def analyze_imported_capture(state):
+        modes.append((state.reanalyze_pending, workflow._replan_only(state)))
+        original_analyzer(state)
+        (workflow._analysis_dir(state) / "profile_findings.md").write_text(
+            "# Reanalyzed findings\n", encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyze_imported_capture
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace == ["projector", "analyzer", "reporter"]
+    assert modes == [(True, False)]
+    state = state_module.load_state(workflow.state_path)
+    assert state.done is True
+    assert state.reanalyze_pending is False
+    assert state.reuse_pending is False
+    capture_dir = Path(state.last_profile_dir)
+    assert capture_dir != source
+    manifest = json.loads((capture_dir / "profile_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["capture_id"] == "original-capture"
+    assert (capture_dir / "server_nsys.nsys-rep").read_bytes() == original["server_nsys.nsys-rep"][
+        0
+    ]
+    analysis_dir = ws / "rounds" / "round_1" / "analysis"
+    assert (analysis_dir / "profile_findings.md").read_text(
+        encoding="utf-8"
+    ) == "# Reanalyzed findings\n"
+    analysis_manifest = yaml.safe_load((analysis_dir / "analysis_manifest.yaml").read_text())
+    assert analysis_manifest["capture_id"] == "original-capture"
+    assert analysis_manifest["imported"] is True
+    assert state.last_profiled_analysis_dir == ""
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in source.iterdir()
+    } == original
+
+
+@pytest.mark.parametrize("generated_ledger", ["missing", "stale"])
+def test_reanalyze_requires_a_valid_new_kernel_ledger(tmp_path, fake_git, generated_ledger):
+    """Full reanalysis enforces its ledger even when prior findings had one."""
+    source = _analyze_workspace(tmp_path / "prior")
+    _write_profile_capture(source)
+    source_ledger = _ledger_yaml("source-opt")
+    (source / "kernel_ledger.yaml").write_text(source_ledger, encoding="utf-8")
+    roadmap_schema.save_roadmap(
+        source / "roadmap.yaml",
+        {
+            "version": 1,
+            "target_metric": "output_throughput",
+            "baseline": {"value": 100.0, "source": "benchmark_results.md"},
+            "current_best": {"value": 100.0, "source": "benchmark_results.md"},
+            "items": [_item("source-opt")],
+        },
+    )
+    task = _write_task(tmp_path, {**_KC_EXTRA, "optimize": {"max_rounds": 1}})
+    workflow = Workflow(workspace=tmp_path / "ws", reuse_analysis=source, reanalyze=True)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_invalid_ledger(state):
+        original_analyzer(state)
+        if generated_ledger == "stale":
+            (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+                source_ledger, encoding="utf-8"
+            )
+
+    workflow._run_analyzer = analyzer_with_invalid_ledger
+    try:
+        with pytest.raises(RuntimeError, match="kernel_ledger.yaml"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace == ["projector", "analyzer"]
+    state = state_module.load_state(workflow.state_path)
+    assert state.stage == state_module.STAGE_ANALYZER
+    assert state.reanalyze_pending is True
+    assert state.reuse_pending is False
+    assert state.done is False
+    assert not (workflow._analysis_dir(state) / "analysis_manifest.yaml").exists()
+
+
+def test_reanalyze_failure_resumes_offline_from_imported_capture(tmp_path, fake_git):
+    """Resume retains imported provenance without recapturing or reimporting."""
+    source = _analyze_workspace(tmp_path / "prior")
+    _write_profile_capture(source, capture_id="original-capture")
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws, reuse_analysis=source, reanalyze=True)
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+
+    def interrupted_analyzer(state):
+        trace.append("analyzer")
+        raise RuntimeError("reanalysis interrupted")
+
+    workflow._run_analyzer = interrupted_analyzer
+    try:
+        with pytest.raises(RuntimeError, match="reanalysis interrupted"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace == ["projector", "analyzer"]
+    interrupted = state_module.load_state(workflow.state_path)
+    assert interrupted.stage == state_module.STAGE_ANALYZER
+    assert interrupted.reanalyze_pending is True
+    capture_dir = Path(interrupted.last_profile_dir)
+    captures = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in capture_dir.iterdir()
+        if path.is_file()
+    }
+    source.rename(tmp_path / "archived-prior")
+
+    resumed = Workflow(workspace=ws)
+    resumed_trace = _stub_agents(resumed, analyzer_items=[[]])
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+
+    assert resumed_trace == ["analyzer", "reporter"]
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in capture_dir.iterdir()
+        if path.is_file()
+    } == captures
+    completed = state_module.load_state(resumed.state_path)
+    assert completed.done is True
+    assert completed.reanalyze_pending is False
+    assert completed.last_profile_dir == str(capture_dir)
+    assert completed.last_profiled_analysis_dir == ""
+    analysis_manifest = yaml.safe_load(
+        (ws / "rounds" / "round_1" / "analysis" / "analysis_manifest.yaml").read_text()
+    )
+    assert analysis_manifest["capture_id"] == "original-capture"
+    assert analysis_manifest["imported"] is True
+
+
+def test_reanalyze_rejects_findings_without_raw_capture(tmp_path, fake_git):
+    """Reanalysis cannot silently degrade into replanning from old findings."""
+    source = _analyze_workspace(tmp_path / "prior")
+    task = _write_task(tmp_path)
+    workflow = Workflow(workspace=tmp_path / "ws", reuse_analysis=source, reanalyze=True)
+    trace = _stub_agents(workflow)
+    try:
+        with pytest.raises(workflow_module.reuse.ReuseError, match="raw|capture"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace == []
+
+
 def test_reuse_analysis_starts_the_campaign_at_the_optimize_stage(tmp_path, fake_git):
     """The imported baseline + findings replace the two GPU stages."""
     source = _analyze_workspace(tmp_path / "prior")
@@ -3833,6 +4222,7 @@ def test_reuse_analysis_starts_the_campaign_at_the_optimize_stage(tmp_path, fake
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -3848,8 +4238,8 @@ def test_reuse_analysis_starts_the_campaign_at_the_optimize_stage(tmp_path, fake
     assert state.reuse_analysis_dir == str(source)
     # Consumed by round 1's analyzer, so a resume never re-plans blind.
     assert state.reuse_pending is False
-    # The imported profile is the freshest trace of the state under test.
-    assert state.last_nsys_dir == str(analysis)
+    # The accepted change earns a new capture after imported round 1.
+    assert state.last_nsys_dir == str(ws / "rounds" / "round_2" / "profile")
 
 
 def test_a_reuse_campaign_that_accepts_nothing_still_profiles_its_own_build(tmp_path, fake_git):
@@ -3921,9 +4311,11 @@ def test_reuse_without_findings_profiles_normally(tmp_path, fake_git):
 
     assert trace == [
         "projector",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
+        "profiler",
         "analyzer",
         "qa",
         "reporter",
@@ -4509,31 +4901,31 @@ def test_no_items_json_means_no_coverage_owed(tmp_path, fake_git):
 
 
 # --------------------------------------------------------------------------- #
-# profile.profile_ranks reaches the analyzer's driving instruction: the
+# profile.profile_ranks reaches the profiler's driving instruction: the
 # stateless agent should not have to re-derive which ranks to capture, and the
 # multi-rank case has to arrive as a duty rather than an option.
 # --------------------------------------------------------------------------- #
 
 
 def test_default_driving_prompt_asks_for_rank_zero_only(tmp_path):
-    analyzer = _capture_driving_prompts(tmp_path)["analyzer"]
-    assert "rank 0 only" in analyzer
+    profiler = _capture_driving_prompts(tmp_path)["profiler"]
+    assert "rank 0 only" in profiler
     # And says plainly that the imbalance step does not apply, rather than
     # leaving the agent to report a spread it could not measure.
-    assert "rank-jitter step does not apply" in analyzer
+    assert "rank-jitter step does not apply" in profiler
 
 
 def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
-    analyzer = _capture_driving_prompts(
+    profiler = _capture_driving_prompts(
         tmp_path, {"profile": {"methods": ["nsys", "ncu"], "profile_ranks": [0, 4]}}
-    )["analyzer"]
-    assert "ranks 0, 4" in analyzer
-    assert "one trace per rank" in analyzer
+    )["profiler"]
+    assert "ranks 0, 4" in profiler
+    assert "one trace per rank" in profiler
     # Only the listed ranks are wrapped — a profiler-slowed rank would
     # otherwise register as jitter the others wait on.
-    assert "only these ranks are wrapped" in analyzer
-    assert "Step 0 survey" in analyzer
-    assert "straggler verdict" in analyzer
+    assert "only these ranks are wrapped" in profiler
+    assert "Step 0 survey" in profiler
+    assert "straggler verdict" in profiler
 
 
 # ------------------------------------------------------------- headroom ledger
@@ -4843,7 +5235,7 @@ def test_headroom_driving_prompts_name_the_ledger_and_the_bracket(tmp_path):
         (False, 32, None, "scalar mode: one replay at the configured concurrency"),
     ],
 )
-def test_analyzer_driving_prompt_selects_effective_profiling_points(
+def test_profiler_driving_prompt_selects_effective_profiling_points(
     tmp_path: Path,
     headroom: bool,
     concurrency: int | list[int],
@@ -4863,8 +5255,8 @@ def test_analyzer_driving_prompt_selects_effective_profiling_points(
         extra["profile"] = {"kernel_coverage": {}, "headroom_ledger": {}}
     if focus is not None:
         extra["optimize"] = {"focus_concurrencies": focus}
-    analyzer = _capture_driving_prompts(tmp_path, extra)["analyzer"]
-    replay = analyzer.split("replay the canonical benchmark load", 1)[1].split(", and drive", 1)[0]
+    profiler = _capture_driving_prompts(tmp_path, extra)["profiler"]
+    replay = profiler.split("replay the canonical benchmark load", 1)[1].split(", and drive", 1)[0]
     assert expected in replay
     if headroom:
         assert "once per distinct point" in replay

@@ -60,6 +60,7 @@ OPTIMIZATION_STAGE = "optimization"
 _AGENTS = (
     "benchmarker",
     "projector",
+    "profiler",
     "analyzer",
     "optimizer",
     "evaluator",
@@ -448,11 +449,18 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         "mapping, the headline SOL ceiling and the baseline-vs-SOL gap (or "
         "the unavailability reason), and the files you wrote.",
     )
+    append_profiler_progress = _make_summary_tool(
+        "profiler",
+        "Short human-readable summary: which profilers you ran, the trace "
+        "files and profile_manifest.json produced, runtime provenance, "
+        "capture coverage and unavailable passes, and server cleanup.",
+    )
     append_analyzer_progress = _make_summary_tool(
         "analyzer",
-        "Short human-readable summary: which profilers you ran, the trace "
-        "files produced, and the roadmap items you added / reordered / "
-        "marked obsolete this round with their expected gains.",
+        "Short human-readable summary: the source capture or standing "
+        "analysis, offline analyses performed, findings and ledgers written, "
+        "and roadmap items added / reordered / marked obsolete with expected "
+        "gains. Name missing evidence that needs a profiler capture.",
     )
     append_optimizer_progress = _make_summary_tool(
         "optimizer",
@@ -805,6 +813,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     appenders = {
         "benchmarker": append_benchmarker_progress,
         "projector": append_projector_progress,
+        "profiler": append_profiler_progress,
         "analyzer": append_analyzer_progress,
         "optimizer": append_optimizer_progress,
         "evaluator": append_evaluator_progress,

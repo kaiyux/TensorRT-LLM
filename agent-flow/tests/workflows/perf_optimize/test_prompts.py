@@ -20,10 +20,13 @@ from agent_flow.workflows.perf_optimize.prompts import (
     DEFAULT_PROMPTS,
     EVALUATOR_SYSTEM_PROMPT,
     OPTIMIZER_SYSTEM_PROMPT,
+    PROFILER_SYSTEM_PROMPT,
     PROJECTOR_SYSTEM_PROMPT,
     QA_SYSTEM_PROMPT,
     REPORTER_SYSTEM_PROMPT,
+    PromptBundle,
     build_perf_optimize_prompts,
+    build_profiler_prompt,
     build_projector_prompt,
     dump_prompt_bundle,
 )
@@ -52,6 +55,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
 _ALL_PROMPTS = {
     "benchmarker": BENCHMARKER_SYSTEM_PROMPT,
     "projector": PROJECTOR_SYSTEM_PROMPT,
+    "profiler": PROFILER_SYSTEM_PROMPT,
     "analyzer": ANALYZER_SYSTEM_PROMPT,
     "optimizer": OPTIMIZER_SYSTEM_PROMPT,
     "evaluator": EVALUATOR_SYSTEM_PROMPT,
@@ -60,7 +64,7 @@ _ALL_PROMPTS = {
 }
 
 # Roles that run the canonical benchmark_serving.py command themselves.
-_MEASURING = ("benchmarker", "analyzer", "evaluator", "qa")
+_MEASURING = ("benchmarker", "profiler", "evaluator", "qa")
 
 
 def _norm(text: str) -> str:
@@ -79,7 +83,7 @@ _BENCHMARK_CANONICAL_FLAGS = (
     "--percentile-metrics",
 )
 
-# Canonical ``nsys profile`` flags the analyzer must carry.
+# Canonical ``nsys profile`` flags the profiler must carry.
 _NSYS_CANONICAL_FLAGS = (
     "-t 'cuda,nvtx,python-gil'",
     "-c cudaProfilerApi",
@@ -96,24 +100,24 @@ def test_measuring_roles_carry_canonical_benchmark_flags():
         assert "do not improvise" in _ALL_PROMPTS[role], role
 
 
-def test_analyzer_carries_canonical_nsys_flags():
+def test_profiler_carries_canonical_nsys_flags():
     for flag in _NSYS_CANONICAL_FLAGS:
-        assert flag in ANALYZER_SYSTEM_PROMPT, flag
+        assert flag in PROFILER_SYSTEM_PROMPT, flag
     # The safety flag that keeps nsys from SIGTERMing the engine.
-    assert "--capture-range-end=stop" in ANALYZER_SYSTEM_PROMPT
+    assert "--capture-range-end=stop" in PROFILER_SYSTEM_PROMPT
     # Knob verification (verify before asserting) came along with the
     # profiling reference blocks.
-    assert "TLLM_PROFILE_START_STOP" in ANALYZER_SYSTEM_PROMPT
-    assert "Verify the profiling knobs first" in ANALYZER_SYSTEM_PROMPT
+    assert "TLLM_PROFILE_START_STOP" in PROFILER_SYSTEM_PROMPT
+    assert "Verify the profiling knobs first" in PROFILER_SYSTEM_PROMPT
 
 
 def test_run_a2_flags_reach_every_role_that_captures_nsys():
-    # The analyzer profiles each round and the evaluator captures the
+    # The profiler captures each round and the evaluator captures the
     # accept-evidence trace; both inherit PROFILING_RUNS_REFERENCE, so both
     # must carry the utilization and call-stack passes or one of the two
     # keeps producing traces with no bounding resource and no call sites.
     for prompt, role in (
-        (ANALYZER_SYSTEM_PROMPT, "analyzer"),
+        (PROFILER_SYSTEM_PROMPT, "profiler"),
         (EVALUATOR_SYSTEM_PROMPT, "evaluator"),
     ):
         for flag in (
@@ -131,7 +135,7 @@ def test_run_a2_is_a_separate_capture_and_degrades_gracefully():
     # Metric sampling and backtraces perturb the timeline, so they take
     # their own captures; and when the host withholds the profiling
     # permission the run reports it rather than inventing utilization.
-    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    prompt = _norm(PROFILER_SYSTEM_PROMPT)
     assert "server_nsys_metrics" in prompt
     assert "server_nsys_stacks" in prompt
     assert "additional** captures" in prompt
@@ -143,7 +147,7 @@ def test_run_a2_call_stack_pass_states_the_cuda_graph_limit():
     # perf-optimize profiles graph-captured servers almost exclusively, so
     # the prompt has to say that a backtrace on cudaGraphLaunch names the
     # launch site and not the operator inside the graph.
-    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    prompt = _norm(PROFILER_SYSTEM_PROMPT)
     assert "cudaGraphLaunch" in prompt
     assert "graphId IS NOT NULL" in prompt
 
@@ -206,7 +210,7 @@ def test_run_a2a_capture_feeds_the_timeline_pipeline():
     # The two changes compose rather than sit side by side: A2a's
     # metric-sampling capture is exactly what the skill's per-operator
     # utilization step reads, and folding it in costs no GPU.
-    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    prompt = _norm(PROFILER_SYSTEM_PROMPT)
     assert "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite" in prompt
     assert "it reads the sampling capture, never the timing one" in prompt
     # A2b is not an input to it — those flags name another tool's exports.
@@ -215,7 +219,7 @@ def test_run_a2a_capture_feeds_the_timeline_pipeline():
     assert "do not wait for A2" in prompt
 
 
-def test_analyzer_carries_the_ncu_deep_dive():
+def test_profiler_carries_the_ncu_capture():
     # The shared Run B: a bounded per-kernel ncu capture of the top nsys
     # kernels, interpreted with the perf-nsight-compute-analysis skill.
     for flag in (
@@ -224,13 +228,13 @@ def test_analyzer_carries_the_ncu_deep_dive():
         "--section SpeedOfLight",
         "--launch-count",
     ):
-        assert flag in ANALYZER_SYSTEM_PROMPT, flag
-    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+        assert flag in PROFILER_SYSTEM_PROMPT, flag
+    prompt = _norm(PROFILER_SYSTEM_PROMPT)
     assert "perf-nsight-compute-analysis" in prompt
     assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
     # The findings carry the dedicated section, degrading honestly.
-    assert "## ncu kernel analysis" in prompt
-    assert "ncu unavailable" in prompt
+    assert "ncu --import" in prompt
+    assert "Final kernel interpretation" in prompt
 
 
 def test_analyzer_grounds_roadmap_items_across_the_analyses() -> None:
@@ -506,7 +510,7 @@ def test_server_roles_carry_the_tuning_config_supersede_note():
     assert "turn instructions name the exact **active tuning config**" in note
     assert "supersedes shorthand references" in note
     assert "<workspace>/tuning/extra_llm_api_options.yaml" not in note
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "qa"):
         assert "The active tuning config" in _ALL_PROMPTS[role], role
     # Only the optimizer may edit the live file; the snapshot is
     # orchestrator-managed.
@@ -580,7 +584,7 @@ def test_reporter_carries_the_kernel_comparison():
     # ...with honest provenance: what each profile covers, and no
     # fabricated "after" data when only round 1 was profiled.
     assert "which accepted items were in effect" in prompt
-    assert "closing analyzer round may have profiled the final accepted state" in prompt
+    assert "closing profiler round may have captured the final accepted state" in prompt
     assert "capture directory your driving instructions name as freshest" in prompt
     assert "no post-optimization profile exists" in prompt
 
@@ -785,7 +789,7 @@ def test_projector_prompt_targets_the_optimize_pipeline():
     assert "baseline/benchmark_results.md" in prompt
     assert "tuning/extra_llm_api_options.yaml" in prompt
     # Guidance addresses this workflow's consumers — the Analyzer owns
-    # the roadmap; there is no Profiler stage here.
+    # the roadmap, while capture details belong to the profiler.
     assert "Analyzer" in prompt
     assert "the Analyzer owns `roadmap.yaml`" in prompt
     assert "expected_gain_pct" in prompt
@@ -835,7 +839,7 @@ def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
     # Optimize-specific placement and cadence: per-round artifacts, one
     # campaign-level peaks file, a fresh join every profiling round.
     assert "this round's `analysis/` directory" in block
-    assert "Re-run correlation in profiling rounds" in block
+    assert "Re-run correlation in full analyses, including re-analysis" in block
     # …and not on the rounds that produce no measured rows to join.
     assert "Replan-only rounds reuse the standing correlation" in block
 
@@ -927,7 +931,7 @@ def test_sol_reporter_guidance_carries_the_headroom_story():
     assert "never fabricate" in block
 
 
-def test_sol_bundle_extends_analyzer_optimizer_and_reporter_only():
+def test_sol_bundle_extends_profiler_analyzer_optimizer_and_reporter():
     base = build_perf_optimize_prompts(include_sol=False)
     sol = build_perf_optimize_prompts(include_sol=True)
     assert "SOL projection as context" in sol.analyzer
@@ -939,6 +943,7 @@ def test_sol_bundle_extends_analyzer_optimizer_and_reporter_only():
     # Everything else — including the projector's own prompt, which is
     # always in the bundle (the stage gate lives in the workflow) — is
     # unchanged.
+    assert "Capture measured SOL constants when needed" in sol.profiler
     for role in ("benchmarker", "projector", "evaluator", "qa"):
         assert getattr(sol, role) == getattr(base, role), role
 
@@ -950,7 +955,8 @@ def test_sol_bundle_composes_with_slurm_and_restriction():
     assert "SOL projection as context" in bundle.analyzer
     assert "SOL projection as context" in bundle.optimizer
     assert "Approach restriction (`optimize.approaches`)" in bundle.analyzer
-    assert "slurm-environment" in bundle.analyzer
+    assert "slurm-environment" in bundle.profiler
+    assert "slurm-environment" not in bundle.analyzer
     assert "Projection vs Measured" in bundle.reporter
     # The evaluator and QA judge on measurements alone — no SOL context.
     assert "SOL projection" not in bundle.evaluator
@@ -971,7 +977,7 @@ def test_html_companion_overlays_the_sol_projected_curve():
 def test_slurm_bundle_augments_all_server_roles_but_not_reporter():
     base = build_perf_optimize_prompts(include_slurm_environment=False)
     slurm = build_perf_optimize_prompts(include_slurm_environment=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "qa"):
         assert "slurm-environment" in getattr(slurm, role), role
         assert "slurm-environment" not in getattr(base, role), role
     # The reporter never launches a server, so it is unchanged — and so
@@ -988,7 +994,7 @@ def test_slurm_bundle_preserves_canonical_templates():
         for flag in _BENCHMARK_CANONICAL_FLAGS:
             assert flag in getattr(slurm, role), (role, flag)
     for flag in _NSYS_CANONICAL_FLAGS:
-        assert flag in slurm.analyzer, flag
+        assert flag in slurm.profiler, flag
 
 
 def test_remote_execution_prompt_is_short_and_task_specific():
@@ -1011,7 +1017,7 @@ def test_remote_execution_prompt_is_short_and_task_specific():
     for role in (
         "benchmarker",
         "projector",
-        "analyzer",
+        "profiler",
         "optimizer",
         "evaluator",
         "qa",
@@ -1302,7 +1308,7 @@ def test_kernel_coverage_reporter_discloses_how_much_ncu_measured():
     assert "must never render" in block
 
 
-def test_kernel_coverage_bundle_extends_analyzer_and_reporter_only():
+def test_kernel_coverage_bundle_extends_profiler_analyzer_and_reporter():
     base = build_perf_optimize_prompts()
     coverage = _coverage_bundle()
     assert "Per-kernel coverage contract" in coverage.analyzer
@@ -1314,8 +1320,8 @@ def test_kernel_coverage_bundle_extends_analyzer_and_reporter_only():
 
 
 def test_kernel_coverage_selects_one_effective_ncu_policy():
-    base = _norm(build_perf_optimize_prompts().analyzer)
-    active = _norm(_coverage_bundle().analyzer)
+    base = _norm(build_perf_optimize_prompts().profiler)
+    active = _norm(_coverage_bundle().profiler)
     default_selection = (
         "2. **Pick the targets from the timeline decomposition, not the kernel sum.**"
     )
@@ -1328,7 +1334,12 @@ def test_kernel_coverage_selects_one_effective_ncu_policy():
     run_b = active.split("## Run B", 1)[1].split("## ", 1)[0]
     assert "supersedes" not in run_b
     assert "superseded" not in run_b
-    assert _norm(kernel_coverage_ncu_targeting(0.5, 95.0)).strip() in active
+    assert (
+        _norm(kernel_coverage_ncu_targeting(0.5, 95.0))
+        .strip()
+        .replace("nsys_analysis", "capture_preprocessing")
+        in active
+    )
 
 
 def test_kernel_coverage_carries_dismissals_only_with_current_evidence():
@@ -1378,7 +1389,8 @@ def test_kernel_coverage_composes_with_sol_slurm_and_restriction():
     assert "Per-kernel coverage contract" in bundle.analyzer
     assert "SOL projection as context" in bundle.analyzer
     assert "Approach restriction (`optimize.approaches`)" in bundle.analyzer
-    assert "slurm-environment" in bundle.analyzer
+    assert "slurm-environment" in bundle.profiler
+    assert "slurm-environment" not in bundle.analyzer
     assert "## Kernel Coverage" in bundle.reporter
     assert "Projection vs Measured" in bundle.reporter
 
@@ -1658,6 +1670,7 @@ def test_evaluator_is_told_to_pass_the_structured_fields():
 _SNAPSHOT_ROLES = (
     "benchmarker",
     "projector",
+    "profiler",
     "analyzer",
     "optimizer",
     "evaluator",
@@ -1688,12 +1701,12 @@ def test_dump_clears_a_previous_launch_stale_role(tmp_path):
     assert (directory / "analyzer.md").is_file()
 
 
-def test_analyzer_emits_only_the_effective_config_and_replay_policies() -> None:
+def test_profiler_emits_only_the_effective_config_and_replay_policies() -> None:
     for headroom in (None, _HL_BLOCK):
         bundle = build_perf_optimize_prompts(
             approaches=["code"], include_sol=True, headroom_ledger=headroom
         )
-        prompt = _norm(bundle.analyzer)
+        prompt = _norm(bundle.profiler)
         assert prompt.count("Effective profiling point policy") == 1
         assert "--extra_llm_api_options <active tuning config>" in prompt
         assert "Treat it and the accepted config snapshot as read-only" in prompt
@@ -1727,7 +1740,174 @@ def test_analyzer_replan_preserves_measurements_and_history() -> None:
     prompt = _norm(_headroom_bundle().analyzer)
     assert "launch no server, run no profiler" in prompt
     assert "Do not regenerate measured artifacts" in prompt
-    assert "full profiling findings structure applies only to rounds that profile" in prompt
+    assert "full findings structure applies only to full analysis, including re-analysis" in prompt
     assert "freeze `baseline`" in prompt
     assert "preserve all accepted / failed / in_progress items" in prompt
     assert "Never renumber or reuse ids" in prompt
+
+
+def test_profiler_and_analyzer_have_separate_artifact_ownership() -> None:
+    profiler = _norm(PROFILER_SYSTEM_PROMPT)
+    analyzer = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "rounds/round_<n>/profile/" in profiler
+    assert "capture_preprocessing" in profiler
+    assert "append_profiler_progress" in profiler
+    assert "Write `profile_manifest.json` last" in profiler
+    assert "never overwrite the profiler's preliminary decomposition" in analyzer
+    assert "`<profile_dir>` means the read-only source capture directory" in analyzer
+    assert "rounds/round_<n>/analysis/" in analyzer
+    assert "append_analyzer_progress" in analyzer
+    assert "## Required findings structure" not in profiler
+    assert "## The roadmap contract" not in profiler
+    assert "Author `<workspace>/nsys_analysis/items.json`" not in profiler
+
+
+def test_profiler_manifest_preserves_runtime_and_capture_provenance() -> None:
+    prompt = _norm(PROFILER_SYSTEM_PROMPT)
+    for field in (
+        '"schema_version": 1',
+        '"capture_id"',
+        '"serve_command"',
+        '"benchmark_command"',
+        '"config"',
+        '"build"',
+        '"import_path"',
+        '"checkout"',
+        '"hardware"',
+        '"model"',
+        '"workload"',
+        '"operating_points"',
+        '"profile_ranks"',
+        '"methods"',
+        '"status": "captured"',
+        '"status": "unavailable"',
+        '"artifacts"',
+        '"limitations"',
+    ):
+        assert field in prompt, field
+    assert "Every configured method needs a final" in prompt
+    assert "Every listed artifact is an existing nonempty file" in prompt
+    assert "No final `pending` or `failed` status is valid" in prompt
+    assert "completed capture must survive an Analyzer failure" in prompt
+    assert "mutable active-tuning path alone cannot establish what ran" in prompt
+    assert "top-level `artifacts` so they travel with imported captures" in prompt
+
+
+def test_sol_calibration_is_owned_by_profiler_and_snapshotted() -> None:
+    base = build_perf_optimize_prompts(include_sol=False)
+    sol = build_perf_optimize_prompts(include_sol=True)
+    prompt = _norm(sol.profiler)
+    assert "measure_channels.py --launch" in prompt
+    assert "servers stopped and the GPU idle" in prompt
+    assert "profile directory" in prompt
+    assert "as `sol_peaks.json`" in prompt
+    assert "manifest's top-level `artifacts`" in prompt
+    assert "measure_channels.py" not in base.profiler
+    assert "measure_channels.py" not in sol.analyzer
+
+
+def test_analyzer_can_reanalyze_saved_captures_without_runtime_access() -> None:
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "**re-analysis of existing captures**" in prompt
+    assert "A new capture is not required" in prompt
+    assert "earlier round or another workspace" in prompt
+    assert "nsys export --type sqlite" in prompt
+    assert "nsys stats --report" in prompt
+    assert "ncu --import <profile_dir>/server_ncu.ncu-rep" in prompt
+    assert "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite" in prompt
+    assert "taxonomy before quoting a single category number" in prompt
+    assert "Never run a workload to fill a missing file" in prompt
+    assert "Additional capture requested:" in prompt
+    assert "Do not launch a runtime probe to re-analyze" in prompt
+    assert "runtime.import_path" in prompt
+    assert "The current source checkout may differ from the profiled build" in prompt
+
+
+def test_analyzer_has_no_capture_commands_under_any_extensions() -> None:
+    for bundle in (
+        DEFAULT_PROMPTS,
+        build_perf_optimize_prompts(
+            include_slurm_environment=True,
+            include_disagg=True,
+            include_sol=True,
+            kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
+            headroom_ledger=_HL_BLOCK,
+        ),
+    ):
+        prompt = bundle.analyzer
+        for command in (
+            "nsys profile",
+            "ncu --target-processes",
+            "setsid env",
+            "python submit.py",
+            "squeue -j",
+            "--container-image",
+            "Effective profiling point policy",
+            "benchmark_serving.py",
+            "measure_channels.py",
+            "you just profiled on it",
+        ):
+            assert command not in prompt, command
+        assert "never launch a server" in prompt
+
+
+def test_disagg_analyzer_gets_only_capture_interpretation_context() -> None:
+    bundle = build_perf_optimize_prompts(include_disagg=True)
+    assert "Disaggregated capture interpretation" in bundle.analyzer
+    assert "Context and generation" in bundle.analyzer
+    assert "different clocks" in bundle.analyzer
+    assert "first-class `communication` cost" in bundle.analyzer
+    assert "python submit.py" in bundle.profiler
+    assert "Disaggregated serving (supersedes" not in bundle.analyzer
+
+
+def test_reanalysis_refreshes_ledgers_and_correlation_without_recapture() -> None:
+    bundle = build_perf_optimize_prompts(
+        include_sol=True,
+        kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
+        headroom_ledger=_HL_BLOCK,
+    )
+    prompt = _norm(bundle.analyzer)
+    assert "Re-analysis rebuilds the ledger from saved evidence" in prompt
+    assert "Re-run correlation in full analyses, including re-analysis" in prompt
+    assert "without collecting measurements" in prompt
+    assert "Never run a GPU microbenchmark" in prompt
+    assert "<campaign_workspace>/sol_work/peaks.json" in prompt
+    assert "**Full analyses**: author the block fresh" in prompt
+    assert "replan-only rounds use the standing analysis" in prompt
+
+
+def test_prompt_bundle_profiler_extensions_are_independent() -> None:
+    extended = DEFAULT_PROMPTS.with_extensions(
+        profiler="Custom capture instructions", analyzer="Custom interpretation instructions"
+    )
+    assert extended.profiler.endswith("\n\nCustom capture instructions")
+    assert extended.analyzer.endswith("\n\nCustom interpretation instructions")
+    assert "Custom capture instructions" not in extended.analyzer
+    assert "Custom interpretation instructions" not in extended.profiler
+    assert DEFAULT_PROMPTS.with_extensions(profiler=" \n") == DEFAULT_PROMPTS
+
+
+def test_custom_bundle_without_profiler_retains_default_capture_prompt() -> None:
+    legacy_roles = {role: f"custom {role}" for role in _SNAPSHOT_ROLES if role != "profiler"}
+    bundle = PromptBundle(**legacy_roles)
+    assert bundle.profiler == PROFILER_SYSTEM_PROMPT
+    assert build_profiler_prompt() == DEFAULT_PROMPTS.profiler
+    for role, prompt in legacy_roles.items():
+        assert getattr(bundle, role) == prompt
+
+
+def test_reporter_pairs_raw_captures_with_their_completed_analysis() -> None:
+    prompt = _norm(REPORTER_SYSTEM_PROMPT)
+    assert "profile/profile_manifest.json" in prompt
+    assert "analysis/analysis_manifest.yaml" in prompt
+    assert "Re-analysis alone never makes a capture newer" in prompt
+    assert "Match analysis and capture identities" in prompt
+    assert "associated `analysis/nsys_analysis/`" in prompt
+
+
+def test_evaluator_comparative_analysis_preserves_previous_capture() -> None:
+    prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "Keep previous captures and analyses read-only" in prompt
+    assert "associated round's `analysis/taxonomy.json`" in prompt
+    assert "<previous capture or analysis server_nsys.sqlite>" in prompt

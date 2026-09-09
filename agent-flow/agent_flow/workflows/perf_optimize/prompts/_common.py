@@ -7,8 +7,8 @@ the canonical templates stay defined in exactly one place — including
 the projector's SOL methodology blocks (``SOL_PROJECTOR_*``), the
 analyzer's findings contract (``PROFILE_FINDINGS_CONTRACT``), and the
 measured↔SOL correlation recipe (``SOL_CORRELATION_METHOD``): this
-workflow's analyzer is perf-analyze's analyzer plus the roadmap
-machinery, and both compose the same fragments.
+workflow separates capture into the profiler and offline interpretation
+into the analyzer, while both workflows reuse the same canonical recipes.
 This module adds the blocks specific to the optimization loop: the
 ``roadmap.yaml`` contract, git discipline for the mutable TRT-LLM
 checkout, the kernel-reuse rule, the evaluator's acceptance gate, the
@@ -51,6 +51,7 @@ __all__ = [
     "CASEBOOK_APPLY",
     "CASEBOOK_CONSULTATION",
     "DERIVED_METRICS_REFERENCE",
+    "DISAGG_ANALYSIS_CONTEXT",
     "DORMANT_CAPABILITY_SWEEP",
     "EVIDENCE_DISCIPLINE",
     "EXECUTION_SLURM_BOOTSTRAP",
@@ -74,15 +75,90 @@ __all__ = [
     "SOL_CORRELATION_METHOD",
     "SOL_METHODOLOGY_FALLBACK",
     "SOL_OPTIMIZER_CONTEXT",
+    "SOL_PROFILER_CONTEXT",
     "SOL_OPTIMIZE_REPORTER_GUIDANCE",
     "SOL_PROJECTOR_INTERNAL_KNOWLEDGE",
     "SOL_PROJECTOR_METHODOLOGY",
     "TUNING_CONFIG_NOTE",
     "approach_restriction_note",
+    "build_offline_analysis_reference",
     "headroom_ledger_analyzer_note",
     "kernel_coverage_analyzer_note",
     "kernel_coverage_ncu_targeting",
 ]
+
+
+def build_offline_analysis_reference() -> str:
+    """Reuse shared interpretation recipes without server or capture instructions.
+
+    These section boundaries select the canonical export/decomposition
+    instructions; perf-analyze keeps its combined capture/analysis workflow.
+    All generated files go into the analysis directory, preserving reports.
+    """
+    decomposition = PROFILING_RUNS_REFERENCE.split("5. **Decompose the timeline", 1)[1].split(
+        "### Multi-GPU:", 1
+    )[0]
+    decomposition = "1. **Decompose the timeline" + decomposition
+    decomposition = decomposition.replace(
+        "<workspace>/server_nsys.nsys-rep", "<profile_dir>/server_nsys.nsys-rep"
+    ).replace(
+        "   cp ",
+        "   nsys stats --report cuda_gpu_kern_sum --report cuda_gpu_trace \\\n"
+        "       <workspace>/server_nsys.sqlite > <workspace>/nsys_stats.txt\n"
+        "   cp ",
+        1,
+    )
+    decomposition = decomposition.replace(
+        "   - Analyze Run A’s timing capture now; do not wait for A2. If the skill\n",
+        "   - Analyze the saved timing capture even if A2 is unavailable. If the skill\n",
+    )
+    additional = PROFILING_RUNS_REFERENCE.split("### Consume the additional captures", 1)[1].split(
+        "## Run B", 1
+    )[0]
+    additional = additional.replace(
+        "<workspace>/<name>.nsys-rep", "<profile_dir>/<name>.nsys-rep"
+    ).replace("Then rerun Run A step 5", "Then rerun the decomposition above")
+    ncu_exports = PROFILING_RUNS_REFERENCE.split(
+        "5. Tear down to finalize the report, then export details and CSV:", 1
+    )[1]
+    ncu_exports = ncu_exports.replace(
+        "<workspace>/server_ncu.ncu-rep", "<profile_dir>/server_ncu.ncu-rep"
+    ).replace("6. Interpret captured kernels", "Interpret captured kernels")
+    return "\n\n".join(
+        (
+            """\
+## Offline analysis of saved captures
+
+Use the manifest's actual artifact paths, ranks and operating points in
+these canonical examples. `<profile_dir>` is read-only and `<workspace>`
+is the current analysis directory. Existing raw `.nsys-rep` / `.ncu-rep`
+reports or their `.sqlite` / raw CSV exports are evidence; the profiler's
+preliminary taxonomy/decomposition is a hint, not the final analysis.
+If a raw report is unavailable, copy an existing export to the analysis
+directory and analyze that. Never run a workload to fill a missing file.
+Offline analysis costs no extra server launch and needs no GPU.
+""",
+            decomposition.strip(),
+            "### Interpret saved utilization and call-stack captures\n" + additional.strip(),
+            """\
+For call stacks, inspect `SAMPLING_CALLCHAINS` and report unresolved
+symbols. A `cudaGraphLaunch` stack identifies the graph launch site,
+not the internal kernels. Keep A2 timing separate from the timing trace.
+
+### Interpret saved ncu reports
+
+Load `perf-nsight-compute-analysis` via the `Skill` tool, using
+`trtllm-agent-toolkit:perf-nsight-compute-analysis` if needed. Its
+thresholds and escalation interpretation determine bound class,
+occupancy, stalls and utilization; never invent its thresholds. If the
+skill is unavailable, retain raw metrics and mark ncu-derived
+classification unavailable. A required ledger bound may instead use
+source/timeline-supported inference with explicit provenance.
+Export each saved report and pass into this analysis directory:
+"""
+            + ncu_exports.strip(),
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -151,9 +227,9 @@ Rules that keep the loop deterministic:
   `disposition: item` `ref` must name a real roadmap item id, any
   status: an opportunity whose fix was already tried *was* considered.
   A `dismissed` `ref` is the evidence for dismissing it, never a bare
-  restatement. **Profiling rounds**: author the block fresh from this
+  restatement. **Full analyses**: author the block fresh from this
   round's `items.json`; replan-only rounds use the standing analysis. An `nsys-NN` id is local to the analysis that
-  wrote it — a re-profile renumbers from `nsys-01` — so unlike a roadmap
+  wrote it — a fresh analysis renumbers from `nsys-01` — so unlike a roadmap
   item id it is never carried forward, and a previous round's row never
   covers this round's same-numbered opportunity. Re-state a judgement
   that still holds against the id this round's file gives it, citing the
@@ -167,7 +243,7 @@ Rules that keep the loop deterministic:
   reuse ids; allocate fresh ids continuing the sequence.
 - **Ownership.** Only the **analyzer** writes item content (ids, titles,
   categories, evidence, gains, ordering) and may mark still-pending items
-  `obsolete` when fresh evidence — a re-profile, or the verdicts a
+  `obsolete` when fresh evidence — a re-analysis, or the verdicts a
   replan-only round plans from — shows they no longer apply. The
   **orchestrator** owns every lifecycle field: it flips `status` to
   `in_progress` / `accepted` / `failed`, counts `attempts`, fills
@@ -550,6 +626,21 @@ take effect by editing the active tuning config and relaunching.
 # aggregate campaign reads it, finds no `disagg:` block, and ignores it.
 # --------------------------------------------------------------------------- #
 
+DISAGG_ANALYSIS_CONTEXT = """\
+## Disaggregated capture interpretation
+
+This campaign has context and generation worker groups. Read the source
+manifest and disaggregated harness/config snapshots as evidence; never
+submit the harness or launch workers. Preserve each trace's worker role,
+instance and original rank IDs when decomposing it. Context and generation
+iteration windows use different clocks; compare matching operating points
+and do not treat the two roles as interchangeable ranks. KV-cache transfer
+from context to generation is a first-class `communication` cost. The
+harness supports nsys only: record `not available in a disagg campaign`
+for ncu and reason from saved nsys plus source evidence.
+"""
+
+
 DISAGG_CAMPAIGN = """\
 ## Disaggregated serving (supersedes the server-lifecycle, tuning, and profiling guidance above)
 
@@ -753,6 +844,49 @@ If you revise the markdown, revise the HTML in the same turn.
 # SOL projection consumption (appended only when the projector stage is enabled)
 # --------------------------------------------------------------------------- #
 
+SOL_PROFILER_CONTEXT = """\
+## Capture measured SOL constants when needed
+
+Read `sol_projection.md` only to locate the campaign peaks file and
+identify missing measurements. If `<campaign_workspace>/sol_work/peaks.json`
+exists but lacks measured `latencies`/`sms`, load
+`internal-perf-sol-analysis` (fully-qualified
+`trtllm-agent-toolkit:internal-perf-sol-analysis` if needed) and, in the
+profiling GPU environment with servers stopped and the GPU idle, run its
+`measure_channels.py --launch … --merge-into <campaign peaks.json>`.
+This measurement belongs to capture, never offline analysis. Record the
+command and whether it succeeded; unavailable skill/GPU measurements are
+a manifest limitation, not invented constants. Never change an existing
+measurement just because an optimization failed. This missing-constant
+calibration permits updates to the campaign peaks file; leave all other
+campaign analysis/planning artifacts read-only. Preserve the peaks used
+as `sol_peaks.json` in the profile directory and list that snapshot under
+the manifest's top-level `artifacts`. The Analyzer performs correlation.
+"""
+
+_OFFLINE_SOL_CORRELATION_METHOD = (
+    SOL_CORRELATION_METHOD.replace("the fresh profile", "the selected capture")
+    .replace(
+        "your profile\njust produced the measured per-op times",
+        "the selected capture\nsupplies the measured per-op times",
+    )
+    .replace(
+        "   `sol_projection.md`'s *Projection setup*). When it carries no\n"
+        "   measured `latencies`/`sms` — the Projector ran without GPU reach —\n"
+        "   run the skill's `measure_channels.py --launch … --merge-into <that\n"
+        "   peaks.json>` yourself: unlike the Projector's stage, a GPU is\n"
+        "   reachable here by construction (you just profiled on it).",
+        "   `sol_projection.md`'s *Projection setup*). Use saved measured\n"
+        "   `latencies`/`sms`, checking the profile's `sol_peaks.json` snapshot\n"
+        "   when present. If constants are missing, label them unmeasured\n"
+        "   and record the limit; when correlation requires them, report\n"
+        "   `Correlation unavailable: missing measured constants`. Request\n"
+        "   any necessary measurement from the Profiler in your summary.\n"
+        "   Never run a GPU microbenchmark or invent missing constants.",
+    )
+    .replace("<workspace>/sol_work/peaks.json", "<campaign_workspace>/sol_work/peaks.json")
+)
+
 SOL_ANALYZER_CONTEXT = (
     """\
 ## SOL projection as context (the projector stage ran)
@@ -783,12 +917,12 @@ column is the baseline snapshot.
   use in ranking, and record the reason in *Caveats*.
 
 """
-    + SOL_CORRELATION_METHOD
+    + _OFFLINE_SOL_CORRELATION_METHOD
     + """
 Keep `regions.json`, `sol.json`, and any `sol_recipes/` in this round's
 `analysis/` directory. The peaks file remains at
-`<workspace>/sol_work/peaks.json`. Re-run correlation in profiling rounds
-using fresh measurements and the standing ceiling (or a documented model
+`<campaign_workspace>/sol_work/peaks.json`. Re-run correlation in full analyses, including re-analysis,
+using the selected capture measurements and the standing ceiling (or a documented model
 revision). Replan-only rounds reuse the standing correlation. Human SOL
 and remaining-gap tables derive their numbers from these artifacts and
 `headroom_ledger.yaml` when present.
@@ -935,13 +1069,9 @@ def kernel_coverage_ncu_targeting(min_share_pct: float, coverage_target_pct: flo
    `matched_kernels`, with `opgroup.json` / `module_slice.json` for the
    residual. This decomposition clips the union of GPU activity to the
    iteration window. Whole-capture `cuda_gpu_kern_sum` is only a fallback
-   when the pipeline cannot run; record that fallback in the ledger's
-   `source`. Record GPU busy vs idle from the same window in
-   `coverage.gpu_busy_pct`.
-
-   Related kernels may share a ledger row only when all four verdicts
-   agree; list every member in `full_name` and sum their `share_pct`.
-   Never group away a kernel with a different opportunity.
+   when the pipeline cannot run; record that fallback in the manifest.
+   Record GPU busy vs idle and the full selected kernel names/shares;
+   the Analyzer independently authors the ledger and its dispositions.
 
    Run the canonical command below for up to **3 passes**, excluding
    collectives from ncu replay. Pass 1 targets the hottest 3–6 stems.
@@ -951,8 +1081,9 @@ def kernel_coverage_ncu_targeting(min_share_pct: float, coverage_target_pct: flo
    exhaust a launch-order budget before once-per-step kernels appear.
    Each pass relaunches the server with the same iteration gate. Name
    artifacts `server_ncu_pass<k>.ncu-rep`, `ncu_details_pass<k>.txt`, and
-   `ncu_raw_pass<k>.csv`. Retain uncaptured kernels in the ledger with
-   `ncu: "unavailable: <reason>"` and answer from nsys plus source.
+   `ncu_raw_pass<k>.csv`. Retain uncaptured kernels in manifest coverage
+   notes with `ncu: "unavailable: <reason>"` so the Analyzer can account
+   for missing evidence from nsys plus source.
 """
 
 
@@ -966,12 +1097,13 @@ def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: flo
     return f"""\
 ## Per-kernel coverage contract (this task declares `profile.kernel_coverage`)
 
-Every profiling round, write `analysis/kernel_ledger.yaml` for the kernels
-selected by Run B's coverage policy: all kernels at/above {min_share_pct}%
+Every full analysis, including re-analysis, write `analysis/kernel_ledger.yaml` for the kernels
+enumerated from the selected capture's timeline: all kernels at/above {min_share_pct}%
 and enough additional rows to cover {coverage_target_pct}% of GPU time.
 A missing row or question, invalid roadmap reference, or insufficient
-coverage aborts the stage. Replan-only and reused-analysis rounds reuse
-the standing ledger and owe no new capture or ledger.
+coverage aborts the stage. Re-analysis rebuilds the ledger from saved
+evidence, independently of the profiler's ncu target selection. Replan-only
+rounds reuse the standing ledger and owe no new capture or ledger.
 
 ### Materiality and shared disposition rules
 
@@ -1187,7 +1319,7 @@ kernels:                        # descending share_pct; one row per kernel/group
   an item may carry that evidence in its referenced roadmap entry.
 - Items below `optimize.noise_floor_pct` are not actionable; use
   `below-materiality` rather than a roadmap reference to such an item.
-- **Subsequent profiling rounds:** author a fresh ledger. Carry a
+- **Subsequent full analyses:** author a fresh ledger. Carry a
   dismissal only if share changed by no more than ~20% relative, bound
   class is unchanged, and no accepted item touched the kernel. Cite its
   original evidence plus `carried from round <k>`. Re-derive changed
@@ -1304,8 +1436,9 @@ pending roadmap items by `expected_gain_pct`; targets do not steer it."""
 
 Update this campaign-level file at the workspace root every round. It
 records per-part headroom, spent levers, and buildable targets. Replan-only
-rounds incorporate new verdicts using standing measurements; profiling
-rounds refresh measurements under the effective profiling policy.
+rounds incorporate new verdicts using standing measurements; full
+analyses refresh interpretation of the selected captures under their
+recorded effective profiling policy, without collecting measurements.
 
 ### The three tiers
 
@@ -1518,7 +1651,7 @@ not establish attribution or change the SOL ceiling.
 
 ### `## Target implementation` — the findings section
 
-Every profiling round, derive this section in `profile_findings.md` from
+Every full analysis, including re-analysis, derive this section in `profile_findings.md` from
 the ledger and correlation artifacts, using model **execution order**:
 layer stages, attention/MoE blocks, tail, then runtime plumbing. Include
 empirical, unmodeled, and non-kernel stages so uncovered work is visible.
@@ -1568,7 +1701,7 @@ it. Follow with the campaign totals in absolute milliseconds, and the
 `eliminated_ms` credit for any part an accepted item deleted outright.
 
 Lift the analyzer's `## Target implementation` walk from the final
-profiling round's `profile_findings.md` in structural (execution) order,
+full analysis's `profile_findings.md` in structural (execution) order,
 unchanged. Print the engineering-gap ranking after it as a derived view.
 
 Close with every `model_revisions` and `measurement_revisions` entry
@@ -1663,7 +1796,7 @@ planned, applied, or accepted; {disallowed_str} is off-limits. What this
 means per role:
 
 - **Analyzer** — every roadmap item's `approach` must be one of the
-  allowed values. When profiling exposes an optimization that would need
+  allowed values. When analysis exposes an optimization that would need
   a disallowed approach, do **not** add it to `roadmap.yaml`; record it
   under an "Out-of-scope opportunities" heading in `profile_findings.md`
   instead, so the insight is preserved without planning unactionable

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -22,11 +23,13 @@ def test_save_load_round_trip(tmp_path):
         attempt_index=1,
         current_item_id="opt-002",
         profile_required=False,
+        last_profile_dir="/ws/rounds/round_1/profile",
         last_profiled_analysis_dir="/ws/rounds/round_1/analysis",
         approach_violation="the attempt changed tuning/extra_llm_api_options.yaml",
         last_nsys_dir="/ws/rounds/round_1/item_1_opt-001/attempt_1/profile",
         reuse_analysis_dir="/ws/previous-perf-analyze",
         reuse_pending=True,
+        reanalyze_pending=True,
         campaign_git_branch="perf-optimize/ws-20260701-120000",
         campaign_git_base_commit="abc123def456",
         item_batch=[
@@ -61,12 +64,14 @@ def test_defaults():
     assert s.attempt_index == 0
     # A fresh campaign has not established a current runtime profile.
     assert s.profile_required is True
+    assert s.last_profile_dir == ""
     assert s.last_profiled_analysis_dir == ""
     assert s.current_item_id == ""
     assert s.approach_violation == ""
     assert s.last_nsys_dir == ""
     assert s.reuse_analysis_dir == ""
     assert s.reuse_pending is False
+    assert s.reanalyze_pending is False
     assert s.campaign_git_branch == ""
     assert s.campaign_git_base_commit == ""
     assert s.item_batch == []
@@ -213,6 +218,7 @@ def test_valid_stages_expose_one_parallel_pair_stage_and_integrator():
     assert state_module._VALID_STAGES == (
         state_module.STAGE_BENCHMARKER,
         state_module.STAGE_PROJECTOR,
+        state_module.STAGE_PROFILER,
         state_module.STAGE_ANALYZER,
         state_module.STAGE_OPTIMIZER_EVALUATOR,
         state_module.STAGE_INTEGRATOR,
@@ -226,6 +232,7 @@ def test_round_stages_are_the_loop_roles():
     # campaign's final verification, not as a per-round gate. The
     # projector is likewise absent — it runs once, before round 1.
     assert state_module.ROUND_STAGES == (
+        state_module.STAGE_PROFILER,
         state_module.STAGE_ANALYZER,
         state_module.STAGE_OPTIMIZER_EVALUATOR,
         state_module.STAGE_INTEGRATOR,
@@ -261,3 +268,64 @@ def test_projector_done_round_trip_and_old_checkpoint_default(tmp_path):
     )
     loaded = state_module.load_state(path)
     assert loaded.projector_done is False
+
+
+@pytest.mark.parametrize(
+    ("extra_fields", "expected_stage"),
+    [
+        ({}, state_module.STAGE_PROFILER),
+        ({"profile_required": "false"}, state_module.STAGE_PROFILER),
+        ({"profile_required": False}, state_module.STAGE_PROFILER),
+        (
+            {"profile_required": True, "last_profiled_analysis_dir": "/ws/old/analysis"},
+            state_module.STAGE_PROFILER,
+        ),
+        (
+            {"profile_required": False, "last_profiled_analysis_dir": "/ws/old/analysis"},
+            state_module.STAGE_ANALYZER,
+        ),
+        ({"reuse_pending": True}, state_module.STAGE_ANALYZER),
+    ],
+)
+def test_legacy_analyzer_checkpoint_migrates_capture_requirement(
+    tmp_path: Path, extra_fields: dict[str, object], expected_stage: str
+) -> None:
+    """Old combined-stage cursors capture only when their evidence is stale."""
+    path = tmp_path / state_module.STATE_FILENAME
+    path.write_text(
+        json.dumps(
+            {
+                "version": state_module.SCHEMA_VERSION,
+                "task_path": "t",
+                "stage": state_module.STAGE_ANALYZER,
+                **extra_fields,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert state_module.load_state(path).stage == expected_stage
+
+
+@pytest.mark.parametrize("reanalyze_pending", [False, True])
+def test_analyzer_checkpoint_preserves_completed_capture(
+    tmp_path: Path, reanalyze_pending: bool
+) -> None:
+    """Retrying full analysis keeps its capture even before freshness is committed."""
+    path = tmp_path / state_module.STATE_FILENAME
+    original = state_module.WorkflowState(
+        task_path="t",
+        stage=state_module.STAGE_ANALYZER,
+        profile_required=True,
+        last_profile_dir="/ws/rounds/round_1/profile",
+        reuse_pending=reanalyze_pending,
+        reanalyze_pending=reanalyze_pending,
+    )
+    state_module.save_state(path, original)
+    assert state_module.load_state(path) == original
+
+
+def test_profiler_checkpoint_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / state_module.STATE_FILENAME
+    original = state_module.WorkflowState(task_path="t", stage=state_module.STAGE_PROFILER)
+    state_module.save_state(path, original)
+    assert state_module.load_state(path) == original

@@ -33,6 +33,7 @@ from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_res
 
 from . import gitops, headroom_ledger, kernel_ledger, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
+from .profile import PROFILE_MANIFEST_NAME, ProfileError, validate_profile_manifest
 from .progress import (
     EVALUATOR_DECISIONS,
     INTEGRATOR_DECISIONS,
@@ -54,6 +55,7 @@ from .state import (
     STAGE_INTEGRATOR,
     STAGE_OPTIMIZER,
     STAGE_OPTIMIZER_EVALUATOR,
+    STAGE_PROFILER,
     STAGE_PROJECTOR,
     STAGE_QA,
     STAGE_REPORTER,
@@ -142,6 +144,7 @@ def _make_agent(
 _ROLES = (
     "benchmarker",
     "projector",
+    "profiler",
     "analyzer",
     "optimizer",
     "evaluator",
@@ -165,9 +168,9 @@ class PerfOptimizeWorkflow:
     aims each item's realization with, and the reporter turns into a
     headroom-captured story closed by a remaining-gap accountability
     breakdown; disabled, that stage is skipped. Then the loop runs
-    up to ``max_rounds`` rounds of ``analyzer`` (profile + rank
-    ``roadmap.yaml`` by expected benefit) → a batch of up to
-    ``max_items_per_round`` pending
+    up to ``max_rounds`` rounds of ``profiler`` (capture evidence) →
+    ``analyzer`` (interpret saved evidence and rank ``roadmap.yaml`` by
+    expected benefit) → a batch of up to ``max_items_per_round`` pending
     items running serially or concurrently in isolated worktrees (per item:
     ``optimizer`` ⇄ ``evaluator`` — review code/functionality/perf against
     the acceptance gate; the evaluator's three-way verdict either APPROVEs
@@ -190,11 +193,11 @@ class PerfOptimizeWorkflow:
     campaign's final verification (independent benchmark + optional
     accuracy eval; skipped when nothing was accepted), and ``reporter``
     synthesizes
-    ``optimization_report.md`` / ``.html``. All eight roles
+    ``optimization_report.md`` / ``.html``. All nine roles
     run on the Claude Code backend, with sessions scoped to each role's
     unit of work: the analyzer keeps one session for the whole campaign
     (its roadmap memory), the optimizer's session spans a single item's
-    attempts and is reset between items, and the evaluator and QA are
+    attempts and is reset between items, and the profiler, evaluator and QA are
     stateless — every verdict gets fresh eyes. The evaluator and QA
     deliberately never see the SOL projection: their gates stay
     measured-vs-measured.
@@ -211,7 +214,9 @@ class PerfOptimizeWorkflow:
     round-1 layout, the benchmarker and projector stages are marked done,
     and round 1's analyzer runs **plan-only** — authoring
     ``roadmap.yaml`` from the imported evidence without launching a
-    server or a profiler.
+    server or a profiler. With ``reanalyze=True``, the analyzer instead
+    regenerates derived evidence from preserved captures. Each completed
+    analysis records its source capture in ``analysis_manifest.yaml``.
 
     Every transition checkpoints before the next agent runs, so a crash /
     Ctrl-C resumes at the same stage with the same round/attempt indices.
@@ -225,7 +230,11 @@ class PerfOptimizeWorkflow:
         max_rounds_override: int | None = None,
         reuse_analysis: str | Path | None = None,
         sol_methodology: SolMethodology | None = None,
+        reanalyze: bool = False,
     ) -> None:
+        if reanalyze and reuse_analysis is None:
+            raise ValueError("reanalyze requires reuse_analysis")
+        self.reanalyze = reanalyze
         self.workspace = workspace
         self.prompts = prompts or DEFAULT_PROMPTS
         # Which SOL methodology skill this session has. Resolved by the CLI
@@ -383,7 +392,9 @@ class PerfOptimizeWorkflow:
                     # rounds' conclusions; the analyzer keeps campaign-long
                     # memory of the roadmap it authored.
                     session_mode=(
-                        "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
+                        "stateless"
+                        if role in ("profiler", "qa", "evaluator", "integrator")
+                        else "persistent"
                     ),
                 ),
             )
@@ -449,7 +460,7 @@ class PerfOptimizeWorkflow:
                         "[dim]projector skipped — `sol.enabled: false` in task.yaml[/dim]",
                         log,
                     )
-                state.stage = STAGE_ANALYZER
+                state.stage = STAGE_PROFILER
                 self._checkpoint(state)
 
             # ---- outer round loop (fixed budget; deterministic breaks) ----
@@ -459,6 +470,23 @@ class PerfOptimizeWorkflow:
                     f"[bold cyan]Optimization round {round_no}/{state.max_rounds}[/bold cyan]",
                     log,
                 )
+
+                if state.stage == STAGE_PROFILER:
+                    if not (
+                        state.reuse_pending or state.reanalyze_pending or self._replan_only(state)
+                    ):
+                        profile_dir = self._profile_dir(state)
+                        profile_dir.mkdir(parents=True, exist_ok=True)
+                        print_rule("[bold cyan]Profiler[/bold cyan]", log)
+                        self._run_profiler(state)
+                        self._require_profile_outputs(profile_dir)
+                        state.last_profile_dir = str(profile_dir)
+                        self._record_nsys_capture(state, profile_dir)
+                    # Capture completion is durable before interpretation starts.
+                    # Keep profile_required until the full analysis validates so
+                    # a retry cannot accidentally replan from older findings.
+                    state.stage = STAGE_ANALYZER
+                    self._checkpoint(state)
 
                 if state.stage == STAGE_ANALYZER:
                     analysis_dir = self._analysis_dir(state)
@@ -471,6 +499,11 @@ class PerfOptimizeWorkflow:
                             f"{state.last_profiled_analysis_dir} still describes "
                             f"this build[/dim]",
                             log,
+                        )
+                    if not (replan_only or state.reuse_pending):
+                        self._require_profile_outputs(
+                            Path(state.last_profile_dir),
+                            imported=state.reanalyze_pending,
                         )
                     self._run_analyzer(state)
                     analyzer_outputs = [
@@ -503,8 +536,9 @@ class PerfOptimizeWorkflow:
                         )
                     self._validate_nsys_items(roadmap, analysis_dir)
                     self._validate_headroom_ledger(state, roadmap, analysis_dir, log=log)
-                    self._record_nsys_capture(state, analysis_dir)
                     if not replan_only and not state.reuse_pending:
+                        self._record_analysis_source(state, analysis_dir)
+                    if not replan_only and not (state.reuse_pending or state.reanalyze_pending):
                         # This round's evidence now describes the current
                         # build; a replan round produced none and leaves the
                         # pointer on the analysis it planned from. The
@@ -518,6 +552,7 @@ class PerfOptimizeWorkflow:
                         state.last_profiled_analysis_dir = str(analysis_dir)
                         state.profile_required = False
                     state.reuse_pending = False
+                    state.reanalyze_pending = False
                     noise_floor = float(self._optimize_block()["noise_floor_pct"])
                     items = roadmap_schema.top_pending_items(
                         roadmap,
@@ -654,6 +689,13 @@ class PerfOptimizeWorkflow:
                     f"--clean to start fresh with the new budget.[/bold yellow]",
                     log,
                 )
+            if self.reanalyze:
+                print_message(
+                    "[bold yellow]⚠ --reanalyze ignored on resume; the checkpointed "
+                    "analysis mode wins. Pass --clean with --reuse-analysis to "
+                    "start a new re-analysis campaign.[/bold yellow]",
+                    log,
+                )
             if self.reuse_analysis is not None:
                 print_message(
                     f"[bold yellow]⚠ --reuse-analysis {self.reuse_analysis} ignored on "
@@ -732,12 +774,14 @@ class PerfOptimizeWorkflow:
                 f"--reuse-analysis source is this run's own workspace ({source}); "
                 f"point it at the previous run's workspace instead."
             )
-        discovered = reuse.discover(source)
+        discovered = reuse.discover(source, reanalyze=self.reanalyze)
         imported = reuse.import_analysis(
             discovered,
             workspace=self.workspace,
             baseline_dir=self.baseline_dir,
             analysis_dir=self.rounds_dir / "round_1" / "analysis",
+            profile_dir=self.rounds_dir / "round_1" / "profile",
+            reanalyze=self.reanalyze,
             sol_projection_path=self.sol_projection_path,
             sol_work_dir=self.sol_work_dir,
             reuse_dir=self.reuse_dir,
@@ -751,9 +795,15 @@ class PerfOptimizeWorkflow:
             # flag is what makes the projector gate skip it, and a task
             # with ``sol.enabled: false`` skips it regardless.
             state.projector_done = self._sol_enabled()
-        if imported.findings:
+        if imported.profile:
+            state.last_profile_dir = str(self.rounds_dir / "round_1" / "profile")
+            self._record_nsys_capture(state, Path(state.last_profile_dir))
+        if self.reanalyze:
+            state.reanalyze_pending = True
+        elif imported.findings:
             state.reuse_pending = True
-            self._record_nsys_capture(state, self.rounds_dir / "round_1" / "analysis")
+            if not imported.profile:
+                self._record_nsys_capture(state, self.rounds_dir / "round_1" / "analysis")
         print_message(
             f"[bold cyan]reusing analysis from {source}: "
             f"{imported.summary()} (manifest: {imported.manifest_path})[/bold cyan]",
@@ -765,13 +815,17 @@ class PerfOptimizeWorkflow:
                 "baseline normally[/yellow]",
                 log,
             )
-        if not imported.findings:
+        if not imported.findings and not self.reanalyze:
             print_message(
                 "[yellow]no profile findings in the reuse source — round 1 will "
                 "profile normally[/yellow]",
                 log,
             )
-        elif self._kernel_coverage() is not None and not imported.kernel_ledger:
+        elif (
+            not self.reanalyze
+            and self._kernel_coverage() is not None
+            and not imported.kernel_ledger
+        ):
             print_message(
                 f"[yellow]reused analysis carries no "
                 f"{kernel_ledger.LEDGER_FILENAME} — the per-kernel coverage "
@@ -1523,7 +1577,7 @@ class PerfOptimizeWorkflow:
                 reason += " before the accepted runtime could be re-profiled"
             self._conclude_round_loop(state, reason, log)
             return
-        state.stage = STAGE_ANALYZER
+        state.stage = STAGE_PROFILER
         self._checkpoint(state)
 
     # ------------------------------------------------------------ approach guard
@@ -1577,6 +1631,7 @@ class PerfOptimizeWorkflow:
         return (
             state.round_index > 0
             and not state.reuse_pending
+            and not state.reanalyze_pending
             and not state.profile_required
             and bool(state.last_profiled_analysis_dir)
         )
@@ -1681,6 +1736,42 @@ class PerfOptimizeWorkflow:
                 f"its deliverable). Re-run the workflow to retry this stage, "
                 f"or pass --clean to start over."
             )
+
+    def _require_profile_outputs(
+        self, profile_dir: Path, *, imported: bool = False
+    ) -> dict[str, Any]:
+        """Validate a completed capture without advancing the profiler checkpoint."""
+        try:
+            return validate_profile_manifest(
+                profile_dir,
+                required_methods=None if imported else self._profile_methods(),
+                require_raw=imported,
+            )
+        except ProfileError as exc:
+            raise RuntimeError(
+                f"profiler capture at {profile_dir} failed validation: {exc}. "
+                f"Restore or repair the named capture artifacts and rerun; start a "
+                f"fresh campaign if a new capture is needed."
+            ) from exc
+
+    def _record_analysis_source(self, state: WorkflowState, analysis_dir: Path) -> None:
+        """Record which immutable capture this completed analysis interprets."""
+        profile_dir = Path(state.last_profile_dir)
+        manifest = validate_profile_manifest(profile_dir)
+        relative_profile = profile_dir.relative_to(self.workspace)
+        (analysis_dir / "analysis_manifest.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": 1,
+                    "analysis_id": f"round_{state.round_index + 1}",
+                    "capture_id": manifest["capture_id"],
+                    "profile_dir": str(relative_profile),
+                    "imported": state.reanalyze_pending,
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
 
     def _validate_roadmap(self) -> dict[str, Any]:
         """Structurally validate roadmap.yaml as part of the analyzer gate."""
@@ -2202,13 +2293,18 @@ class PerfOptimizeWorkflow:
         """Point ``last_nsys_dir`` at ``directory`` when it holds a capture.
 
         Called after the stages that may produce an nsys profile — the
-        analyzer's round profile, and an accepted attempt's
+        profiler's round profile, and an accepted attempt's
         accept-evidence capture — so the next evaluator's kernel
         comparison always names the freshest trace of the accepted state.
         A stage that captured nothing leaves the pointer unchanged. The
         caller checkpoints.
         """
-        if any(directory.glob("*.nsys-rep")) or (directory / "nsys_stats.txt").is_file():
+        manifest_path = directory / PROFILE_MANIFEST_NAME
+        if manifest_path.is_file():
+            manifest = validate_profile_manifest(directory)
+            if manifest["methods"].get("nsys", {}).get("status") == "captured":
+                state.last_nsys_dir = str(directory)
+        elif any(directory.rglob("*.nsys-rep")) or (directory / "nsys_stats.txt").is_file():
             state.last_nsys_dir = str(directory)
 
     def _any_accepted_items(self) -> bool:
@@ -2438,6 +2534,9 @@ class PerfOptimizeWorkflow:
     def _round_dir(self, state: WorkflowState) -> Path:
         return self.rounds_dir / f"round_{state.round_index + 1}"
 
+    def _profile_dir(self, state: WorkflowState) -> Path:
+        return self._round_dir(state) / "profile"
+
     def _analysis_dir(self, state: WorkflowState) -> Path:
         return self._round_dir(state) / "analysis"
 
@@ -2621,6 +2720,7 @@ class PerfOptimizeWorkflow:
         """
         analysis_dir = self._analysis_dir(state)
         findings_path = analysis_dir / "profile_findings.md"
+        profile_dir = Path(state.last_profile_dir) if state.last_profile_dir else analysis_dir
         prior_roadmap_context = ""
         if self.prior_roadmap_path.is_file():
             prior_roadmap_context = (
@@ -2661,7 +2761,8 @@ class PerfOptimizeWorkflow:
             f"Read `{self.task_path}` (the spec this campaign runs under), "
             f"`{self.reuse_manifest_path}` (what was imported, and from "
             f"where), `{findings_path}` **in full** plus the traces and "
-            f"summaries beside it in `{analysis_dir}`, and "
+            f"summaries in `{analysis_dir}` plus preserved captures in "
+            f"`{profile_dir}` (read-only), and "
             f"`{self.baseline_results_path}` (the imported baseline "
             f"measurement — the anchor for the roadmap's `baseline` "
             f"block).\n\n"
@@ -2701,16 +2802,105 @@ class PerfOptimizeWorkflow:
             f"roadmap items you authored with their expected gains."
         )
 
+    def _run_profiler(self, state: WorkflowState) -> None:
+        """Capture immutable runtime evidence for the analyzer's offline turn."""
+        round_no = state.round_index + 1
+        self._stamp_progress(state, round_no=round_no)
+        profile_dir = self._profile_dir(state)
+        replay_note = " (scalar mode: one replay at the configured concurrency)"
+        if self._curve_mode() and self._curve_points():
+            if self._headroom_ledger() is not None:
+                points = self._focus_points() or self._curve_points()
+                bracket = sorted({min(points), max(points)})
+                replay_note = (
+                    " (Pareto-curve mode with the headroom ledger: replay at the "
+                    f"lowest and highest scored concurrencies {bracket}, once per "
+                    "distinct point"
+                )
+            else:
+                replay_note = (
+                    " (Pareto-curve mode: one replay at the largest concurrency "
+                    f"point, {self._curve_points()[-1]}, only"
+                )
+            replay_note += (
+                "; when `benchmark.num_prompts` is a list, use the entry paired "
+                "with each selected point in `benchmark.concurrency`; otherwise "
+                "use the scalar prompt count)"
+            )
+        coverage = self._kernel_coverage()
+        if coverage is not None:
+            ncu_scope = (
+                f"For the per-kernel coverage contract, enumerate every kernel "
+                f"at/above {coverage['min_share_pct']}% of GPU time and extend "
+                f"until {coverage['coverage_target_pct']}% is covered. Group "
+                f"honestly-shared rows and capture over bounded ncu passes, "
+                f"re-filtering on still-missing stems. Preserve the kernel list, "
+                f"pass coverage, and the window's GPU busy share. The analyzer "
+                f"will author the kernel dispositions and ledger offline."
+            )
+        else:
+            ncu_scope = (
+                "Target the top nsys kernels with the canonical ncu flags and "
+                "bounded `--launch-count`; save `server_ncu.ncu-rep` and exports."
+            )
+        self.profiler(
+            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            f"Round: {round_no}\n"
+            f"Profile directory (write capture artifacts here): {profile_dir}\n"
+            f"Active runtime checkout: `{self._trtllm_repo_path()}`\n"
+            f"Active tuning config: `{self.tuning_config_path}`\n\n"
+            f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
+            f"recover the serving commands and operating point. Verify this "
+            f"checkout's profiling knobs with `rg` via `Bash` under "
+            f"`{self._trtllm_hint()}` and record the actual build, import path, "
+            f"effective config, hardware, ranks, and exact commands.\n\n"
+            f"Capture only the methods in `profile.methods`: relaunch "
+            f"`trtllm-serve` with `--extra_llm_api_options {self.tuning_config_path}`, "
+            f"replay the canonical benchmark load" + replay_note + f", and drive "
+            f"nsys from the canonical `nsys profile` command in your system prompt. "
+            f"{profile_ranks_note(self._profile_ranks())} Export reports with "
+            f"`nsys export --type sqlite` and preserve `nsys_stats.txt`. Load "
+            f"`internal-perf-nsight-system-analysis` (fully-qualified "
+            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if needed) "
+            f"and run `run_all.py` into `{profile_dir}/capture_preprocessing` "
+            f"only as needed to check capture quality and select ncu targets. "
+            f"Save a reusable taxonomy there when available.\n\n"
+            f"Keep the **Run A2** GPU-metrics and backtrace captures separate "
+            f"from the timing capture: use `--gpu-metrics-devices` / "
+            f"`--gpu-metrics-frequency` for utilization, and the backtrace flags "
+            f"for call sites. Preserve each export; record unavailable auxiliary "
+            f"passes with a reason. For ncu load `perf-nsight-compute-analysis` "
+            f"(fully-qualified `trtllm-agent-toolkit:perf-nsight-compute-analysis` "
+            f"if needed) as the capture methodology. {ncu_scope}\n\n"
+            f"Poll readiness in the foreground and tear every server down before "
+            f"completing this turn. Write `{profile_dir / PROFILE_MANIFEST_NAME}` "
+            f"using the manifest contract in your system prompt: a unique "
+            f"`capture_id`, runtime provenance (`serve_command`, "
+            f"`benchmark_command`, `config`, `build`, and `import_path`), and a "
+            f"`methods` entry for every requested method. Each entry must be "
+            f"`captured` with the command and relative nonempty artifacts, or "
+            f"`unavailable` with an explicit reason. Partial work is not a "
+            f"completed capture. Preserve these artifacts for read-only reuse; "
+            f"the analyzer will write findings, SOL correlation, dispositions, "
+            f"and the roadmap in a separate directory.\n\n"
+            f"Before completing your turn, call `append_profiler_progress` "
+            f"with a `summary` of capture quality and coverage, methods captured "
+            f"or unavailable, the artifact paths, and server cleanup."
+        )
+
     def _run_analyzer(self, state: WorkflowState) -> None:
         round_no = state.round_index + 1
         self._stamp_progress(state, round_no=round_no)
         analysis_dir = self._analysis_dir(state)
-        if state.reuse_pending:
+        if state.reuse_pending and not state.reanalyze_pending:
             self._run_reused_analyzer(state)
             return
         if self._replan_only(state):
             self._run_replan_analyzer(state)
             return
+        profile_dir = (
+            Path(state.last_profile_dir) if state.last_profile_dir else self._profile_dir(state)
+        )
         if round_no == 1:
             curve_note = self._baseline_curve_note()
             round_context = (
@@ -2726,56 +2916,38 @@ class PerfOptimizeWorkflow:
             )
         else:
             profile_reason = (
-                "**the standing profile is stale or unproven for the current "
-                "runtime** — accepted work changed the campaign, or the "
-                "checkpoint has not established a current local profile"
+                "**the profiler has captured the current runtime** — "
+                "interpret that completed evidence without recapturing it"
             )
             round_context = (
                 f"This is **round {round_no}**: the roadmap at "
                 f"`{self.roadmap_path}` already exists, and {profile_reason}. "
-                f"That is why this round profiles rather than re-planning. "
+                f"This round rebuilds the analysis from its capture. "
                 f'Call `read_latest_progress` with `agent: "evaluator"` for '
                 f"the verdicts on the items that **failed** — a REJECT is "
                 f"measured evidence about this runtime, and re-proposing what "
-                f"it disproved wastes the round. Re-profile the **current** "
-                f"build and update the roadmap in place: re-order / revise "
+                f"it disproved wastes the round. Analyze the saved evidence "
+                f"and update the roadmap in place: re-order / revise "
                 f"still-pending items, add newly exposed ones, mark stale "
                 f"pending items `obsolete`. Never rewrite accepted/failed "
                 f"history, `baseline`, `current_best`, or existing ids."
             )
+        coverage_context = ""
         coverage = self._kernel_coverage()
         if coverage is not None:
             ledger_path = analysis_dir / kernel_ledger.LEDGER_FILENAME
-            ncu_scope = (
-                f"under the **per-kernel coverage contract** in your system "
-                f"prompt (it supersedes Run B's top-kernel targeting): "
-                f"enumerate every kernel at/above "
-                f"{coverage['min_share_pct']}% of GPU time from the fresh "
-                f"kern_sum (extend until "
-                f"{coverage['coverage_target_pct']}% is covered; group "
-                f"honestly-shared rows), capture them over bounded ncu "
-                f"passes (re-filtering each pass on the still-missing "
-                f"stems), record the window's GPU busy share in "
-                f"`coverage.gpu_busy_pct` (it converts every share of GPU "
-                f"time into the share of wall clock the noise floor judges), "
-                f"and answer all four questions per kernel — eliminable? "
-                f"faster? fusible? overlappable? — each with a roadmap item "
-                f"or an evidence-backed dismissal. `Write` the ledger to "
-                f"`{ledger_path}` per the contract; the orchestrator "
-                f"validates it (all four dispositions per row, item refs "
-                f"resolving into `{self.roadmap_path}`, coverage ≥ target) "
-                f"and an incomplete ledger aborts the stage. Mirror the rows "
-                f"as the `## Kernel disposition ledger` section of your "
-                f"findings"
+            coverage_context = (
+                f"Apply the **per-kernel coverage contract** to the saved captures: "
+                f"enumerate kernels at/above {coverage['min_share_pct']}% of GPU "
+                f"time, extending to {coverage['coverage_target_pct']}% coverage. "
+                f"Record `coverage.gpu_busy_pct` from the measured window and "
+                f"answer all four questions — eliminable? faster? fusible? "
+                f"overlappable? — with a roadmap item or evidence-backed "
+                f"dismissal. Write `{ledger_path}` and mirror it under "
+                f"`## Kernel disposition ledger` in the findings. The "
+                f"orchestrator validates coverage and item references; disclose "
+                f"missing capture evidence rather than fabricating it.\n\n"
             )
-            ncu_artifacts = "the per-pass `server_ncu_pass<k>.ncu-rep` reports + their summaries"
-        else:
-            ncu_scope = (
-                "on the top nsys kernels: keep the canonical ncu flags "
-                "(`--launch-count` bounded), and classify each profiled "
-                "kernel (SOL%, bound class, occupancy, stalls)"
-            )
-            ncu_artifacts = "`server_ncu.ncu-rep` + its summaries"
         projection_context = ""
         if self._sol_enabled():
             projection_context = (
@@ -2786,7 +2958,7 @@ class PerfOptimizeWorkflow:
                 f"how you rank roadmap items and sanity-bound their "
                 f"`expected_gain_pct`, but measured trace evidence always "
                 f"outranks the projection — note where the profile confirms "
-                f"or contradicts it. After profiling, run the **measured↔SOL "
+                f"or contradicts it. Run the offline **measured↔SOL "
                 f"correlation** per your system prompt: load the "
                 f"`internal-perf-sol-analysis` skill (via the `Skill` tool; "
                 f"fully-qualified "
@@ -2808,99 +2980,73 @@ class PerfOptimizeWorkflow:
                 f"of the gap gets a new item or an evidence-backed reason it "
                 f"cannot be closed in this campaign.\n\n"
             )
-        replay_note = " (scalar mode: one replay at the configured concurrency)"
-        if self._curve_mode() and self._curve_points():
-            if self._headroom_ledger() is not None:
-                points = self._focus_points() or self._curve_points()
-                bracket = sorted({min(points), max(points)})
-                replay_note = (
-                    " (Pareto-curve mode with the headroom ledger: replay at the "
-                    f"lowest and highest scored concurrencies {bracket}, once per "
-                    "distinct point"
-                )
-            else:
-                replay_note = (
-                    " (Pareto-curve mode: one replay at the largest concurrency "
-                    f"point, {self._curve_points()[-1]}, only"
-                )
-            replay_note += (
-                "; when `benchmark.num_prompts` is a list, use the entry paired "
-                "with each selected point in `benchmark.concurrency`; otherwise "
-                "use the scalar prompt count)"
+        import_context = ""
+        if state.reanalyze_pending:
+            import_context = (
+                f"This is **re-analysis of imported captures** from "
+                f"`{state.reuse_analysis_dir}`. Read `{self.reuse_manifest_path}` "
+                f"and preserve the source evidence verbatim. Rebuild the derived "
+                f"analysis using the current methodology, taxonomy, and "
+                f"hypotheses; previous findings under "
+                f"`{self.reuse_dir / 'prior_analysis'}` are read-only prior art. "
+                f"These measurements describe the source run, so verify their "
+                f"fit to this task and record differences in model, mapping, "
+                f"config, runtime, and operating point. They do not establish "
+                f"that this campaign's checkout was profiled.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
-            f"Round: {round_no}\n"
-            f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
+            f"Workspace: {self.workspace}\n"
+            f"Round: {round_no} (**offline analysis**)\n"
+            f"Source profile directory (read-only): {profile_dir}\n"
+            f"Analysis directory (write derived artifacts here): {analysis_dir}\n\n"
             + self._headroom_ledger_instruction(round_no, analysis_dir)
-            + f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
-            f"recover the serve + benchmark commands and operating point.\n\n"
+            + import_context
+            + f"Read `{self.task_path}`, `{self.baseline_results_path}`, and "
+            f"`{profile_dir / PROFILE_MANIFEST_NAME}` to establish capture "
+            f"provenance, methods, ranks, and the measured operating points. "
+            f"Do not launch servers, replay workloads, run benchmarks, or "
+            f"capture nsys / ncu data. Offline exports and analysis commands "
+            f"may read the saved reports, with every output under "
+            f"`{analysis_dir}`; never modify `{profile_dir}`.\n\n"
             f"{round_context}\n\n"
             + projection_context
-            + f"Early on, **load the `perf-optimization-casebook` skill** (via "
-            f"the `Skill` tool) as read-only reference, as your system prompt "
-            f"directs — tag each roadmap item's `casebook_ref` with the "
-            f"matching *bottleneck signal → candidate pattern* row.\n\n"
-            f"First **verify this checkout's profiling knobs** with "
-            f"`grep -rn`/`rg` via `Bash` under `{self._trtllm_hint()}` as your "
-            f"system prompt directs, then profile the current build under the "
-            f"methods in `profile.methods`: relaunch `trtllm-serve` with "
-            f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
-            f"tuning config), replay the canonical benchmark load" + replay_note + f", and drive "
-            f"nsys from the **canonical `nsys profile` command in your system "
-            f"prompt** (don't improvise nsys flags). "
-            f"{profile_ranks_note(self._profile_ranks())} Then **decompose that "
-            f"timeline with the `internal-perf-nsight-system-analysis` skill** (via "
-            f"the `Skill` tool; fully-qualified "
-            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare "
-            f"name is not found), per your system prompt's Run A step 5: "
-            f"export the report with `nsys export --type sqlite`, run the "
-            f"skill's `run_all.py` single-variant into "
-            f"`{analysis_dir}/nsys_analysis`, and report the *nsys timeline* "
-            f"section from what it produces — per-iteration time, the "
-            f"busy/idle rungs, and the compute-absent split (launch-starved "
-            f"/ blocking / dependency-stalled) — not from the `nsys stats` "
-            f"table alone; an item aimed at host exposure and one aimed at a "
-            f"slow kernel are ranked from different numbers. Once that timing "
-            f"pass lands, take the two **Run A2** nsys passes from your system "
-            f"prompt as separate captures — `--gpu-metrics-devices` / "
-            f"`--gpu-metrics-frequency` for per-operator utilization, and the "
-            f"backtrace flags for call sites — never folded into the timing "
-            f"pass, and skipped gracefully (reason under *Caveats*) rather "
-            f"than fabricated; when A2a lands, re-run the skill's "
-            f"`run_all.py` with `--metrics-profile` pointed at its sqlite so "
-            f"the utilization bullet comes from the pipeline too (it re-reads "
-            f"files only — no server, no GPU). Verify the taxonomy and author "
-            f"`{analysis_dir}/nsys_analysis/items.json` as your system prompt's "
-            f"Run A step 5 requires, then account for every id it carries in "
-            f"`roadmap.yaml`'s `nsys_items` block — this stage does not pass "
-            f"until it does. Then run the **ncu "
-            f"per-kernel deep dive** (Run B in your system prompt) — load "
-            f"the `perf-nsight-compute-analysis` skill "
-            f"(via the `Skill` tool; fully-qualified "
-            f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if the bare "
-            f"name is not found) as the capture + interpretation "
-            f"methodology — {ncu_scope}. Save the traces, `nsys stats` "
-            f"output, the `nsys_analysis/` directory, and {ncu_artifacts} "
-            f"under "
-            f"`{analysis_dir}`. Tear every server "
-            f"down.\n\n"
-            f"Do **all** of this within this single turn — poll readiness in "
-            f"the foreground and do not yield to a background poll.\n\n"
-            f"`Write` `{analysis_dir / 'profile_findings.md'}` (Profiling "
+            + f"Early on, **load the `perf-optimization-casebook` skill** as "
+            f"read-only reference via the `Skill` tool; tag each roadmap item's "
+            f"`casebook_ref` with the matching bottleneck signal → candidate "
+            f"pattern.\n\n"
+            f"Decompose the saved timeline with "
+            f"`internal-perf-nsight-system-analysis` (fully-qualified "
+            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if "
+            f"needed). Read saved sqlite exports, or export a saved report "
+            f"using `nsys export --type sqlite` into `{analysis_dir}`. Run "
+            f"`run_all.py` single-variant into `{analysis_dir}/nsys_analysis`; "
+            f"when a GPU-metrics capture exists, pass `--metrics-profile` "
+            f"pointed at its sqlite. Verify the taxonomy and author "
+            f"`{analysis_dir}/nsys_analysis/items.json`, then account for every "
+            f"id in `roadmap.yaml`'s `nsys_items` block. Derive per-iteration "
+            f"time, busy/idle rungs, and the compute-absent split "
+            f"(launch-starved / blocking / dependency-stalled) from that "
+            f"pipeline, not from the `nsys stats` table alone.\n\n"
+            f"Interpret the saved ncu reports (`server_ncu.ncu-rep` or the "
+            f"per-pass reports) and exports using "
+            f"`perf-nsight-compute-analysis` (fully-qualified "
+            f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if needed) "
+            f"as the offline interpretation methodology: classify SOL%, bound "
+            f"class, occupancy, and stalls. Respect unavailable methods and "
+            f"capture caveats. If evidence is insufficient, name the needed "
+            f"additional capture in findings; do not obtain it this turn.\n\n"
+            + coverage_context
+            + f"Write `{analysis_dir / 'profile_findings.md'}` (Profiling "
             f"setup / nsys timeline / ncu kernel analysis / "
             + ("SOL correlation / " if self._sol_enabled() else "")
-            + f"Ranked bottleneck "
-            f"hypotheses / Caveats), then `Write` the updated "
-            f"`{self.roadmap_path}` — items ordered by expected benefit, "
-            f"every item grounded across the analyses (nsys timeline, ncu "
-            f"kernel analysis"
-            + (", SOL correlation" if self._sol_enabled() else "")
-            + ") with a quantified `expected_gain_rationale`.\n\n"
-            "Before completing your turn, call `append_analyzer_progress` "
-            "with a `summary` of which profilers ran, the trace files "
-            "produced, and the roadmap items you added / re-ordered / marked "
-            "obsolete with their expected gains."
+            + f"Ranked bottleneck hypotheses / Caveats), then write "
+            f"`{self.roadmap_path}` with items ordered by expected benefit "
+            f"and quantified `expected_gain_rationale` grounded across the "
+            f"available analyses.\n\n"
+            f"Before completing your turn, call `append_analyzer_progress` "
+            f"with a `summary` of the source capture, analyses regenerated, "
+            f"evidence limitations, and roadmap items added / re-ordered / "
+            f"marked obsolete with their expected gains."
         )
 
     def _run_replan_analyzer(self, state: WorkflowState) -> None:
@@ -3123,11 +3269,27 @@ class PerfOptimizeWorkflow:
             return ""
         profile_dir = self._attempt_dir(state) / "profile"
         if state.last_nsys_dir:
+            previous_capture = Path(state.last_nsys_dir)
+            if state.last_nsys_dir == state.last_profile_dir:
+                # Round captures have a separate completed analysis. Imported
+                # evidence uses this round's analysis without claiming local
+                # runtime freshness through last_profiled_analysis_dir.
+                taxonomy_dir = (
+                    Path(state.last_profiled_analysis_dir)
+                    if state.last_profiled_analysis_dir
+                    else self._analysis_dir(state)
+                )
+            else:
+                # Evaluator captures carry their own analysis and may postdate
+                # the standing round analysis by several accepted items.
+                taxonomy_dir = previous_capture
             decompose = (
                 f"its `run_all.py` **comparative** — `--variant before` on the "
                 f"`.sqlite` under `{state.last_nsys_dir}` and `--variant after` "
-                f"on this capture's, reusing that directory's `taxonomy.json` "
-                f"so both sides classify identically — into "
+                f"on this capture's, reusing `{taxonomy_dir / 'taxonomy.json'}` "
+                f"for both variants (fall back to "
+                f"`{previous_capture / 'taxonomy.json'}` when the separate "
+                f"analysis has no taxonomy) so both sides classify identically — into "
                 f"`{profile_dir}/nsys_analysis`, whose `difference/rank-0/` "
                 f"holds the signed per-iteration and module-slice deltas "
                 f"(single-variant, compared by hand, only if that capture kept "
@@ -3524,7 +3686,9 @@ class PerfOptimizeWorkflow:
             f"statuses, expected vs measured gains, baseline/current_best), "
             f"every `optimization_summary.md` / `evaluation.md` under "
             f"`{self.rounds_dir}`, every round's "
-            f"`analysis/profile_findings.md` + `analysis/nsys_stats.txt` and "
+            f"`analysis/profile_findings.md` + `profile/{PROFILE_MANIFEST_NAME}` "
+            f"+ `profile/nsys_stats.txt` (legacy rounds may keep stats under "
+            f"`analysis/`) and "
             f"every accepted attempt's `profile/nsys_stats.txt` (the "
             f"kernel-level before/after evidence; {after_profile}), "
             f"`{self.verification_report_path}` when it exists (the final "

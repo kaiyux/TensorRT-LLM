@@ -13,7 +13,10 @@ import yaml
 
 from agent_flow.workflows.perf_optimize import task_schema
 from agent_flow.workflows.perf_optimize.prompts import build_perf_optimize_prompts
-from agent_flow.workflows.perf_optimize.prompts._common import DISAGG_CAMPAIGN
+from agent_flow.workflows.perf_optimize.prompts._common import (
+    DISAGG_ANALYSIS_CONTEXT,
+    DISAGG_CAMPAIGN,
+)
 
 
 def _flat(text: str) -> str:
@@ -227,6 +230,7 @@ def test_the_disagg_section_is_composed_only_for_a_disagg_campaign():
     aggregate = build_perf_optimize_prompts()
     for role in (
         "benchmarker",
+        "profiler",
         "analyzer",
         "optimizer",
         "evaluator",
@@ -235,10 +239,14 @@ def test_the_disagg_section_is_composed_only_for_a_disagg_campaign():
         "reporter",
     ):
         assert DISAGG_CAMPAIGN not in getattr(aggregate, role)
+        assert DISAGG_ANALYSIS_CONTEXT not in getattr(aggregate, role)
 
     disagg_bundle = build_perf_optimize_prompts(include_disagg=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa"):
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "integrator", "qa"):
         assert DISAGG_CAMPAIGN in getattr(disagg_bundle, role)
+    # The analyzer receives topology interpretation without server launch instructions.
+    assert DISAGG_ANALYSIS_CONTEXT in disagg_bundle.analyzer
+    assert DISAGG_CAMPAIGN not in disagg_bundle.analyzer
     # The reporter only synthesizes artifacts, the projector launches nothing.
     assert DISAGG_CAMPAIGN not in disagg_bundle.reporter
     assert DISAGG_CAMPAIGN not in disagg_bundle.projector
@@ -251,7 +259,7 @@ def test_the_disagg_section_is_composed_last_so_its_overrides_win():
     reads it after the guidance it replaces.
     """
     bundle = build_perf_optimize_prompts(include_disagg=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa"):
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "integrator", "qa"):
         assert getattr(bundle, role).rstrip().endswith(DISAGG_CAMPAIGN.rstrip())
 
 

@@ -10,18 +10,22 @@ independently verifies the final state, and reports expected-vs-measured
 results.
 
 `--reuse-analysis <dir>` imports a previous perf-analyze / perf-optimize
-run's baseline, SOL projection and profile, starting the campaign at the
-optimize stage (round 1's analyzer then plans without profiling).
+run's baseline, SOL projection and findings, starting the campaign at the
+optimize stage (round 1's analyzer then plans from imported findings).
+Add `--reanalyze` to reinterpret that run's saved captures before planning,
+without profiling again in round 1.
+
 ```
-benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_rounds) ─────────────────────────┐ ──▶ qa ──▶ reporter
- (baseline)     (SOL ceiling)   │ analyzer ──▶ optimizer ⇄ evaluator item pairs         │   (final     (report)
-                                │               (serial or parallel worktrees;          │ verification)
-                                │                ≤ max_attempts_per_item)               │
-                                │                         │                             │
-                                │                         ▼ (parallel only)              │
-                                │                    integrator                         │
-                                │            (combine, benchmark, verdict)              │
-                                └───────────────────────────────────────────────────────┘
+benchmarker → (projector) → [round loop × max_rounds] → qa → reporter
+ (baseline)  (SOL ceiling)                        (final verification)
+
+round loop:
+  (profiler) → analyzer → optimizer ⇄ evaluator item pairs
+                         (serial or parallel worktrees;
+                          ≤ max_attempts_per_item)
+                                      ↓ (parallel only)
+                                  integrator
+                          (combine, benchmark, verdict)
 ```
 
 - **benchmarker** — serves the checkpoint, runs the canonical
@@ -44,22 +48,32 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   correlation joins against. The ceiling is
   a property of the hardware + model + operating point — later rounds
   compare against the same projection rather than re-deriving it.
-- **analyzer** — once per round (with `--reuse-analysis` round 1's
-  profile is imported instead and the analyzer runs plan-only; after a
-  round that neither accepted anything nor made a potentially
-  build-changing code attempt it runs **replan-only**, planning from the
-  standing profile and that round's verdicts — see *What a round costs*):
-  profiles the *current* build (nsys — decomposed with the
-  `internal-perf-nsight-system-analysis` skill into per-iteration time, busy/idle
-  rungs and the compute-absent split (launch-starved / blocking /
-  dependency-stalled) — plus an ncu per-kernel deep dive on the top
-  kernels of that decomposition (ranked by in-window union time, not by
-  the capture-wide `kern_sum`), captured over the same iteration window
-  and interpreted
-  with the
-  `perf-nsight-compute-analysis` skill — per-kernel SOL%, occupancy,
-  warp stalls → bound class; perf-analyze methodology), then
-  writes/updates
+- **profiler** — runs before the analyzer when the current runtime needs
+  fresh evidence. Owns server launch and cleanup, nsys/ncu captures,
+  exports, capture quality and coverage checks, and runtime/configuration
+  provenance. It preprocesses the nsys timeline with the
+  `internal-perf-nsight-system-analysis` skill to choose ncu targets
+  (ranked by in-window union time, not capture-wide `kern_sum`) over the
+  same iteration window. Raw captures and capture-local targeting
+  derivations live in `rounds/round_<n>/profile/`, identified by
+  `profile_manifest.json`. The profiler authors no roadmap or findings.
+  A separate successful checkpoint preserves these captures if the
+  analyzer fails; retrying analysis does not repeat the GPU capture.
+- **analyzer** — runs once per round, interpreting saved evidence and
+  writing analysis artifacts under `rounds/round_<n>/analysis/`. It
+  leaves the capture unchanged; after a successful full analysis, the
+  orchestrator writes `analysis_manifest.yaml` linking that analysis to
+  the source `profile_dir` and `capture_id`. It
+  launches no server or GPU profiler. It can regenerate the nsys
+  decomposition, classify per-iteration busy/idle and compute-absent
+  time (launch-starved / blocking / dependency-stalled), and interpret
+  saved ncu results with `perf-nsight-compute-analysis` (per-kernel SOL%,
+  occupancy, warp stalls → bound class). With `--reuse-analysis` it
+  plans from imported findings; with `--reuse-analysis --reanalyze` it
+  first recomputes the analysis from imported captures. After a round
+  that neither accepted anything nor made a potentially build-changing
+  code attempt, it runs **replan-only** from the standing findings and
+  evaluator verdicts — see *What a round costs*. It writes/updates
   `roadmap.yaml` — items ordered by `expected_gain_pct` (bottleneck share
   removed, casebook-grounded), never by fix ease, each item's evidence
   drawn across the analyses (nsys timeline, ncu kernel analysis, SOL
@@ -70,15 +84,14 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   `nsys_items` block — every opportunity it found becomes an item or a
   dismissal with evidence, and the orchestrator validates that the
   moment the turn ends (see *The nsys opportunity-coverage gate*).
-  Later rounds re-profile
-  (bottlenecks shift after each accepted item) and update statuses /
+  After fresh captures, the analyzer updates statuses /
   ordering without rewriting history — a round following one that left
   the standing runtime profile current has no shift to find and re-plans
   instead. When the projector ran, it reads
   `sol_projection.md` as context (not evidence): the projected headroom
   and bound mix inform the ranking and sanity-bound each item's
   `expected_gain_pct`; measured trace evidence always outranks the
-  projection. Each profiling round also runs the skill's **measured↔SOL
+  projection. Each fresh analysis also runs the skill's **measured↔SOL
   correlation** (`sol_calc.py analyze`): the round's traces roll up
   into `analysis/regions.json`, join against the projector's
   `sol_work/peaks.json`, and the resulting per-op table (% of SOL,
@@ -272,10 +285,11 @@ orchestrator-enforced breaks fires first:
 Either way the campaign proceeds to the one-shot final verification
 (skipped when nothing was accepted) and the reporter.
 
-## What a round costs: profile or replan
+## What a round costs: profile, re-analyze, or replan
 
-Every round opens with an analyzer turn, but not every round pays for a
-profile. Rejected config attempts are hard-reverted (`git reset --hard`
+Every round reaches an analyzer turn; the orchestrator invokes the
+profiler first only when fresh captures are needed. Rejected config
+attempts are hard-reverted (`git reset --hard`
 plus the last accepted tuning config), so they leave the runtime the
 standing analysis describes. Code attempts are different: `clean -x` is
 deliberately omitted, so a rebuilt gitignored `.so` or JIT/AOT cache may
@@ -288,12 +302,21 @@ according to `optimize.item_execution`; parallel candidates are combined
 and measured by the Integrator, while serial candidates are accepted
 directly.
 
-- **Profiling round** — round 1; any round opening after an accept; and
-  any round whose reverted code attempt may have changed ignored build
-  output. Re-profiles the current runtime (nsys + ncu per
-  `profile.methods`) and re-ranks the roadmap against fresh traces. An
-  older checkpoint with no profile-currency marker also buys one
+- **Profile and analyze** — round 1 unless evidence is imported; any round
+  opening after an accept; and any round whose reverted code attempt may
+  have changed ignored build
+  output. The profiler captures the current runtime (nsys + ncu per
+  `profile.methods`), then the analyzer interprets those captures and
+  re-ranks the roadmap. An older checkpoint with no profile-currency
+  marker also buys one
   conservative profile on resume.
+- **Re-analyze saved captures** — round 1 of a fresh campaign started with
+  `--reuse-analysis <dir> --reanalyze`. The profiler is skipped and the
+  analyzer regenerates findings, derivations, ledgers, and the roadmap
+  from imported raw evidence. This supports changes to analysis
+  methodology or taxonomy without another GPU capture. Later rounds
+  follow the normal profiling rules; the option does not make the
+  entire optimization campaign offline.
 - **Replan-only round** — opens when the standing profile is known to be
   current: the predecessor accepted nothing and made no code attempt
   capable of leaving rebuilt output behind. The analyzer launches no
@@ -306,9 +329,16 @@ directly.
   per-kernel ledger contract is waived for such a round (it ran no ncu);
   the standing ledger still describes the build.
 
-Neither mode is an agent's choice, and a replan round is not a skipped
+The orchestrator selects the mode, and a replan round is not a skipped
 round: if it leaves nothing actionable, that is the roadmap-exhausted
 break and the campaign closes.
+
+Capture completion and analysis completion have separate checkpoints.
+If the analyzer fails after a successful capture, rerunning the command
+resumes analysis from the preserved `profile/` directory. An unfinished
+capture remains the profiler's responsibility. Re-analysis imported from
+another workspace is not proof that the local runtime is current, so it
+does not earn the local profile-currency marker used by replan-only rounds.
 
 That break only fires at the top of a round, never mid-round. A roadmap
 that runs dry between items ran dry against a plan written *before* the
@@ -328,7 +358,8 @@ the optimize stage instead of re-deriving what that run already measured:
 | --- | --- | --- | --- |
 | baseline report + result JSONs | `benchmark_results.md` | `baseline/benchmark_results.md` | the benchmarker |
 | SOL projection + `sol_work/` | `sol_projection.md` | `sol_projection.md` | the projector |
-| profile findings + traces (+ `kernel_ledger.yaml`) | `profile_findings.md` | newest `rounds/round_<n>/analysis/` | round 1's profiling |
+| profile findings (+ `kernel_ledger.yaml`) | `profile_findings.md` and companion artifacts | newest `rounds/round_<n>/analysis/` | round 1's analysis, unless `--reanalyze` |
+| raw profile captures | workspace trace files | `rounds/round_<n>/profile/` with `profile_manifest.json` (legacy `analysis/` layouts also supported) | round 1's profiler |
 | roadmap (as read-only prior art) | — | `roadmap.yaml` | nothing |
 
 Round 1's analyzer then runs **plan-only**: it reads the imported
@@ -340,6 +371,27 @@ benchmark. Round 2 profiles normally: the imported traces describe
 made, and the replan rule only ever plans from a profile of this
 campaign's own checkout.
 
+For a new interpretation instead of a plan based on existing findings,
+add `--reanalyze`:
+
+```bash
+perf-optimize --task task.yaml --workspace workspace/reanalysis \
+    --reuse-analysis workspace/previous-run --reanalyze
+```
+
+This imports raw captures into round 1's `profile/` directory and runs
+the analyzer offline, writing fresh outputs in round 1's `analysis/`
+directory. The capture manifest records the source and available
+artifacts; discovery can find a completed capture even when its original
+analyzer never finished. Legacy perf-analyze and perf-optimize captures
+are supported too. When importing findings, `analysis_manifest.yaml`
+links them to their own source capture; discovery does not substitute
+a newer round's unrelated capture. Re-analysis needs usable raw evidence
+or offline exports: a findings-only
+source can support plain `--reuse-analysis`, but cannot supply a new trace
+analysis. The analyzer checks coverage and records missing evidence
+without silently launching another capture.
+
 Two deliberate limits:
 
 - **Ledger state is never imported.** A source `roadmap.yaml` lands in
@@ -349,10 +401,11 @@ Two deliberate limits:
   as evidence (carry the pending items forward, don't re-propose what
   failed) rather than inheriting it. A source `headroom_ledger.yaml` is
   not imported either — its partition and its dispositions are claims
-  about another checkout. The *inputs* to a fresh one do travel
-  (`sol.json`, `regions.json`, `kernel_ledger.yaml` come with the
-  profile), so a reused round can author its own from imported evidence
-  rather than inherit a stranger's accounting.
+  about another checkout. For plan-only reuse, the *inputs* to a fresh
+  one do travel (`sol.json`, `regions.json`, `kernel_ledger.yaml` come
+  with the profile), so a reused round can author its own from imported
+  evidence. With `--reanalyze`, the analyzer regenerates these derived
+  artifacts from the saved captures.
 - **The baseline is inherited, not re-measured.** Every gain this
   campaign reports is computed against numbers measured by the source
   run, so the two must describe the same system. The import writes
@@ -362,12 +415,18 @@ Two deliberate limits:
   baseline — the import is per-artifact, so a source without one simply
   gets benchmarked normally.
 
-Fresh runs only: on resume the checkpoint wins and the flag is ignored
-with a warning. Note that a run whose `profile.kernel_coverage` contract
-is on does **not** enforce the per-kernel ledger for a reused round that
-carries none, nor for a replan-only round (neither ran ncu); every round
-the analyzer actually profiles is still bound by it. A reused round that
-*did* import a ledger is held to the contract, but one this campaign
+These options seed fresh runs. `--reanalyze` requires `--reuse-analysis`
+and a fresh workspace (or `--clean`); it is rejected against an existing
+checkpoint. To resume a campaign already started in re-analysis mode,
+rerun without `--reanalyze`: the checkpoint preserves the choice. Plain
+`--reuse-analysis` on resume is ignored with a warning.
+
+Note that a run whose `profile.kernel_coverage` contract is on does
+**not** enforce the per-kernel ledger for a plan-only reused round that
+carries none, nor for a replan-only round (neither produces a fresh
+analysis); every fresh analysis, including `--reanalyze`, is still bound
+by it. A plan-only reused round that *did* import a ledger is held to
+the contract, but one this campaign
 cannot satisfy — an older schema, or `item` refs naming the source
 campaign's roadmap ids — is waived with a warning rather than aborted,
 since the plan-only round never writes a ledger a retry could repair.
@@ -387,6 +446,8 @@ perf-optimize --task path/to/task.yaml --workspace workspace/perf-optimize/my-mo
 perf-optimize --task ... --workspace ... --max-rounds 5
 # start at the optimize stage, reusing a previous run's analysis:
 perf-optimize --task ... --workspace ... --reuse-analysis workspace/perf-analyze/my-model
+# reinterpret saved captures before round 1's plan, in a fresh workspace:
+perf-optimize --task ... --workspace ... --reuse-analysis workspace/perf-analyze/my-model --reanalyze
 ```
 
 ## task.yaml
@@ -407,7 +468,7 @@ exactly as in perf-analyze):
 
 | field | required | default | meaning |
 | --- | --- | --- | --- |
-| `optimize.max_rounds` | no | `5` | The number of rounds the loop **runs** (not just a cap — only the two deterministic breaks above end it earlier); each round is one analyzer turn + up to `max_items_per_round` items, so `max_rounds × max_items_per_round` bounds total items attempted. Only rounds with a stale or unproven runtime profile pay to refresh it (see *What a round costs*), so this bounds items far more tightly than GPU hours. |
+| `optimize.max_rounds` | no | `5` | The number of rounds the loop **runs** (not just a cap — only the two deterministic breaks above end it earlier); each round is an optional profiler turn, one analyzer turn, and up to `max_items_per_round` items, so `max_rounds × max_items_per_round` bounds total items attempted. Only rounds with a stale or unproven runtime profile pay to refresh it (see *What a round costs*), so this bounds items far more tightly than GPU hours. |
 | `optimize.max_items_per_round` | no | `3` | Maximum optimizer/evaluator pairs selected per round. Every pair owns an isolated worktree, tuning copy, progress file, and bounded attempt loop. |
 | `optimize.item_execution` | no | `parallel` | `parallel` fans out all selected pairs from one frozen round base and runs the Integrator. `serial` runs them one at a time from the latest accepted campaign state, accepts each approved candidate directly, and emits no batch lifecycle or Integrator progress events. |
 | `optimize.max_attempts_per_item` | no | `3` | Total optimizer attempts per item: PUSH_BACK verdicts retry until this bound, then the item is marked `failed` and reverted (an explicit REJECT fails it immediately). |
@@ -489,8 +550,11 @@ running the CLI.
 │   ├── manifest.md                  #   what was imported, and from where
 │   └── prior_roadmap.yaml           #   source campaign's roadmap — read-only prior art
 ├── rounds/round_<n>/
-│   ├── analysis/                    # analyzer: profile_findings.md, nsys/ncu traces, nsys_analysis/ (+ regions.json / sol.json when the projector ran;
+│   ├── profile/                     # profiler: raw nsys/ncu captures, exports, logs, targeting derivations
+│   │   └── profile_manifest.json    # capture identity, provenance, and artifact inventory
+│   ├── analysis/                    # analyzer: profile_findings.md, regenerated nsys_analysis/ (+ regions.json / sol.json when the projector ran;
 │   │                                #   + kernel_ledger.yaml with a profile.kernel_coverage block)
+│   │   └── analysis_manifest.yaml   # orchestrator: successful full analysis identity and source capture link
 │   └── item_<j>_<id>/attempt_<k>/   # per item: optimization_summary.md, evaluation.md, result *.json
 │       └── profile/                 # accept-evidence nsys capture (APPROVEd attempts only)
 ├── final_verification/
@@ -513,12 +577,21 @@ running the CLI.
   README and [`task.example.yaml`](task.example.yaml) are the operator
   guide.
 - **Session scoping.** Agent sessions match each role's unit of work:
-  the analyzer keeps one session across the whole campaign (it must
-  remember the roadmap it authored), the optimizer's session spans one
+  the profiler runs stateless for each capture; the analyzer keeps one
+  session across the whole campaign (it must remember the roadmap it
+  authored), the optimizer's session spans one
   item's retry attempts and is reset between items, and the evaluator /
   qa run stateless — the judges always get fresh eyes, and no role drags
   a long campaign's stale context into later decisions. (The
   benchmarker, projector, qa, and reporter run once each.)
+- **Prompt extensions.** `PromptBundle.with_extensions(profiler=...)`
+  customizes capture instructions independently of
+  `with_extensions(analyzer=...)`, which customizes offline analysis and
+  planning. The composed prompts are snapshotted separately as
+  `prompts/profiler.md` and `prompts/analyzer.md`. Put server launch,
+  capture tooling, and export guidance in the profiler extension; put
+  interpretation, taxonomy, findings, and roadmap guidance in the
+  analyzer extension.
 - **Serve tuning lives in the workspace.** Every `trtllm-serve` launch in
   this workflow passes
   `--extra_llm_api_options <workspace>/tuning/extra_llm_api_options.yaml`
@@ -530,7 +603,7 @@ running the CLI.
   canonical `benchmark_serving.py` / `nsys profile` / `ncu` templates at
   the configured operating point(s) — one run per `benchmark.concurrency`
   point in Pareto-curve mode — so numbers stay comparable across the
-  whole campaign. Every nsys capture — the analyzer's round profile and
+  whole campaign. Every nsys capture — the profiler's round profile and
   the evaluator's accept-evidence capture alike — is exported to
   `.sqlite` and decomposed with the `internal-perf-nsight-system-analysis` skill
   into `nsys_analysis/`, so "the launch gaps shrunk" is a measured
@@ -540,12 +613,13 @@ running the CLI.
   check reads signed deltas out of `difference/rank-0/` instead of
   comparing two trees by eye. Kernels are classified with the
   checked-in TRT-LLM taxonomy
-  (`perf_analyze/assets/taxonomy_trtllm.json`), which the analyzer
-  extends per workload before quoting any category number. The
-  analyzer's ncu deep dive is bounded
+  (`perf_analyze/assets/taxonomy_trtllm.json`). The profiler's decomposition
+  supports capture targeting; the analyzer regenerates its own derived
+  outputs and extends the taxonomy per workload before quoting any
+  category number. The profiler's ncu deep dive is bounded
   (`--launch-count`, kernel filter from the top decomposition kernels)
-  and
-  interpreted with the `perf-nsight-compute-analysis` skill; both
+  and the analyzer interprets its saved results with the
+  `perf-nsight-compute-analysis` skill; both
   degrade gracefully when the tool or the skill is unavailable.
 - **Multi-rank capture (`profile.profile_ranks`, default `[0]`).**
   Listing several ranks wraps each of them separately inside the
@@ -566,7 +640,8 @@ running the CLI.
   share bar** (enumerated from the fresh kern_sum, extended until the
   coverage target is reached, captured over up to 3 bounded ncu passes
   that re-filter on still-missing stems so once-per-step kernels are
-  not starved by per-layer hot ones). Each round the analyzer must then
+  not starved by per-layer hot ones). The profiler owns targeting and
+  capture coverage; for each fresh analysis the analyzer must then
   answer four questions per enumerated kernel — *can it be eliminated?*
   *can it be made faster?* *can it be fused with its neighbors?* *can it
   be overlapped with independent work on another stream?* — in
@@ -616,7 +691,7 @@ running the CLI.
   possibility was never considered; the reporter's *Kernel Coverage* section resolves
   the final ledger's dispositions to campaign outcomes and itemizes the
   untried tail. Requires `nsys` + `ncu` in `profile.methods`; costs
-  extra profiling wall-clock per round.
+  extra profiling wall-clock in rounds that collect fresh captures.
 
 - **Headroom ledger (optional).** A `profile.headroom_ledger` block in
   `task.yaml` (empty mapping = defaults: `enforcement: warn`,
@@ -718,7 +793,7 @@ running the CLI.
   `internal-glean-search` skill / `internal-glean-specialist` subagent
   as read-only reference, used only if it is installed in the
   session.
-- **Cost.** The analyzer re-profiles every round that follows an accept
+- **Cost.** The profiler runs every round that follows an accept
   or a potentially build-changing reverted code attempt (nsys plus
   the bounded ncu deep dive by default); set `profile.methods: [nsys]`
   to trim it. When the standing runtime profile is still current, the
@@ -728,12 +803,14 @@ running the CLI.
   profiled replay (the accept-evidence capture), and the final
   verification runs one more benchmark at campaign end. The per-item
   evaluator benchmark is the irreducible price of per-item attribution;
-  raising `max_items_per_round` amortizes an analyzer profile across
+  raising `max_items_per_round` amortizes a round's capture across
   more serial items or widens a parallel batch. Parallel execution trades extra
   isolation/integration work for concurrency. Across the campaign,
   `max_rounds` remains the primary round budget.
 - **Local vs Slurm.** With a `slurm-environment` block, every
-  server-launching role (all but the projector and the reporter) is
+  server-launching role (benchmarker, profiler, optimizer, evaluator,
+  integrator, and qa) is
   augmented with the Slurm container-bootstrap guidance, exactly like
-  perf-analyze. The projector launches no servers; under Slurm it runs
-  on the login node and records the latency constants as unmeasured.
+  perf-analyze. The analyzer works from local saved artifacts and needs
+  no server bootstrap. The projector launches no servers; under Slurm
+  it runs on the login node and records the latency constants as unmeasured.

@@ -42,6 +42,9 @@ STATE_FILENAME = ".perf_optimize_state.json"
 # checkpointed batch.  V2 checkpoints cannot be resumed safely because a
 # single checkout and a single current_item_id do not identify the work done
 # by concurrent item workers.
+# The profiler split is additive within v3. Old analyzer cursors that still
+# owe a capture migrate to profiler; new analyzer cursors resume from their
+# independently checkpointed capture.
 SCHEMA_VERSION = 3
 ITEM_EXECUTIONS = ("serial", "parallel")
 
@@ -57,8 +60,10 @@ ITEM_EXECUTIONS = ("serial", "parallel")
 #                       internal-perf-sol-analysis skill and writes
 #                       ``sol_projection.md``; skipped (never marked
 #                       done) otherwise.
-#   - ``analyzer``    — start of each round: profiles the current build and
-#                       writes/updates ``roadmap.yaml`` (items ordered by
+#   - ``profiler``    — conditional capture of the current runtime, with a
+#                       validated manifest checkpointed before analysis.
+#   - ``analyzer``    — interprets saved captures offline and writes/updates
+#                       ``roadmap.yaml`` (items ordered by
 #                       expected perf benefit). Opens **replan-only** (no
 #                       server, no profiler) when the standing runtime
 #                       profile is known to remain current.
@@ -81,6 +86,7 @@ ITEM_EXECUTIONS = ("serial", "parallel")
 #                       ``.html`` from every role's artifacts.
 STAGE_BENCHMARKER = "benchmarker"
 STAGE_PROJECTOR = "projector"
+STAGE_PROFILER = "profiler"
 STAGE_ANALYZER = "analyzer"
 # Public stage while the per-item optimizer/evaluator attempt loops run.
 STAGE_OPTIMIZER_EVALUATOR = "optimizer_evaluator"
@@ -94,6 +100,7 @@ STAGE_REPORTER = "reporter"
 _VALID_STAGES = (
     STAGE_BENCHMARKER,
     STAGE_PROJECTOR,
+    STAGE_PROFILER,
     STAGE_ANALYZER,
     STAGE_OPTIMIZER_EVALUATOR,
     STAGE_INTEGRATOR,
@@ -104,6 +111,7 @@ _VALID_STAGES = (
 # The stages that make up one optimization round, in order. ``qa`` is
 # not one of them: it runs once, after the round loop concludes.
 ROUND_STAGES = (
+    STAGE_PROFILER,
     STAGE_ANALYZER,
     STAGE_OPTIMIZER_EVALUATOR,
     STAGE_INTEGRATOR,
@@ -137,13 +145,17 @@ class WorkflowState:
     round_index: int = 0
     item_index: int = 0
     attempt_index: int = 0
-    # Whether the next analyzer turn must profile rather than re-plan from
+    # Whether the next round must profile rather than re-plan from
     # ``last_profiled_analysis_dir``. True initially and before an accepted
     # candidate or integrated batch is promoted into the campaign.
     profile_required: bool = True
+    # Independently checkpointed capture consumed by the offline analyzer.
+    # May name imported evidence; its presence alone never proves that the
+    # current campaign runtime matches that evidence.
+    last_profile_dir: str = ""
     # The analysis directory holding the newest evidence of the current
     # campaign's build — the round directory of the last analyzer turn
-    # that actually produced a profile. Imported evidence belongs to a
+    # that analyzed a new local profile. Imported evidence belongs to a
     # different run and never advances it; neither do replan-only rounds.
     # Empty until this campaign's first real profile lands.
     last_profiled_analysis_dir: str = ""
@@ -157,7 +169,7 @@ class WorkflowState:
     # and the retry.
     approach_violation: str = ""
     # The most recent nsys capture of the system as currently accepted:
-    # the round's ``analysis/`` directory after each analyzer profile, or
+    # the round's ``profile/`` directory after each profiler capture, or
     # an accepted attempt's ``profile/`` directory after an
     # accept-evidence capture. The evaluator compares its own capture
     # against it; "" until the first capture lands (or when nsys is not
@@ -169,6 +181,9 @@ class WorkflowState:
     # so a resume never re-plans from scratch).
     reuse_analysis_dir: str = ""
     reuse_pending: bool = False
+    # Rebuild derived outputs from imported captures instead of planning
+    # from imported findings. Preserved while the analyzer is retried.
+    reanalyze_pending: bool = False
     # The dedicated campaign branch in ``trtllm_repo_path`` and the
     # HEAD it was created from (the reporter diffs ``base..HEAD``).
     campaign_git_branch: str = ""
@@ -224,6 +239,19 @@ def load_state(path: Path) -> WorkflowState:
             f"item_batch — the checkpoint is inconsistent. Delete the "
             f"file to start fresh."
         )
+    profile_required = (
+        data["profile_required"] if isinstance(data.get("profile_required"), bool) else True
+    )
+    last_profiled_analysis_dir = str(data.get("last_profiled_analysis_dir", "") or "")
+    if (
+        "last_profile_dir" not in data
+        and stage == STAGE_ANALYZER
+        and not data.get("reuse_pending", False)
+        and (profile_required or not last_profiled_analysis_dir)
+    ):
+        # Before the split, entering analyzer did not certify a completed
+        # capture. Preserve the conservative capture requirement on resume.
+        stage = STAGE_PROFILER
     return WorkflowState(
         task_path=str(data["task_path"]),
         max_rounds=int(data.get("max_rounds", 3)),
@@ -233,15 +261,15 @@ def load_state(path: Path) -> WorkflowState:
         round_index=int(data.get("round_index", 0)),
         item_index=int(data.get("item_index", 0)),
         attempt_index=int(data.get("attempt_index", 0)),
-        profile_required=(
-            data["profile_required"] if isinstance(data.get("profile_required"), bool) else True
-        ),
-        last_profiled_analysis_dir=str(data.get("last_profiled_analysis_dir", "") or ""),
+        profile_required=profile_required,
+        last_profile_dir=str(data.get("last_profile_dir", "") or ""),
+        last_profiled_analysis_dir=last_profiled_analysis_dir,
         current_item_id=current_item_id,
         approach_violation=str(data.get("approach_violation", "") or ""),
         last_nsys_dir=str(data.get("last_nsys_dir", "") or ""),
         reuse_analysis_dir=str(data.get("reuse_analysis_dir", "") or ""),
         reuse_pending=bool(data.get("reuse_pending", False)),
+        reanalyze_pending=bool(data.get("reanalyze_pending", False)),
         campaign_git_branch=str(data.get("campaign_git_branch", "") or ""),
         campaign_git_base_commit=str(data.get("campaign_git_base_commit", "") or ""),
         item_worktree_path=str(data.get("item_worktree_path", "") or ""),

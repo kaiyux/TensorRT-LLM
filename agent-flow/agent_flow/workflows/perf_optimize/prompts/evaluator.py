@@ -107,7 +107,7 @@ story. Procedure, after your clean measurement and gate arithmetic:
   benchmark at that same point (at least 2× its measured wall time,
   never a default shell timeout).
 - Then **decompose that capture with the `internal-perf-nsight-system-analysis`
-  skill**, exactly as the Analyzer's Run A step 5 does: `nsys export
+  skill**, using the shared Run A step 5 recipe below: `nsys export
   --type sqlite`, then the skill's `run_all.py`. This is what makes "the
   launch gaps shrunk" a number rather than an impression. Load the skill
   via the `Skill` tool (fully-qualified
@@ -116,14 +116,17 @@ story. Procedure, after your clean measurement and gate arithmetic:
   one line and compare on the `nsys stats` kernel table alone — never
   block the verdict on it, and never state a split you did not measure.
 - **Run it comparative, not twice single-variant.** The previous capture
-  of the accepted state (your instructions name its directory) kept its
-  own `server_nsys.sqlite`; hand the skill both sides in one command and
-  let it do the differencing:
+  of the accepted state (your instructions name its directory) has an
+  associated `server_nsys.sqlite` and taxonomy. For a round capture, use
+  its completed `analysis/` exports/taxonomy; the manifest links that
+  analysis to `profile/`. Accepted-attempt captures keep them together.
+  Keep previous captures and analyses read-only. Hand the skill both
+  sides in one command and let it do the differencing:
   ```bash
   python <skill_dir>/scripts/run_all.py \\
-      --taxonomy <previous capture dir>/taxonomy.json \\
+      --taxonomy <previous analysis taxonomy.json> \\
       --out <attempt>/profile/nsys_analysis \\
-      --variant before --profile 0=<previous capture dir>/server_nsys.sqlite \\
+      --variant before --profile 0=<previous capture or analysis server_nsys.sqlite> \\
       --variant after  --profile 0=<attempt>/profile/server_nsys.sqlite
   ```
   It writes `difference/rank-0/iteration.json` — `iter_ms`,
@@ -131,8 +134,8 @@ story. Procedure, after your clean measurement and gate arithmetic:
   after − before — plus `difference/rank-0/module_slice.json`, the
   per-module signature diff carrying a per-call Δ that survives a
   count mismatch. Use the taxonomy that capture was classified with —
-  its own `taxonomy.json` if it kept one, else the round's
-  `analysis/taxonomy.json`, which the Analyzer iterated — so both sides
+  the associated round's `analysis/taxonomy.json`, which the Analyzer
+  iterated, or the accepted attempt's own `taxonomy.json` — so both sides
   are classified identically; a diff across two taxonomies is not a
   diff. Copy the one you used into this capture's directory, so the next
   attempt's comparison finds it in the same place. Where the previous

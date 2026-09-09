@@ -32,7 +32,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "candidates or integrate and benchmark a parallel batch, run the full optimize.max_rounds "
         "budget unless the roadmap exhausts or the improvement target is met, "
         "verify the final state with one independent QA benchmark, and report "
-        "expected-vs-measured gains — via a benchmarker -> [analyzer -> "
+        "expected-vs-measured gains — via a benchmarker -> [optional profiler -> analyzer -> "
         "(optimizer <-> evaluator) items -> optional integrator] x rounds "
         "-> qa -> reporter loop. "
         "A one-shot SOL projector stage runs between the baseline and "
@@ -52,8 +52,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "SOL projector stage — on by default — and `gpu` names the GPU "
         "part for the SOL skill's peaks calculator). "
         "An optional `profile.kernel_coverage` block "
-        "activates the per-kernel coverage contract: the analyzer's ncu "
-        "dive covers every kernel above the share bar and answers "
+        "activates the per-kernel coverage contract: the profiler's ncu "
+        "dive covers every kernel above the share bar, and the analyzer answers "
         "eliminable?/faster?/fusible?/overlappable? per kernel in a "
         "schema-validated kernel_ledger.yaml each round. An optional "
         "`profile.headroom_ledger` block (requires the two above) adds the "
@@ -94,24 +94,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(+ sol_work/), and newest profile findings (+ traces and "
         "kernel_ledger.yaml) are copied into this workspace, the "
         "benchmarker/projector stages are skipped, and round 1's analyzer "
-        "runs plan-only — authoring roadmap.yaml from the imported evidence "
+        "runs plan-only by default — authoring roadmap.yaml from the imported evidence "
         "with no server, profiler, or benchmark. A source roadmap.yaml is "
         "kept aside as read-only prior art (reused_analysis/), never as this "
-        "campaign's ledger. Whatever the source lacks is produced normally. "
+        "campaign's ledger. Add --reanalyze to reinterpret the saved captures "
+        "offline before optimizing. Whatever the source lacks is produced normally. "
         "Fresh runs only — ignored on resume.",
+    )
+    parser.add_argument(
+        "--reanalyze",
+        action="store_true",
+        help="With --reuse-analysis DIR, regenerate round 1's findings and "
+        "analysis products from saved profiler captures without launching "
+        "a server, profiler, or benchmark for that analysis, then continue "
+        "the optimization campaign normally. Requires reusable captures. "
+        "Fresh runs only; omit this flag when resuming, since the requested "
+        "analysis mode is checkpointed.",
     )
     parser.add_argument(
         "--max-rounds",
         type=int,
         default=None,
         help="Override `optimize.max_rounds` from task.yaml on a fresh run "
-        "(each round opens with an analyzer turn — a re-profile when the "
-        "standing profile is stale, a replan otherwise — then evaluates up "
+        "(each round opens with an optional profiler when the standing profile "
+        "is stale, then an analyzer turn — reusing findings for a replan "
+        "otherwise — then evaluates up "
         "to `optimize.max_items_per_round` roadmap items per the configured "
         "`optimize.item_execution` mode). "
         "Ignored on resume — the checkpointed budget wins.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.reanalyze and not args.reuse_analysis:
+        parser.error("--reanalyze requires --reuse-analysis DIR")
+    if args.reanalyze and not args.clean and (args.workspace / STATE_FILENAME).is_file():
+        parser.error(
+            "--reanalyze is for fresh runs only; omit it to resume the checkpointed "
+            "analysis mode, or use a new --workspace or --clean to start fresh"
+        )
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -154,6 +174,7 @@ def main(argv: list[str] | None = None) -> None:
         prompts=prompts,
         max_rounds_override=args.max_rounds,
         reuse_analysis=args.reuse_analysis,
+        reanalyze=args.reanalyze,
         sol_methodology=methodology,
     ) as workflow:
         prompt_dir = args.workspace / PROMPTS_DIRNAME

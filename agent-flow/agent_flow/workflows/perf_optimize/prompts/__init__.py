@@ -9,6 +9,7 @@ from agent_flow.workflows.perf_analyze.prompts import (
 )
 
 from ._common import (
+    DISAGG_ANALYSIS_CONTEXT,
     DISAGG_CAMPAIGN,
     EXECUTION_SLURM_BOOTSTRAP,
     HEADROOM_LEDGER_REPORTER_GUIDANCE,
@@ -17,6 +18,7 @@ from ._common import (
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
+    SOL_PROFILER_CONTEXT,
     approach_restriction_note,
     headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
@@ -28,6 +30,8 @@ from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
 from .evaluator import SYSTEM_PROMPT as EVALUATOR_SYSTEM_PROMPT
 from .integrator import SYSTEM_PROMPT as INTEGRATOR_SYSTEM_PROMPT
 from .optimizer import SYSTEM_PROMPT as OPTIMIZER_SYSTEM_PROMPT
+from .profiler import SYSTEM_PROMPT as PROFILER_SYSTEM_PROMPT
+from .profiler import build_profiler_prompt
 from .projector import SYSTEM_PROMPT as PROJECTOR_SYSTEM_PROMPT
 from .projector import build_projector_prompt
 from .qa import SYSTEM_PROMPT as QA_SYSTEM_PROMPT
@@ -36,7 +40,7 @@ from .reporter import SYSTEM_PROMPT as REPORTER_SYSTEM_PROMPT
 
 @dataclass(frozen=True)
 class PromptBundle:
-    """System prompts for the seven agents in ``PerfOptimizeWorkflow``.
+    """System prompts for the nine agents in ``PerfOptimizeWorkflow``.
 
     Pass a custom bundle to ``PerfOptimizeWorkflow(..., prompts=...)``
     to swap or extend the default prompts; use ``with_extensions`` to
@@ -51,12 +55,14 @@ class PromptBundle:
     integrator: str
     qa: str
     reporter: str
+    profiler: str = PROFILER_SYSTEM_PROMPT
 
     def with_extensions(
         self,
         *,
         benchmarker: str = "",
         projector: str = "",
+        profiler: str = "",
         analyzer: str = "",
         optimizer: str = "",
         evaluator: str = "",
@@ -79,6 +85,7 @@ class PromptBundle:
         return PromptBundle(
             benchmarker=_append(self.benchmarker, benchmarker),
             projector=_append(self.projector, projector),
+            profiler=_append(self.profiler, profiler),
             analyzer=_append(self.analyzer, analyzer),
             optimizer=_append(self.optimizer, optimizer),
             evaluator=_append(self.evaluator, evaluator),
@@ -91,6 +98,7 @@ class PromptBundle:
 DEFAULT_PROMPTS = PromptBundle(
     benchmarker=BENCHMARKER_SYSTEM_PROMPT,
     projector=PROJECTOR_SYSTEM_PROMPT,
+    profiler=PROFILER_SYSTEM_PROMPT,
     analyzer=ANALYZER_SYSTEM_PROMPT,
     optimizer=OPTIMIZER_SYSTEM_PROMPT,
     evaluator=EVALUATOR_SYSTEM_PROMPT,
@@ -115,15 +123,16 @@ def build_perf_optimize_prompts(
 
     When ``include_slurm_environment`` is True (the task spec carries a
     ``slurm-environment`` block), the Slurm container-bootstrap guidance
-    is appended to every role that launches servers — all of them except
-    the reporter, which only synthesizes existing artifacts, and the
-    projector, which launches no servers either (under Slurm it runs on
+    is appended to every role that launches servers, including the profiler.
+    The analyzer works offline; the reporter synthesizes existing artifacts;
+    the projector launches no servers either (under Slurm it runs on
     the login node and records the latency constants as unmeasured, per
     its own prompt).
 
     ``remote_execution`` is the resolved task spec. When it names an SSH
     target, a short remote boundary plus its task-specific connection and
-    Slurm values is appended to every role that may touch runtime data.
+    Slurm values is appended to runtime-executing roles. The analyzer
+    consumes staged artifacts locally and gets no launch instructions.
 
     When ``approaches`` (``optimize.approaches`` from the task spec)
     restricts the run to a subset of the roadmap's approach values, the
@@ -141,7 +150,8 @@ def build_perf_optimize_prompts(
     leaving the roadmap exhausted), the optimizer (aim each item's
     realization at the binding ceiling — context, never an expansion of
     the item), and the reporter (the "Projection vs Measured" section
-    with its remaining-gap accountability breakdown). The projector's
+    with its remaining-gap accountability breakdown). The profiler gets
+    only missing-constant calibration and snapshot guidance. The projector's
     own SOL prompt is always in the bundle — the stage gate lives in
     the workflow. The evaluator and QA deliberately get no SOL context:
     their gates are measured-vs-measured with deterministic thresholds,
@@ -159,8 +169,8 @@ def build_perf_optimize_prompts(
 
     When ``kernel_coverage`` is set (the validated
     ``profile.kernel_coverage`` block — the per-kernel coverage
-    contract), the analyzer gets the coverage-driven ncu targeting, the
-    four per-kernel questions (eliminable? faster? fusible?
+    contract), the profiler gets coverage-driven ncu targeting and the
+    analyzer gets the four per-kernel questions (eliminable? faster? fusible?
     overlappable?), and the
     ``kernel_ledger.yaml`` contract with the task's bars interpolated;
     the reporter gets the "Kernel Coverage" accountability section. The
@@ -181,9 +191,9 @@ def build_perf_optimize_prompts(
     block), the disaggregated-serving section is appended to every role
     that launches or measures a server. It supersedes the single-server
     lifecycle, the tuning-config note and the profiling runs those roles
-    otherwise follow, so it is composed last. The reporter and the
-    projector are left alone: neither stands up a server, and the
-    reporter reads the artifacts the others produced either way.
+    otherwise follow, so it is composed last. The analyzer gets only
+    topology and interpretation context. The reporter and projector are
+    left alone: neither stands up a server.
 
     Composing it here rather than carrying it unconditionally is what
     keeps the override unambiguous — a role either has the section and it
@@ -205,7 +215,7 @@ def build_perf_optimize_prompts(
         )
         bundle = dataclasses.replace(
             bundle,
-            analyzer=build_analyzer_prompt(
+            profiler=build_profiler_prompt(
                 ncu_targeting=ncu_targeting, headroom_ledger=headroom_ledger is not None
             ),
         )
@@ -221,7 +231,7 @@ def build_perf_optimize_prompts(
     if include_slurm_environment:
         bundle = bundle.with_extensions(
             benchmarker=EXECUTION_SLURM_BOOTSTRAP,
-            analyzer=EXECUTION_SLURM_BOOTSTRAP,
+            profiler=EXECUTION_SLURM_BOOTSTRAP,
             optimizer=EXECUTION_SLURM_BOOTSTRAP,
             evaluator=EXECUTION_SLURM_BOOTSTRAP,
             integrator=EXECUTION_SLURM_BOOTSTRAP,
@@ -229,6 +239,7 @@ def build_perf_optimize_prompts(
         )
     if include_sol:
         bundle = bundle.with_extensions(
+            profiler=SOL_PROFILER_CONTEXT,
             analyzer=SOL_ANALYZER_CONTEXT,
             optimizer=SOL_OPTIMIZER_CONTEXT,
             reporter=SOL_OPTIMIZE_REPORTER_GUIDANCE,
@@ -253,7 +264,8 @@ def build_perf_optimize_prompts(
     if include_disagg:
         bundle = bundle.with_extensions(
             benchmarker=DISAGG_CAMPAIGN,
-            analyzer=DISAGG_CAMPAIGN,
+            profiler=DISAGG_CAMPAIGN,
+            analyzer=DISAGG_ANALYSIS_CONTEXT,
             optimizer=DISAGG_CAMPAIGN,
             evaluator=DISAGG_CAMPAIGN,
             integrator=DISAGG_CAMPAIGN,
@@ -264,7 +276,7 @@ def build_perf_optimize_prompts(
         bundle = bundle.with_extensions(
             benchmarker=context,
             projector=context,
-            analyzer=context,
+            profiler=context,
             optimizer=context,
             evaluator=context,
             qa=context,
@@ -279,6 +291,7 @@ __all__ = [
     "EVALUATOR_SYSTEM_PROMPT",
     "INTEGRATOR_SYSTEM_PROMPT",
     "OPTIMIZER_SYSTEM_PROMPT",
+    "PROFILER_SYSTEM_PROMPT",
     "PROJECTOR_SYSTEM_PROMPT",
     "PROMPTS_DIRNAME",
     "REMOTE_SLURM_EXECUTION",
@@ -286,6 +299,8 @@ __all__ = [
     "QA_SYSTEM_PROMPT",
     "REPORTER_SYSTEM_PROMPT",
     "build_perf_optimize_prompts",
+    "build_analyzer_prompt",
+    "build_profiler_prompt",
     "build_projector_prompt",
     "dump_prompt_bundle",
 ]

@@ -1,9 +1,3 @@
-from agent_flow.workflows.perf_analyze.prompts._common import (
-    build_benchmark_flags_reference,
-    build_profiling_runs_reference,
-    build_server_lifecycle,
-)
-
 from ._common import (
     BOTTLENECK_TAXONOMY,
     CASEBOOK_CONSULTATION,
@@ -11,13 +5,16 @@ from ._common import (
     KERNEL_REUSE_ANALYZER,
     MEASUREMENT_METRICS,
     PROFILE_FINDINGS_CONTRACT,
-    PROFILING_KNOB_VERIFICATION,
     ROADMAP_SPEC,
+    build_offline_analysis_reference,
 )
 
 _ANALYZER_WORKFLOW = """\
-You are the **Analyzer**: diagnose the current runtime and maintain
+You are the **Analyzer**: interpret saved profiling evidence and maintain
 `roadmap.yaml`, the ranked optimization plan. Never apply optimizations.
+You work offline: never launch a server, benchmark workload, profiler
+capture, Slurm job, or disaggregated-serving harness. Offline `nsys export`,
+`nsys stats`, `ncu --import`, and analysis scripts are allowed.
 
 ## Round mode and workflow
 
@@ -28,49 +25,57 @@ alone, since a reverted code attempt may leave rebuilt ignored output.
    and prior evaluation reports. `read_latest_progress` with
    `agent: "evaluator"` provides structured `decision` / `reason_category`
    verdicts. Load the casebook as read-only reference.
-2. **Profiling round:** verify the profiling knobs, capture the current
-   build using `profile.methods` and the effective profiling point policy
-   below, analyze the traces, and tear down every server. Run the
-   dormant-capability sweep in round 1 before planning.
+2. **Full analysis**, including **re-analysis of existing captures**:
+   read the supplied profile directory and `profile_manifest.json`, verify
+   provenance and available evidence, and rerun offline exports,
+   decomposition, taxonomy refinement, ncu interpretation and SOL
+   correlation as needed. A new capture is not required. Write a fresh
+   analysis in the supplied output directory, even when the profile came
+   from an earlier round or another workspace. Run the dormant-capability
+   sweep in round 1 before planning.
    **Replan-only round** (including reused analysis): launch no server,
    run no profiler, and use the standing analysis directory supplied in
    your instructions plus evaluator verdicts. Do not regenerate measured
    artifacts. Write a short replan note naming the source analysis, failed
-   items and verdicts, and resulting roadmap changes; the full profiling
-   findings structure applies only to rounds that profile.
+   items and verdicts, and resulting roadmap changes; the full findings
+   structure applies only to full analysis, including re-analysis.
 3. Write findings and the applicable ledgers, then author the roadmap in
    round 1 or update it in place in later rounds under the roadmap
    contract. Evidence may justify new items, revised pending items, or
    marking pending items obsolete. Never pad the roadmap: no actionable
    pending item is a valid plateau and ends the campaign.
 4. Call `append_analyzer_progress` exactly once, as the last action of
-   your turn. Its only argument is `summary`: round mode, profilers and
-   artifacts (or standing analysis and verdicts), and items added,
-   re-ordered or marked obsolete with expected gains.
+   your turn. Its only argument is `summary`: round mode, source capture
+   identity and artifacts (or standing analysis and verdicts), and items
+   added, re-ordered or marked obsolete with expected gains. If evidence
+   is insufficient, include `Additional capture requested: <method,
+   operating point, ranks/targets, and reason>` in the summary; do not
+   collect it yourself. Missing evidence must remain explicit in findings.
 
 ## Workspace and ownership
 
 - Read-only: `task.yaml`, `baseline/benchmark_results.md`, the active
-  tuning config, the accepted config snapshot, earlier round directories,
-  optimization reports, and `sol_projection.md` when available.
+  tuning config, the accepted config snapshot, all profiler artifacts and
+  `profile_manifest.json`, earlier round directories, optimization reports,
+  and `sol_projection.md` when available. Preserve the source capture.
 - `roadmap.yaml` is your primary output. Its contract defines field
   ownership and round-1 initialization.
 - This round's `rounds/round_<n>/analysis/` directory holds
-  `profile_findings.md`, profiler reports, `nsys_analysis/`, benchmark
-  JSON, and optional `regions.json`, `sol.json`, `sol_recipes/` and
-  `kernel_ledger.yaml`. Use the exact artifact path from your instructions
-  wherever a capture command says `<workspace>`.
+  `profile_findings.md`, derived exports, `taxonomy.json`, `nsys_analysis/`,
+  and optional `regions.json`, `sol.json`, `sol_recipes/` and
+  `kernel_ledger.yaml`. Recompute derived data here; never overwrite the
+  profiler's preliminary decomposition, reports, or manifest. In offline
+  commands, `<workspace>` means this analysis directory; `<profile_dir>`
+  means the read-only source capture directory supplied in your turn.
+- `<campaign_workspace>` always means the campaign root containing
+  `task.yaml`, `sol_projection.md`, `sol_work/` and `roadmap.yaml`.
+- For multiple operating points, keep each point under `concurrency_<c>`
+  and the highest point's primary derived artifacts at the analysis root
+  for ledger validation. Identify every point and source report from the
+  manifest; do not infer a new capture policy from the current task.
 - `sol_work/peaks.json` is campaign-level; the SOL correlation contract
   defines permitted updates. Optional ledgers have their own contracts.
 - Record `progress.yaml` only through `append_analyzer_progress`.
-
-## The active tuning config
-
-Always pass `--extra_llm_api_options` with the exact active tuning config
-path supplied in your turn instructions, even when its contents are `{}`.
-Treat it and the accepted config snapshot as read-only. All tuning and
-parallel sizes come from this config; serve `checkpoint_path` with
-`--backend pytorch` at `127.0.0.1:8000`.
 
 ## Evidence and expected gains
 
@@ -98,51 +103,25 @@ parallel sizes come from this config; serve `checkpoint_path` with
   `pct_of_iter`, not the whole rank spread. A pinned machine issue may be
   outside this campaign; rotating imbalance calls for work distribution.
 - Every proposed approach must be allowed by `optimize.approaches`.
-  Verify code eligibility once per round in the actual runtime environment:
-  `python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"`.
-  The path must resolve under the active runtime checkout named in your
-  instructions (`trtllm_repo_path` by default). If not, exclude code
-  items and report the blocker; config remains eligible only if allowed.
-"""
-
-_PROFILE_POINT_POLICY = """\
-- **Effective profiling point policy:** replay only the **largest**
-  configured `benchmark.concurrency` point (the configured value in
-  scalar mode). Profiling replays are not scored curve measurements.
-  Start a fresh server for each capture pass so its iteration window
-  refers to the same steady-state load.
-"""
-
-_HEADROOM_POINT_POLICY = """\
-- **Effective profiling point policy:** with `profile.headroom_ledger`,
-  profile the **lowest and highest scored concurrency points**: use
-  `optimize.focus_concurrencies` when set, otherwise `benchmark.concurrency`.
-  Deduplicate identical endpoints; scalar mode has one point. These are
-  profiling replays, not a full scored curve sweep. Capture each point
-  separately with a fresh server and its paired `num_prompts`, isolating
-  artifacts under `concurrency_<c>`. Keep the highest point's primary
-  analysis artifacts at the round analysis root for ledger validation.
+  Verify code eligibility from the profiler's recorded `runtime.import_path`
+  and `runtime.checkout`, or equivalent saved runtime provenance. Do not
+  launch a runtime probe to re-analyze. If the captured import did not
+  resolve under the runtime checkout, or that provenance is missing,
+  exclude unsupported code items and report the blocker; config remains
+  eligible only if allowed. The current source checkout may differ from
+  the profiled build: ground trace/source claims in the recorded build
+  identity and distinguish later source changes from captured behavior.
 """
 
 
-def build_analyzer_prompt(
-    *, ncu_targeting: str | None = None, headroom_ledger: bool = False
-) -> str:
-    """Compose one effective capture and operating-point policy for the analyzer."""
-    point_policy = _HEADROOM_POINT_POLICY if headroom_ledger else _PROFILE_POINT_POLICY
+def build_analyzer_prompt() -> str:
+    """Compose offline evidence interpretation and roadmap planning guidance."""
     return "\n\n".join(
         (
             _ANALYZER_WORKFLOW,
             CASEBOOK_CONSULTATION,
-            build_server_lifecycle(active_tuning_config=True),
-            build_benchmark_flags_reference(point_policy),
             MEASUREMENT_METRICS,
-            PROFILING_KNOB_VERIFICATION,
-            build_profiling_runs_reference(
-                ncu_targeting,
-                launch_count="<8 x pass stem count; cap 300>" if ncu_targeting else "40",
-                artifact_suffix="_pass<k>" if ncu_targeting else "",
-            ),
+            build_offline_analysis_reference(),
             BOTTLENECK_TAXONOMY,
             PROFILE_FINDINGS_CONTRACT,
             DORMANT_CAPABILITY_SWEEP,

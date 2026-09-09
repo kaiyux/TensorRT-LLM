@@ -88,10 +88,11 @@ Ready-to-run multi-agent workflows ship as subpackages of
   dominant bottleneck. It applies nothing and never mutates the TensorRT-LLM
   checkout. Launch via `perf-analyze`.
 - [`agent_flow.workflows.perf_optimize`](agent_flow/workflows/perf_optimize) —
-  the **applying** counterpart: it shares perf-analyze's benchmark, SOL
-  projection and analysis stages, then iterates Optimizer ↔ Evaluator rounds
-  that apply the top-ranked roadmap item (serving config and/or TRT-LLM source
-  on a dedicated git branch) and gate each attempt on measured gain, before a
+  the **applying** counterpart: it shares perf-analyze's benchmark and SOL
+  projection, then runs a separate Profiler for captures and an Analyzer
+  for offline interpretation and roadmap planning. Optimizer ↔ Evaluator
+  rounds apply the top-ranked roadmap items (serving config and/or TRT-LLM
+  source on a dedicated git branch) and gate each attempt on measured gain, before a
   stateless QA re-measurement and a final report. Launch via `perf-optimize`.
 
 The `agent-team` / `modeling-bringup` pipeline:
@@ -102,14 +103,35 @@ PlanDrafter ⇄ PlanReviewer [⇄ Human]  →  Coder ⇄ Reviewer  →  QA  ✔
 
 ![Agent-team workflow](./agent_flow/workflows/agent_team/docs/agent-team.svg)
 
-The `perf-analyze` / `perf-optimize` pipeline (the optimize rounds are the
-part perf-analyze does not have):
+The `perf-analyze` pipeline:
 
 ```
 Benchmarker  →  [Projector]  →  Analyzer  →  Reporter  ✔
-                                     ↓
-                   (Optimizer ⇄ Evaluator) × items × rounds  →  QA
 ```
+
+The `perf-optimize` pipeline:
+
+```
+Benchmarker → [Projector] → ([Profiler] → Analyzer → Optimizer ⇄ Evaluator) × rounds → QA → Reporter
+```
+
+The profiler runs when fresh captures are needed. The analyzer can reuse
+saved captures or replan from existing findings, and a failed analyzer
+turn resumes without repeating a completed capture. Parallel item
+evaluation also runs an Integrator before closing the round.
+
+To reinterpret an earlier run's captures in round 1 of a new optimization
+campaign:
+
+```bash
+perf-optimize --task task.yaml --workspace workspace/reanalysis \
+    --reuse-analysis workspace/previous-run --reanalyze
+```
+
+Without `--reanalyze`, `--reuse-analysis` plans from imported findings.
+Later rounds follow normal optimization and profiling rules in either
+case. Resume a re-analysis campaign without `--reanalyze`; its checkpoint
+preserves that choice.
 
 ### Run the modeling-bringup workflow
 

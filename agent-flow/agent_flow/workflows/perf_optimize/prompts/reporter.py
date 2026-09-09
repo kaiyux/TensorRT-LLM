@@ -27,13 +27,18 @@ inventing it.
   every item's status, attempts, expected vs measured gain (see the
   contract below).
 - `rounds/round_<n>/analysis/profile_findings.md` — each round's
-  profiling evidence. A round that opened **replan-only** (the standing
-  runtime profile was still current) carries a short replan note instead,
-  and no traces — that is by design, not a missing artifact.
-- `rounds/round_<n>/analysis/nsys_stats.txt` — each profiling round's
-  kernel-level `nsys stats` dump (the `cuda_gpu_kern_sum` table): round
-  1 is the baseline build's kernel picture; replan-only rounds have
-  none. These files are large — extract
+  interpreted evidence. Full re-analysis can reference an older capture;
+  its analysis timestamp is not a new measurement. A **replan-only** round
+  carries a short replan note and reuses the standing analysis.
+- `rounds/round_<n>/profile/profile_manifest.json` — capture identity,
+  runtime/build/config provenance, raw artifact paths and missing evidence.
+  `analysis/analysis_manifest.yaml` links a full analysis to its source
+  capture; follow that association when reading a re-analysis.
+- `rounds/round_<n>/profile/nsys_stats.txt` — each captured round's
+  kernel-level `nsys stats` dump (the `cuda_gpu_kern_sum` table). The
+  associated `analysis/nsys_stats.txt` may contain an offline re-export;
+  legacy campaigns keep both raw and derived artifacts under `analysis/`.
+  Round 1's selected capture describes the baseline build. Extract
   the kernel-summary rows with shell tools (`grep`/`head`/`awk`) rather
   than reading them whole.
 - `rounds/round_<n>/analysis/nsys_analysis/` — the same round's
@@ -159,10 +164,11 @@ overlapping streams over the whole capture, where the iteration budget
 that opens this section is a union clipped to the window. Where the two
 disagree about which kernel dominates, the budget is the one describing
 an iteration. "Before" is round 1's
-`analysis/nsys_stats.txt` (the baseline build). For "After", use the
-capture directory your driving instructions name as freshest. It is
-usually the last accepted attempt's `profile/`, but a closing analyzer
-round may have profiled the final accepted state later and superseded it.
+`profile/nsys_stats.txt` or its associated analysis export (the baseline
+build). For "After", use the capture directory your driving instructions
+name as freshest. It is usually the last accepted attempt's `profile/`,
+but a closing profiler round may have captured the final accepted state
+later and superseded it. Re-analysis alone never makes a capture newer.
 If the instructions say no capture postdates the last accept, fall back
 to the latest round profile and state which accepted items it misses.
 Open with one provenance line per profile: its round (or the accepted
@@ -170,12 +176,15 @@ item it captured), its capture window, and **which accepted items were in
 effect** when it was captured; never imply full coverage when the named
 fallback lacks later accepts, and note any capture mismatch (different
 iteration window / load) that weakens comparability. Where **both**
-sides carry a `nsys_analysis/`, open the section with the iteration
+sides have an associated `nsys_analysis/`, open the section with the iteration
 budget before the kernel table — per-iteration time, the busy rungs and
 the compute-absent split (launch-starved / blocking /
 dependency-stalled), before vs after — because that is what says whether
 the campaign bought GPU work or bought back host exposure; where either
-side lacks it, say so and compare on kernels alone. Then compare over
+side lacks it, say so and compare on kernels alone. Round captures use
+their associated `analysis/nsys_analysis/`; accepted-attempt captures
+keep `profile/nsys_analysis/`. Match analysis and capture identities,
+never pair a newer analysis with an unrelated capture. Then compare over
 the union of both profiles' top ~10 kernels by total GPU time:
 | kernel | before % | before ms | before calls | after % | after ms | after calls | Δ ms % |
 Abbreviate template-heavy kernel names to a distinctive stem,

@@ -6,8 +6,8 @@ enables a one-shot projector stage deriving the analytical
 speed-of-light ceiling — ``sol_projection.md``, per the
 ``internal-perf-sol-analysis`` skill — that the analyzer weighs and the
 reporter turns into a headroom-captured story), then iterates
-optimization rounds — the
-analyzer profiles the current build and ranks candidate optimizations
+optimization rounds — a conditional profiler captures the current build,
+then an offline analyzer interprets saved evidence and ranks candidate optimizations
 into ``roadmap.yaml`` by expected perf benefit; isolated optimizer/evaluator
 pairs run the top pending items serially or concurrently; each evaluator gates attempts on code quality,
 functionality, and measured gain vs expectation with a three-way
@@ -18,17 +18,17 @@ serial mode accepts each approved candidate directly. The loop runs the configur
 the roadmap is exhausted or the optional improvement target is met),
 stateless QA independently re-measures the final accepted state once —
 and finally a reporter synthesizes the expected-vs-measured story into
-``optimization_report.md`` / ``.html``. All eight roles run on the
+``optimization_report.md`` / ``.html``. All nine roles run on the
 Claude Code backend.
 
 Public surface:
 
 - :class:`PerfOptimizeWorkflow` — the orchestrator for the
-  benchmarker -> (projector) -> [analyzer -> serial/parallel
+  benchmarker -> (projector) -> [(profiler) -> analyzer -> serial/parallel
   (optimizer <-> evaluator) items -> optional integrator] x rounds -> qa -> reporter loop.
 - :class:`PromptBundle`, :data:`DEFAULT_PROMPTS`, and
   :func:`build_perf_optimize_prompts` — prompt bundle and helpers for
-  the workflow's eight agents.
+  the workflow's nine agents.
 - ``STAGE_*`` constants — stage identifiers used by the checkpoint schema
   (``<workspace>/.perf_optimize_state.json``).
 """
@@ -43,6 +43,7 @@ from .state import (
     STAGE_INTEGRATOR,
     STAGE_OPTIMIZER,
     STAGE_OPTIMIZER_EVALUATOR,
+    STAGE_PROFILER,
     STAGE_PROJECTOR,
     STAGE_QA,
     STAGE_REPORTER,
@@ -58,6 +59,7 @@ __all__ = [
     "STAGE_INTEGRATOR",
     "STAGE_OPTIMIZER",
     "STAGE_OPTIMIZER_EVALUATOR",
+    "STAGE_PROFILER",
     "STAGE_PROJECTOR",
     "STAGE_QA",
     "STAGE_REPORTER",

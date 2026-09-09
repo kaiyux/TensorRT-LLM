@@ -12,8 +12,8 @@ metadata:
 `trtllm-serve`: benchmarker (baseline) → projector (a one-shot
 analytical speed-of-light ceiling; on unless task.yaml sets
 `sol.enabled: false`) → a fixed budget of rounds of
-[analyzer (re-profile when the runtime evidence is stale; otherwise
-replan-only) → (optimizer ⇄ evaluator) per roadmap item] → one
+[(profiler, when fresh captures are needed) → analyzer (offline analysis
+or replan-only) → (optimizer ⇄ evaluator) per roadmap item] → one
 final-verification QA pass → reporter. Every change is gated on code
 quality, functionality, and measured gain vs the last accepted
 measurement — the evaluator's verdict is three-way (APPROVE / REJECT
@@ -22,6 +22,17 @@ profiled under nsys (accept-evidence capture). No agent decides when to
 stop: the loop runs `optimize.max_rounds` rounds unless the roadmap
 runs out of actionable items or the optional improvement target is met.
 The deliverable is `<workspace>/optimization_report.md` (+ `.html`).
+
+The profiler owns server lifecycle, nsys/ncu capture, exports, capture
+coverage, and provenance. The analyzer interprets saved evidence and
+authors findings, ledgers, and the roadmap without launching a server or
+GPU profiler. Capture and analysis have separate checkpoints, so a failed
+analysis can resume from a completed capture. Each successful full
+analysis records its source capture in `analysis/analysis_manifest.yaml`.
+Use
+`--reuse-analysis <dir> --reanalyze` to reinterpret existing captures in
+round 1 of a fresh campaign;
+plain `--reuse-analysis` plans from existing findings instead.
 
 Do not hand-roll a serve/benchmark/tune loop when the user asks to
 optimize serving performance — drive this workflow instead. Authoritative
@@ -143,8 +154,9 @@ than inventing values:
   - **Rounds are not equally expensive.** A round pays for a profile
     after an accept, after a reverted code attempt may have changed
     gitignored build output, or when an older checkpoint cannot prove its
-    profile is current. Otherwise it opens replan-only — the analyzer
-    plans from the standing profile and the round's verdicts without
+    profile is current. The profiler captures first and the analyzer
+    interprets those saved artifacts. Otherwise it opens replan-only —
+    the analyzer plans from the standing profile and the round's verdicts without
     touching the GPU. On a config-only plateau `max_rounds` costs almost
     nothing beyond the per-attempt benchmarks; a productive or
     code-mutating campaign pays more profiling turns.
@@ -170,8 +182,8 @@ than inventing values:
   made faster?*, *can it be fused with its neighbors?* and *can it be
   overlapped with independent work on another stream?* recorded in a
   schema-validated
-  `kernel_ledger.yaml` each profiling round (a roadmap item or an
-  evidence-backed dismissal per question; the orchestrator aborts the
+  `kernel_ledger.yaml` for each fresh analysis, including `--reanalyze`
+  (a roadmap item or an evidence-backed dismissal per question; the orchestrator aborts the
   round on an incomplete ledger — replan-only rounds run no ncu and are
   waived — and the report gains a Kernel Coverage accountability section
   resolving every disposition to its outcome). The four are ordered by
@@ -276,7 +288,9 @@ monitor.
 
 - **Resume**: re-running the identical command resumes from
   `<workspace>/.perf_optimize_state.json` — interruption (Ctrl-C, crash,
-  node loss) is safe.
+  node loss) is safe. If the launch used `--reanalyze`, omit that flag
+  when resuming; the checkpoint preserves the mode. A completed profiler
+  stage is not repeated when only the analyzer needs to retry.
 - **Fresh start**: `--clean` wipes the workspace's managed state but
   never touches the TRT-LLM checkout (abandoned `perf-optimize/*`
   branches are left for inspection).
@@ -301,6 +315,18 @@ monitor.
   `reused_analysis/prior_roadmap.yaml`, never as this campaign's ledger;
   `reused_analysis/manifest.md` records the provenance and the report
   repeats it. Fresh runs only — ignored on resume.
+- `--reuse-analysis <dir> --reanalyze` imports saved captures and runs
+  round 1's analyzer offline to regenerate its derivations, findings,
+  ledgers, and roadmap. Use it when methodology, taxonomy, or hypotheses
+  changed and the existing captures still cover the required evidence.
+  Capture discovery supports both the separate `profile/` layout and
+  legacy layouts, including a completed capture whose original analysis
+  failed. It requires raw evidence; findings alone are insufficient.
+  This is a fresh-campaign option, so an existing checkpoint rejects
+  `--reanalyze` unless `--clean` is also supplied. Resume without the
+  flag. Later optimization and profiling rounds proceed normally: the
+  option does not make the whole campaign offline, and imported captures
+  do not prove that this campaign's local runtime is current.
 
 ## 4. Monitor
 
@@ -317,7 +343,9 @@ Poll the workspace (and the launch log) rather than waiting silently:
   have been.
 - `baseline/benchmark_results.md` (and `sol_projection.md` right after
   it unless `sol.enabled: false`), then per-round
-  `rounds/round_<n>/` (`analysis/profile_findings.md`,
+  `rounds/round_<n>/` (`profile/profile_manifest.json` and raw captures,
+  `analysis/analysis_manifest.yaml` linking the source capture,
+  `analysis/profile_findings.md` and offline derivations/ledgers,
   `item_<j>_<id>/attempt_<k>/` — accepted attempts also grow a
   `profile/` nsys capture), and at the end
   `final_verification/verification_report.md`. A round whose standing
@@ -328,7 +356,7 @@ Poll the workspace (and the launch log) rather than waiting silently:
   branch — one commit per accepted item.
 
 If it dies, read the tail of the launch log, fix the environment issue,
-and re-run the same command to resume.
+and re-run the command to resume (omit `--reanalyze` on resume).
 
 ## 5. Wrap up
 

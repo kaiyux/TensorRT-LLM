@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agent_flow.workflows.perf_optimize import reuse
+from agent_flow.workflows.perf_optimize.profile import (
+    PROFILE_MANIFEST_NAME,
+    validate_profile_manifest,
+)
 
 # --------------------------------------------------------------------- helpers
 
@@ -59,6 +65,46 @@ def _import_into(source: Path, workspace: Path) -> reuse.ImportedAnalysis:
         sol_projection_path=workspace / "sol_projection.md",
         sol_work_dir=workspace / "sol_work",
         reuse_dir=workspace / reuse.REUSE_DIRNAME,
+    )
+
+
+def _capture(root: Path, capture_id: str = "round_1-capture") -> Path:
+    _write(root / "rank_0" / "server_nsys.nsys-rep", f"trace {capture_id}\n")
+    _write(root / "nsys_analysis" / "summary.json", '{"preliminary": true}\n')
+    manifest = {
+        "schema_version": 1,
+        "capture_id": capture_id,
+        "runtime": {
+            "serve_command": "serve model",
+            "benchmark_command": "bench model",
+            "config": "{backend: pytorch}",
+            "build": "abc123",
+            "import_path": "/repo/tensorrt_llm/__init__.py",
+        },
+        "methods": {
+            "nsys": {
+                "status": "captured",
+                "command": "nsys profile ...",
+                "artifacts": ["rank_0/server_nsys.nsys-rep", "nsys_analysis/summary.json"],
+            },
+            "ncu": {"status": "unavailable", "reason": "No counter permissions"},
+        },
+    }
+    _write(root / PROFILE_MANIFEST_NAME, json.dumps(manifest))
+    return root
+
+
+def _split_import(source: Path, workspace: Path, *, reanalyze: bool = False):
+    return reuse.import_analysis(
+        reuse.discover(source),
+        workspace=workspace,
+        baseline_dir=workspace / "baseline",
+        analysis_dir=workspace / "rounds" / "round_1" / "analysis",
+        profile_dir=workspace / "rounds" / "round_1" / "profile",
+        sol_projection_path=workspace / "sol_projection.md",
+        sol_work_dir=workspace / "sol_work",
+        reuse_dir=workspace / reuse.REUSE_DIRNAME,
+        reanalyze=reanalyze,
     )
 
 
@@ -279,3 +325,248 @@ def test_import_summary_lists_what_came_in(tmp_path):
     assert "baseline benchmark" in summary
     assert "profile findings" in summary
     assert "kernel ledger" in summary
+
+
+def test_discover_capture_that_completed_before_analysis_failed(tmp_path):
+    source = tmp_path / "source"
+    capture = _capture(source / "rounds" / "round_1" / "profile")
+
+    found = reuse.discover(source)
+
+    assert found.profile_dir == capture
+    assert found.findings is None
+    assert not found.is_empty
+    assert reuse.discover(source, reanalyze=True).profile_dir == capture
+
+
+def test_discover_profile_directory_directly(tmp_path):
+    source = _capture(tmp_path / "profile")
+
+    assert reuse.discover(source).profile_dir == source
+    assert reuse.discover(source, reanalyze=True).profile_dir == source
+
+
+def test_discover_newest_capture_numerically_and_skip_incomplete_manifest(tmp_path):
+    source = tmp_path / "source"
+    _capture(source / "rounds" / "round_9" / "profile", "nine")
+    ten = _capture(source / "rounds" / "round_10" / "profile", "ten")
+    incomplete = _capture(source / "rounds" / "round_11" / "profile", "eleven")
+    (incomplete / "rank_0" / "server_nsys.nsys-rep").unlink()
+
+    assert reuse.discover(source, reanalyze=True).profile_dir == ten
+
+
+def test_default_reuse_keeps_findings_paired_with_their_capture(tmp_path):
+    source = tmp_path / "source"
+    first = _capture(source / "rounds" / "round_1" / "profile", "one")
+    first_findings = _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME)
+    second = _capture(source / "rounds" / "round_2" / "profile", "two")
+
+    ordinary = reuse.discover(source)
+    reanalysis = reuse.discover(source, reanalyze=True)
+
+    assert ordinary.findings == first_findings
+    assert ordinary.profile_dir == first
+    assert reanalysis.profile_dir == second
+    assert reanalysis.findings is None
+
+
+def test_new_replan_note_does_not_replace_last_full_findings(tmp_path):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile")
+    findings = _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME)
+    _write(source / "rounds" / "round_2" / "analysis" / reuse.FINDINGS_NAME, "Replan note")
+
+    found = reuse.discover(source)
+
+    assert found.profile_dir == profile
+    assert found.findings == findings
+
+
+def test_reanalysis_identity_links_new_findings_to_previous_capture(tmp_path):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile", "first-capture")
+    _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME, "old findings")
+    latest = source / "rounds" / "round_3" / "analysis"
+    _write(latest / reuse.FINDINGS_NAME, "fresh interpretation")
+    _write(
+        latest / "analysis_manifest.yaml",
+        "schema_version: 1\ncapture_id: first-capture\nprofile_dir: rounds/round_1/profile\n",
+    )
+
+    for reanalyze in (False, True):
+        found = reuse.discover(source, reanalyze=reanalyze)
+        assert found.findings == latest / reuse.FINDINGS_NAME
+        assert found.profile_dir == profile
+
+
+@pytest.mark.parametrize(
+    "reference,capture_id", [("../profile", "outside"), ("rounds/round_1/profile", "wrong")]
+)
+def test_discovery_rejects_invalid_analysis_capture_identity(tmp_path, reference, capture_id):
+    source = tmp_path / "source"
+    _capture(tmp_path / "profile", "outside")
+    profile = _capture(source / "rounds" / "round_1" / "profile", "one")
+    findings = _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME, "valid")
+    later = source / "rounds" / "round_2" / "analysis"
+    _write(later / reuse.FINDINGS_NAME, "untrustworthy pointer")
+    _write(
+        later / "analysis_manifest.yaml", f"capture_id: {capture_id}\nprofile_dir: {reference}\n"
+    )
+
+    found = reuse.discover(source)
+
+    assert found.profile_dir == profile
+    assert found.findings == findings
+
+
+def test_flat_legacy_findings_do_not_borrow_an_unrelated_sibling_capture(tmp_path):
+    source = _perf_analyze_workspace(tmp_path / "source")
+    _capture(tmp_path / "profile", "unrelated")
+
+    assert reuse.discover(source).profile_dir == source
+
+
+def test_capture_only_import_preserves_nested_inventory_and_provenance(tmp_path):
+    source = tmp_path / "source"
+    capture = _capture(source / "rounds" / "round_2" / "profile", "capture-only")
+    _write(capture / "serve_config.yaml", "backend: pytorch\n")
+    manifest = json.loads((capture / PROFILE_MANIFEST_NAME).read_text())
+    manifest["artifacts"] = ["serve_config.yaml"]
+    manifest["runtime"]["config"] = "serve_config.yaml: backend=pytorch"
+    _write(capture / PROFILE_MANIFEST_NAME, json.dumps(manifest))
+    workspace = tmp_path / "destination"
+    before = (capture / PROFILE_MANIFEST_NAME).read_bytes()
+
+    imported = _split_import(source, workspace, reanalyze=True)
+
+    profile = workspace / "rounds" / "round_1" / "profile"
+    assert imported.profile
+    assert not imported.findings
+    assert validate_profile_manifest(profile, require_raw=True)["capture_id"] == "capture-only"
+    assert (profile / "rank_0" / "server_nsys.nsys-rep").is_file()
+    assert (profile / "nsys_analysis" / "summary.json").is_file()
+    assert (profile / "serve_config.yaml").read_text() == "backend: pytorch\n"
+    assert (capture / PROFILE_MANIFEST_NAME).read_bytes() == before
+    assert not (workspace / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME).exists()
+
+
+def test_reanalysis_preserves_prior_findings_separately_from_fresh_outputs(tmp_path):
+    source = tmp_path / "source"
+    _capture(source / "rounds" / "round_1" / "profile")
+    analysis = source / "rounds" / "round_1" / "analysis"
+    findings = _write(analysis / reuse.FINDINGS_NAME, "source conclusions")
+    _write(analysis / reuse.KERNEL_LEDGER_NAME, "source ledger")
+    _write(analysis / "nsys_analysis" / "summary.json", '{"old_derivation":true}')
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=True)
+
+    prior = workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_ANALYSIS_DIRNAME
+    assert (prior / reuse.FINDINGS_NAME).read_text() == "source conclusions"
+    assert (prior / reuse.KERNEL_LEDGER_NAME).read_text() == "source ledger"
+    assert (prior / "nsys_analysis" / "summary.json").is_file()
+    assert not imported.findings
+    assert not imported.kernel_ledger
+    assert not (workspace / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME).exists()
+    assert findings.read_text() == "source conclusions"
+
+
+def test_reanalysis_import_reselects_newest_capture_without_mixing_findings(tmp_path):
+    source = tmp_path / "source"
+    _capture(source / "rounds" / "round_1" / "profile", "one")
+    _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME, "older runtime")
+    _capture(source / "rounds" / "round_2" / "profile", "two")
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=True)
+
+    manifest = validate_profile_manifest(workspace / "rounds" / "round_1" / "profile")
+    assert manifest["capture_id"] == "two"
+    assert imported.profile
+    assert not (workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_ANALYSIS_DIRNAME).exists()
+
+
+@pytest.mark.parametrize("layout", ["flat", "nested"])
+def test_legacy_raw_captures_support_reanalysis_without_findings(tmp_path, layout):
+    source = tmp_path / "source"
+    original = source if layout == "flat" else source / "rounds" / "round_2" / "analysis"
+    _write(original / "server_ncu.ncu-rep", "raw counters")
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=True)
+
+    profile = workspace / "rounds" / "round_1" / "profile"
+    manifest = validate_profile_manifest(profile, require_raw=True)
+    assert imported.profile
+    assert manifest["methods"]["ncu"]["status"] == "captured"
+    assert manifest["runtime"]["import_path"].startswith("unavailable:")
+    assert (original / "server_ncu.ncu-rep").read_text() == "raw counters"
+    assert not (original / PROFILE_MANIFEST_NAME).exists()
+
+
+def test_split_legacy_import_separates_reports_and_derivations(tmp_path):
+    source = _perf_analyze_workspace(tmp_path / "source")
+    _write(source / "nsys_analysis" / "summary.json", "old decomposition")
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace)
+
+    round_dir = workspace / "rounds" / "round_1"
+    assert imported.findings and imported.profile
+    assert (round_dir / "profile" / "server_nsys.nsys-rep").is_file()
+    assert not (round_dir / "analysis" / "server_nsys.nsys-rep").exists()
+    assert (round_dir / "analysis" / "nsys_analysis" / "summary.json").is_file()
+    assert (round_dir / "analysis" / reuse.FINDINGS_NAME).is_file()
+
+
+def test_reanalysis_rejects_prose_even_when_baseline_is_available(tmp_path):
+    source = tmp_path / "source"
+    _write(source / reuse.BASELINE_REPORT_NAME)
+    _write(source / reuse.FINDINGS_NAME)
+    _write(source / "nsys_stats.txt", "aggregated summary")
+
+    with pytest.raises(reuse.ReuseError, match="requires usable raw captures"):
+        _split_import(source, tmp_path / "destination", reanalyze=True)
+    assert not (tmp_path / "destination").exists()
+
+
+def test_unavailable_only_manifest_can_be_imported_but_not_reanalyzed(tmp_path):
+    source = _capture(tmp_path / "source")
+    manifest_path = source / PROFILE_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["methods"]["nsys"] = {"status": "unavailable", "reason": "No GPU"}
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert _split_import(source, tmp_path / "destination").profile
+    with pytest.raises(reuse.ReuseError, match="requires usable raw captures"):
+        _split_import(source, tmp_path / "reanalyze", reanalyze=True)
+
+
+def test_chained_imports_rebase_analysis_identity_to_destination_profile(tmp_path):
+    source = tmp_path / "source"
+    _capture(source / "rounds" / "round_3" / "profile", "third-capture")
+    analysis = source / "rounds" / "round_3" / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME, "third round findings")
+    original_identity = (
+        "schema_version: 1\nanalysis_id: round_3\ncapture_id: third-capture\n"
+        "profile_dir: rounds/round_3/profile\n"
+    )
+    _write(analysis / "analysis_manifest.yaml", original_identity)
+    first = tmp_path / "first-import"
+    second = tmp_path / "second-import"
+
+    _split_import(source, first)
+    found = reuse.discover(first)
+
+    assert found.profile_dir == first / "rounds" / "round_1" / "profile"
+    identity = yaml.safe_load(
+        (first / "rounds" / "round_1" / "analysis" / "analysis_manifest.yaml").read_text()
+    )
+    assert identity["capture_id"] == "third-capture"
+    assert identity["profile_dir"] == "rounds/round_1/profile"
+    assert identity["source_analysis_dir"] == str(analysis)
+    imported = _split_import(first, second)
+    assert imported.findings and imported.profile
+    assert reuse.discover(second).profile_dir == second / "rounds" / "round_1" / "profile"
+    assert (analysis / "analysis_manifest.yaml").read_text() == original_identity
