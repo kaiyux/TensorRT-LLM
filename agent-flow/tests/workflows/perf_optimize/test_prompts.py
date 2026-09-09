@@ -46,6 +46,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     approach_restriction_note,
     headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
+    kernel_coverage_ncu_targeting,
 )
 
 _ALL_PROMPTS = {
@@ -167,7 +168,7 @@ def test_analyzer_carries_the_nsys_timeline_decomposition():
     assert "costs no extra server launch" in prompt
     # The roadmap's expected-gain grounding reads the split, not just shares.
     assert "compute-absent split" in prompt
-    assert "a launch-starved share is not recovered by a faster kernel" in prompt
+    assert "faster kernels do not recover launch-starved host time" in prompt
     # Degrades to a one-liner rather than blocking or fabricating.
     assert "timeline analysis unavailable" in prompt
 
@@ -209,9 +210,9 @@ def test_run_a2a_capture_feeds_the_timeline_pipeline():
     assert "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite" in prompt
     assert "it reads the sampling capture, never the timing one" in prompt
     # A2b is not an input to it — those flags name another tool's exports.
-    assert "Pass A2b's capture is **not** an input to that pipeline" in prompt
+    assert "different tool’s exports, not A2b" in prompt
     # And step 5 never waits on a pass that is allowed to be skipped.
-    assert "it must not wait on Run A2" in prompt
+    assert "do not wait for A2" in prompt
 
 
 def test_analyzer_carries_the_ncu_deep_dive():
@@ -232,15 +233,13 @@ def test_analyzer_carries_the_ncu_deep_dive():
     assert "ncu unavailable" in prompt
 
 
-def test_analyzer_grounds_roadmap_items_across_the_analyses():
-    # Expected gains draw on all three analyses — the nsys share, the
-    # targeted kernel's ncu bound class, and the SOL correlation's gap
-    # rows (when the sol block ran) — not the timeline alone.
+def test_analyzer_grounds_roadmap_items_across_the_analyses() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    assert "Draw the evidence from all three analyses" in prompt
-    assert "bound class" in prompt
-    # The three-pillar synthesis rule arrives with the shared contract.
-    assert "three evidence pillars" in prompt
+    for evidence in ("nsys timeline", "ncu kernel analysis", "SOL correlation"):
+        assert evidence in prompt
+    assert "including disagreement or missing analyses" in prompt
+    assert "measured bound class" in prompt
+    assert "Dormant capabilities use the explicit source/config evidence exception" in prompt
 
 
 def test_no_prompt_references_removed_builtin_tools():
@@ -321,16 +320,16 @@ def test_kernel_work_roles_prefer_existing_kernels():
     block = _norm(KERNEL_REUSE)
     # Search order: the checkout first, then flashinfer, then any other
     # provider already integrated; a new kernel is the last resort.
-    assert "The TRT-LLM checkout itself" in block
+    assert "TRT-LLM checkout's custom ops" in block
     assert "flashinfer" in block
-    assert "already integrated" in block
+    assert "Other integrated providers" in block
     # Planning and implementing both record the search that came up empty.
     assert "what you searched" in block
     # The preference is conditional: an empty search makes a new kernel the
     # encouraged realization, never a dropped item — the analyzer still
     # plans it, the optimizer falls back to writing instead of recording a
     # no-change blocker, and the evaluator judges it on the normal axes.
-    assert "writing a new kernel is the encouraged" in block
+    assert "If none fits, plan a scoped **new kernel**" in block
     assert "fall back to writing the kernel rather than recording a no-change blocker" in block
     assert "the new kernel is a legitimate realization" in block
     # The evaluator enforces reuse on the code-quality axis, gain or not.
@@ -798,37 +797,27 @@ def test_projector_prompt_targets_the_optimize_pipeline():
     assert "point by point" in prompt
 
 
-def test_sol_analyzer_context_is_context_not_evidence():
+def test_sol_analyzer_context_is_context_not_evidence() -> None:
     block = _norm(SOL_ANALYZER_CONTEXT)
-    assert "context, not evidence" in block
-    assert "% of SOL" in block
-    # The projection bounds roadmap expectations but never outranks the
-    # trace, stays valid across rounds, and degrades honestly.
-    assert "Sanity-bound `expected_gain_pct`" in block
-    assert "outranks the projection" in block
-    assert "never re-derive it" in block
-    assert "missing or declares itself unavailable" in block
-    assert "never present a SOL number as a measured one" in block
+    assert "its measured column is the baseline snapshot" in block
+    assert "bound `expected_gain_pct` by recoverable headroom" in block
+    assert "Fresh measured evidence outranks the projection" in block
+    assert "Projected numbers must remain labeled as projections" in block
+    assert "Reuse the ceiling across rounds" in block
+    assert "record it through `model_revisions`" in block
+    assert "An optimization failure alone never changes SOL" in block
+    assert "projection is missing or unavailable, skip correlation" in block
 
 
-def test_sol_analyzer_context_forbids_silent_exhaustion():
-    # A campaign must never end with projected headroom that is neither
-    # attacked nor accounted for: an exhausted roadmap owes the
-    # remaining-gap attribution.
+def test_sol_analyzer_context_forbids_silent_exhaustion() -> None:
     block = _norm(SOL_ANALYZER_CONTEXT)
-    assert "No silent exhaustion" in block
+    assert "no actionable item remains despite meaningful projected headroom" in block
     assert "## Remaining-gap attribution" in block
-    assert "no actionable pending item" in block
-    # Every gap part gets an item or an evidence-backed infeasibility
-    # reason — citing artifacts, never hunches.
-    assert "new roadmap item" in block
-    assert "evidence-backed reason it cannot be closed in this campaign" in block
-    assert "cite the artifact, not a hunch" in block
-    # The unexplained bucket stays visible, and the evaluator's verdict
-    # lines are named as an evidence source.
-    assert "unexplained" in block
-    assert "never absorbed into the other buckets" in block
+    assert "each part, its roadmap item or evidence-backed campaign constraint" in block
+    assert "any `unexplained` remainder" in block
+    assert "failed items' `evaluation.md`" in block
     assert "Gap implication" in block
+    assert "apply the ledger's attribution rules" in block
 
 
 def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
@@ -846,9 +835,9 @@ def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
     # Optimize-specific placement and cadence: per-round artifacts, one
     # campaign-level peaks file, a fresh join every profiling round.
     assert "this round's `analysis/` directory" in block
-    assert "Re-run the correlation **every round that profiles**" in block
+    assert "Re-run correlation in profiling rounds" in block
     # …and not on the rounds that produce no measured rows to join.
-    assert "A replan-only round produced no new measured rows" in block
+    assert "Replan-only rounds reuse the standing correlation" in block
 
 
 def test_projector_prompt_persists_peaks_for_the_analyzer():
@@ -1110,105 +1099,100 @@ def _coverage_bundle():
 
 
 def test_kernel_coverage_note_interpolates_the_task_bars():
-    block = _norm(kernel_coverage_analyzer_note(0.75, 92.0))
-    assert "0.75%" in block
-    assert "92.0%" in block
-    # The contract supersedes Run B's bounded top-kernel targeting.
-    assert "supersedes Run B's target selection" in block
+    for text in (
+        kernel_coverage_analyzer_note(0.75, 92.0),
+        kernel_coverage_ncu_targeting(0.75, 92.0),
+    ):
+        assert "0.75%" in text
+        assert "92.0%" in text
+    assert "min_share_pct: 0.75" in kernel_coverage_analyzer_note(0.75, 92.0)
 
 
 def test_kernel_coverage_note_poses_all_four_questions_per_kernel():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "can it be eliminated?" in block
-    assert "can it be made faster?" in block
-    assert "can it be fused with its neighbors?" in block
-    assert "can it be overlapped with independent work on another stream?" in block
-    # Each answer is an item or an evidence-backed dismissal — recorded
-    # in the schema-validated ledger, with the abort consequence named.
+    for question in (
+        "can it be eliminated?",
+        "can it be made faster?",
+        "can it be fused with its neighbors?",
+        "can it be overlapped with independent work?",
+    ):
+        assert question in block
+    assert "all four questions for every row" in block
+    assert "even when elimination is an item" in block
     assert "kernel_ledger.yaml" in block
     assert "aborts the stage" in block
+    for field in (
+        "enumerated_share_pct:",
+        "other_share_pct:",
+        "min_share_pct:",
+        "gpu_busy_pct:",
+        "full_name:",
+        "share_pct:",
+        "elimination:",
+        "faster:",
+        "fusion:",
+        "overlap:",
+        "why_it_runs:",
+        "ref:",
+    ):
+        assert field in block, field
     assert "disposition: item" in block
     assert "disposition: dismissed" in block
+    assert "compute | memory | latency | balanced | comm" in block
 
 
 def test_kernel_coverage_note_orders_questions_by_what_they_presuppose():
-    """Each question assumes less than the last, elimination least of all."""
+    """Elimination leads, while all alternative assessments remain required."""
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "ordered by how much they presuppose, each asking less than the last" in block
-    # The order is load-bearing: elimination leads because a yes moots
-    # the rest, overlap trails because it drops the alone assumption.
-    for earlier, later in (
-        (
-            "### Question 1 per kernel — can it be eliminated?",
-            "### Question 2 per kernel — can it be made faster?",
-        ),
-        (
-            "### Question 2 per kernel — can it be made faster?",
-            "### Question 3 per kernel — can it be fused with its neighbors?",
-        ),
-        (
-            "### Question 3 per kernel — can it be fused with its neighbors?",
-            "### Question 4 per kernel — can it be overlapped with independent work?",
-        ),
-    ):
-        assert block.index(earlier) < block.index(later), later
+    positions = [block.index(f"### Question {number} per kernel") for number in range(1, 5)]
+    assert positions == sorted(positions)
+    assert "even when elimination is an item" in block
+    assert "Prioritize elimination over that row's alternative implementations" in block
+    assert "do not add their expected gains together" in block
 
 
 def test_kernel_coverage_note_grounds_elimination_in_why_the_kernel_runs():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "Ask this **first**" in block
-    # It recovers the WHOLE share, unlike every other question.
-    assert "recovers the row's **whole** wall-clock share" in block
-    assert "elimination.why_it_runs" in block or "why_it_runs" in block
-    # The four shapes it hunts for.
+    assert "source and the NVTX timeline" in block
+    assert "why_it_runs" in block
     for shape in ("Redundant", "Wasted", "Hoistable", "Accidental slow path"):
         assert shape in block, shape
-    # It is the per-kernel teeth on round 1's one-shot global sweep.
-    assert "dormant-capability sweep" in block
-    # Carved cleanly against question 2 so the two do not duplicate.
-    assert '"this work does not need to happen" is *elimination*' in block
+    assert "measure the fraction that cannot affect the output" in block
+    assert "faster implementation of necessary work belongs to question 2" in block
     for tag in (
         "mandatory-math",
         "padding-minimal",
         "already-hoisted",
         "fast-path-active",
         "fast-path-blocked",
+        "approach-restricted",
+        "accuracy-scope",
     ):
         assert tag in block, tag
-    # An elimination item outranks the row's other answers; gains are not
-    # summed across a kernel this item intends to delete.
-    assert "An elimination item outranks the row's other answers" in block
 
 
 def test_kernel_coverage_note_justifies_the_overlap_question():
-    """Q4 is not redundant with Q2/Q3 — both presuppose running alone."""
+    """A faster-execution dismissal must not also dismiss overlap."""
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "Questions 2 and 3 both presuppose the kernel must run **alone**" in block
-    # A latency-bound kernel is routed to Q3, not left at "use CUDA graphs":
-    # graphs collapse the gaps BETWEEN launches, not a kernel that fails to
-    # fill the device from inside a replayed graph.
-    assert "gaps *between* launches" in block
-    assert "answered by question 4" in block
+    assert "A faster-execution dismissal does not settle overlap" in block
+    assert "inter-launch gaps (graph/launch amortization)" in block
+    assert "underfilling the device inside a graph replay (question 4)" in block
 
 
 def test_kernel_coverage_note_grounds_overlap_in_an_independent_partner():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    # The partner and the evidence of today's serialization are recorded,
-    # the same discipline `fusion.neighbors` imposes for adjacency.
     assert "overlap.concurrent_with" in block
-    assert "data-independent" in block
-    assert "disjoint output slices, disjoint step state" in block
-    # Overlap only pays when the machine is idle — two saturated kernels
-    # serialize on the shared resource whatever stream issued them.
-    assert "do not overlap into anything" in block
-    assert "binding* resource" in block
-    # Realized through the shipped idiom, not a hand-rolled stream pair.
+    assert "neither reads what the other writes" in block
+    assert "disjoint outputs and step state" in block
+    assert "evidence that they are serialized today" in block
+    assert "Sum demand on the binding resource" in block
+    assert "under ~100%" in block
     assert "maybe_execute_in_parallel" in block
     assert "AuxStreamType" in block
-    # The CUDA-graph gate is a hard precondition, not a nicety.
     assert "with_multi_stream(True)" in block
-    assert "graph-disabled" in block
+    assert "Plan graph enablement only if the task permits it" in block
     for tag in (
+        "graph-disabled",
         "no-independent-partner",
         "resource-saturated",
         "already-concurrent",
@@ -1216,30 +1200,30 @@ def test_kernel_coverage_note_grounds_overlap_in_an_independent_partner():
         "phase-boundary",
     ):
         assert tag in block, tag
-    # Fusion and overlap are alternative spends of one adjacency.
-    assert "Never book the same saving twice" in block
+    assert "identify them as alternatives" in block
+    assert "count the saving once" in block
 
 
 def test_kernel_coverage_note_fixes_the_materiality_unit():
-    """`share_pct` is GPU time; every gate downstream is wall clock."""
+    """Percent shares convert to wall time before gain and materiality checks."""
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "The materiality unit — wall clock, not GPU time" in block
     assert "coverage.gpu_busy_pct" in block
-    assert "wall_clock_share = share_pct x gpu_busy_pct / 100" in block
-    # The failure mode the conversion prevents is named with its factor.
-    assert "overstates every candidate by `1 / busy`" in block
-    # And dismissals must quote the converted number, not the raw share.
-    assert "dismissal quoting a raw `share_pct` is not evidence" in block
-    # A low busy share is itself a roadmap item, not per-kernel noise.
-    assert "*is* the host-overhead opportunity" in block
+    assert "percentages (0–100)" in block
+    assert "wall_clock_share_pct = share_pct x gpu_busy_pct / 100" in block
+    assert "best_case_gain_pct = wall_clock_share_pct x recovery_fraction" in block
+    assert "expected_gain_rationale" in block
+    assert "optimize.noise_floor_pct" in block
+    assert "Whole affected chain x best-case saving fraction" in block
+    assert "min(wall_clock_share_pct_A, wall_clock_share_pct_B)" in block
+    assert "separate host/launch finding" in block
 
 
 def test_kernel_coverage_note_grounds_fusion_in_observed_adjacency():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "observed adjacency, not guesses" in block
+    assert "predecessor/successor launches" in block
+    assert "cuda_gpu_trace" in block
+    assert "producer/consumer tensors from NVTX plus source" in block
     assert "fusion.neighbors" in block
-    # The recurring legitimate dismissals are named so verdicts stay
-    # evidence-tagged rather than free-form.
     for tag in (
         "at-sol-floor",
         "below-materiality",
@@ -1247,35 +1231,39 @@ def test_kernel_coverage_note_grounds_fusion_in_observed_adjacency():
         "already-fused",
         "phase-boundary",
         "needs-rebuild",
+        "neighbors-at-bandwidth-floor",
     ):
         assert tag in block, tag
-    # Materiality is judged on the whole fusible chain, not one kernel.
-    assert "whole chain" in block
+    assert "whole chain's materiality bound" in block
 
 
 def test_kernel_coverage_needs_rebuild_requires_ruling_out_a_replacement():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    # "The incumbent ships compiled" alone does not dismiss a kernel: a
-    # written-from-scratch replacement routed from Python must also be
-    # ruled out, otherwise the answer is an item that swaps the call
-    # site and lands only if the new kernel measures faster.
-    assert "reroute the Python call site" in block
-    assert "the replacement path is also ruled out" in block
-    assert "swap the call site" in block
-    # The same bar governs fusion cells that blame a compiled neighbor.
-    assert "replacing the incumbent plus its glue" in block
+    assert "why the artifact cannot be rebuilt" in block
+    assert "why a replacement kernel cannot help" in block
+    assert "no Python-reachable dispatch to reroute" in block
+    assert "no credible headroom over the tuned incumbent" in block
+    assert "Otherwise plan the replacement" in block
+    assert "a newly written fused kernel" in block
 
 
 def test_kernel_coverage_note_bounds_the_capture():
-    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    # Multi-pass with re-filtering on missing stems, bounded passes, and
-    # the honest degrade for kernels no pass reached.
+    block = _norm(kernel_coverage_ncu_targeting(0.5, 95.0))
+    assert block.startswith("2. **Select kernels by coverage")
     assert "3 passes" in block
     assert "still-missing stems" in block
-    assert "server_ncu_pass<k>.ncu-rep" in block
+    assert "8 × the pass's stem count (cap ~300)" in block
+    for artifact in (
+        "server_ncu_pass<k>.ncu-rep",
+        "ncu_details_pass<k>.txt",
+        "ncu_raw_pass<k>.csv",
+    ):
+        assert artifact in block
+    assert "same iteration gate" in block
+    assert "excluding collectives" in block
     assert 'ncu: "unavailable: <reason>"' in block
-    # Unactionable below-noise-floor items are not a valid answer.
-    assert "below-materiality` dismissal wearing an item costume" in block
+    ledger = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "Items below `optimize.noise_floor_pct` are not actionable" in ledger
 
 
 def test_kernel_coverage_template_never_shows_a_note_the_schema_rejects():
@@ -1289,17 +1277,20 @@ def test_kernel_coverage_template_never_shows_a_note_the_schema_rejects():
 
 
 def test_kernel_coverage_degrade_string_takes_bound_on_the_row():
-    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    # A collective is excluded from every ncu pass, so `bound: comm` cannot
-    # live under `ncu`; the template and the rule must agree on where it goes.
-    assert "bound: comm" in block
-    assert "on the row, beside `ncu`" in block
-    assert "on the row when `ncu` is the degrade string" in block
+    prompt = kernel_coverage_analyzer_note(0.5, 95.0)
+    block = _norm(prompt)
+    assert re.search(r'    ncu: "unavailable: collective[^\n]+\n    bound: comm', prompt)
+    assert "with `bound` on the row" in block
+    assert "For captured kernels, `bound` lives inside the `ncu` mapping" in block
+    assert "`bound` is required in either shape" in block
 
 
 def test_kernel_coverage_note_requires_marking_unmeasured_rows():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "did *not* come from an ncu capture" in block
+    assert "## Kernel disposition ledger" in block
+    assert "authoritative YAML" in block
+    assert "mark every unmeasured bound" in block
+    assert "degrade reason or null metric's `note`" in block
 
 
 def test_kernel_coverage_reporter_discloses_how_much_ncu_measured():
@@ -1320,6 +1311,38 @@ def test_kernel_coverage_bundle_extends_analyzer_and_reporter_only():
     assert "## Kernel Coverage" not in base.reporter
     for role in ("benchmarker", "projector", "optimizer", "evaluator", "qa"):
         assert getattr(coverage, role) == getattr(base, role), role
+
+
+def test_kernel_coverage_selects_one_effective_ncu_policy():
+    base = _norm(build_perf_optimize_prompts().analyzer)
+    active = _norm(_coverage_bundle().analyzer)
+    default_selection = (
+        "2. **Pick the targets from the timeline decomposition, not the kernel sum.**"
+    )
+    coverage_selection = "2. **Select kernels by coverage and capture in bounded passes.**"
+    assert base.count(default_selection) == 1
+    assert coverage_selection not in base
+    assert active.count(coverage_selection) == 1
+    assert default_selection not in active
+    assert "This pass targets the top kernels Run A surfaced" not in active
+    run_b = active.split("## Run B", 1)[1].split("## ", 1)[0]
+    assert "supersedes" not in run_b
+    assert "superseded" not in run_b
+    assert _norm(kernel_coverage_ncu_targeting(0.5, 95.0)).strip() in active
+
+
+def test_kernel_coverage_carries_dismissals_only_with_current_evidence():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    for condition in (
+        "~20% relative",
+        "bound class is unchanged",
+        "no accepted item touched the kernel",
+        "carried from round <k>",
+        "when the neighbor/partner changed",
+        "whenever `gpu_busy_pct` changes",
+    ):
+        assert condition in block
+    assert "Replan-only rounds keep standing measurements" in block
 
 
 def test_kernel_coverage_off_leaves_bundle_unchanged():
@@ -1389,31 +1412,24 @@ def test_measuring_roles_inherit_the_server_identity_checks():
 # --------------------------------------------------------------------------- #
 
 
-def test_analyzer_bounds_expected_gain_by_measured_headroom():
+def test_analyzer_bounds_expected_gain_by_measured_headroom() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    # Ranking hot kernels by cost alone is how rounds get spent on kernels
-    # that were already at their roofline.
-    assert "Headroom bounds the gain, cost only ranks it" in prompt
-    assert "utilization.json" in prompt
-    assert "headroom_verdict" in prompt
-    # An at-roofline operator can still be removed — it just cannot be
-    # made faster.
-    assert "elimination or fusion" in prompt
-    # Unsampled is not zero, and a contaminated row is directional only.
-    assert "cannot carry an item by itself" in prompt
-    # Two independent verdicts on one kernel; a disagreement is reported.
-    assert "disagree for the same kernel" in prompt
+    for field in ("bounding_resource", "bounding_pct", "headroom_verdict"):
+        assert field in prompt
+    assert "bound faster-execution claims" in prompt
+    assert "elimination, fusion or independent-overlap" in prompt
+    assert "utilization cannot support an item alone" in prompt
+    assert "If ncu's bound disagrees with utilization" in prompt
 
 
-def test_analyzer_must_account_for_every_nsys_opportunity():
+def test_analyzer_must_account_for_every_nsys_opportunity() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    assert "Cover the nsys opportunity list" in prompt
     assert "nsys_analysis/items.json" in prompt
-    assert "nsys_items" in prompt
-    # Deterministic teeth, not a request.
-    assert "stops the round rather than quietly evaporating" in prompt
-    # Dismissal is a first-class answer — padding the roadmap is not.
-    assert "Dismissing is a legitimate answer" in prompt
+    assert "`nsys_items` accounts for the timeline analysis, one row per id" in prompt
+    assert "disposition: item" in prompt
+    assert "disposition: dismissed" in prompt
+    assert "an unaccounted id does" in prompt
+    assert "Never pad the roadmap" in prompt
 
 
 def test_roadmap_spec_documents_the_nsys_items_block():
@@ -1428,24 +1444,20 @@ def test_roadmap_spec_documents_the_nsys_items_block():
     # Ids are local to the analysis that wrote them, so the block is
     # authored fresh each round rather than carried forward — a stale row
     # names an id this round's file does not have.
-    assert "author the block fresh from *this* round's `items.json`" in spec
+    assert "author the block fresh from this round's `items.json`" in spec
+    assert "replan-only rounds use the standing analysis" in spec
     assert "never carried forward" in spec
 
 
-def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
+def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    # Jitter wait surfaces inside a collective but is caused elsewhere;
-    # filing it as `communication` aims the next round at bucketing and
-    # overlap levers that cannot recover another rank's lateness.
-    assert "categorized by the work, not by where it surfaces" in prompt
-    assert "not** `communication`" in prompt
-    assert "imbalance_operator" in prompt
-    # The two verdicts produce different items, and one of them often has
-    # no in-campaign lever at all.
-    assert "`pinned` is one machine" in prompt
-    assert "often not fixable in-campaign" in prompt
-    # Bounded by the measured share, not the raw spread.
-    assert "bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread" in prompt
+    assert "Categorize imbalance by `imbalance_operator`'s work, not communication" in prompt
+    assert "uneven experts are `compute`" in prompt
+    assert "uneven KV footprint is `kv-capacity`" in prompt
+    assert "`pinned` / `rotating`" in prompt
+    assert "A pinned machine issue may be outside this campaign" in prompt
+    assert "rotating imbalance calls for work distribution" in prompt
+    assert "bound recovery by `pct_of_iter`, not the whole rank spread" in prompt
 
 
 # --------------------------------------------------------------- headroom ledger
@@ -1468,67 +1480,121 @@ def test_headroom_note_states_the_three_tiers_and_their_owners():
     # The split is the point: one gap has an owner, the other has none.
     assert "engineering gap" in block
     assert "structural gap" in block
+    for field in (
+        "operating_point:",
+        "build_sha:",
+        "capture_state:",
+        "step_ms:",
+        "kernel_ms:",
+        "modeled_kernel_ms:",
+        "empirical_kernel_ms:",
+        "unmodeled_kernel_ms:",
+        "non_kernel_ms:",
+        "residual_ms:",
+        "parts:",
+        "partition:",
+        "attribution:",
+        "closed_ms:",
+        "attributed_ms:",
+        "open_ms:",
+        "unexplained_ms:",
+        "part_lifecycle:",
+    ):
+        assert field in block, field
+    assert "analytic | empirical | unmodeled" in block
+    assert "gpu-bound | host-bound | mixed" in block
 
 
 def test_headroom_note_makes_the_lever_distinction_explicit():
-    # Booking a failed item as an attribution retires real headroom on
-    # evidence that does not support the conclusion.
     block = _norm(headroom_ledger_analyzer_note())
-    assert "A failed item closes a LEVER, not a part." in block
+    assert "A failed item rules out its lever, not the whole part" in block
     assert "kernel-ledger-exhaustive" in block
+    assert "every joined kernel has all four questions dispositioned `dismissed`" in block
     assert "convergent-levers" in block
-    assert "One failure is an anecdote." in block
+    assert "at least **two** dispositions with distinct `lever` values" in block
+    for implication in (
+        "applied-but-no-gain",
+        "mechanism-already-present",
+        "change-not-live",
+        "blocked-by-constraint",
+    ):
+        assert implication in block
+    assert "never count toward either basis" in block
+    assert "Without a qualifying basis, keep the time `unexplained`" in block
 
 
 def test_headroom_note_says_which_artifact_the_join_closes_against():
-    # sol.json substitutes exposed_ms for comm rows, so joining against
-    # it would report a phantom residual on a correct join.
     block = _norm(headroom_ledger_analyzer_note())
-    assert "must equal that part's `measured_ms` in **`regions.json`**" in block
-    assert "not* in `sol.json`" in block
+    assert "`parts[].kernels` is the authoritative join" in block
+    assert "sum(kernels[].share_pct) / 100 x kernel_ms = part measured_ms in regions.json" in block
+    assert "`sol.json` substitutes `exposed_ms` for communication rows" in block
+    assert "reverse annotation derived from this join" in block
 
 
 def test_headroom_note_requires_both_bracketing_concurrencies():
+    """The composed policy chooses captures; the ledger records sensitivity."""
     block = _norm(headroom_ledger_analyzer_note())
-    assert "sensitivity" in block
-    assert "flat" in block and "steep" in block
-    assert "ranked **per scored point**" in block
+    assert "effective profiling policy" in block
+    assert "Sensitivity requires two distinct bracketing points" in block
+    assert "a single point cannot establish it" in block
+    assert "`flat`" in block and "`steep`" in block
+    assert "estimate its benefit separately at each scored point" in block
+    assert "Profile and enter every part at **both**" not in block
 
 
 def test_headroom_note_licenses_saying_the_target_is_unknown():
-    # An unsourced target manufactures headroom and sends rounds at it.
     block = _norm(headroom_ledger_analyzer_note())
-    assert "`basis: none-known` is legal and expected" in block
-    assert "not a failure to fill in the form" in block
-    assert "falsifier" in block
+    assert "`basis: none-known`" in block
+    assert "`target_ms == measured_ms`, omit `delta`" in block
+    assert "leave the gap structural" in block
+    assert "`achieved_efficiency`: **measured**, with a named source" in block
+    assert "`falsifier`: required" in block
+    assert "existing-impl | published | derived | none-known" in block
+    assert "Include an explicit `unattributed` remainder" in block
 
 
 def test_headroom_note_separates_the_symptom_from_the_fact():
     block = _norm(headroom_ledger_analyzer_note())
-    assert "the symptom is never the fact" in block
-    assert "the SOL looks too aggressive" in block
-    assert "A failed optimization is never, by itself, grounds to lower a ceiling." in block
+    for cause in ("missing-factor", "wrong-peak", "wrong-parallelism", "mixed-state-capture"):
+        assert cause in block
+    for field in (
+        "model_revisions",
+        "measurement_revisions",
+        "target_revisions",
+        "cause",
+        "detail",
+        "evidence",
+    ):
+        assert f"`{field}`" in block
+    assert "non-empty `detail` naming the specific defect" in block
+    assert "resolving `evidence` reference" in block
+    assert "An optimization failure alone cannot revise SOL or retire headroom" in block
 
 
 def test_headroom_note_reserves_dispositions_for_the_orchestrator():
     block = _norm(headroom_ledger_analyzer_note())
-    assert "orchestrator-owned" in block
-    assert "Read them; never write them." in block
+    assert "`dispositions` and `history` are **orchestrator-owned**" in block
+    assert "Read them without modifying them" in block
 
 
 def test_headroom_note_switches_ranking_with_the_task_knob():
     ranking = _norm(headroom_ledger_analyzer_note("ranking"))
     report_only = _norm(headroom_ledger_analyzer_note("report_only"))
-    assert "Rank the roadmap on the engineering gap." in ranking
-    assert "Rank the roadmap on the engineering gap." not in report_only
+    assert "Size expected gains from the engineering gap" in ranking
+    assert "Size expected gains from the engineering gap" not in report_only
     assert "report-only this campaign" in report_only
+    assert "targets do not steer it" in report_only
+    for block in (ranking, report_only):
+        assert "Execution priority remains the roadmap's expected gain" in block
 
 
 def test_headroom_note_states_the_real_consequence_of_an_invalid_ledger():
     warn = _norm(headroom_ledger_analyzer_note(enforcement="warn"))
     error = _norm(headroom_ledger_analyzer_note(enforcement="error"))
-    assert "degrades the campaign's accounting silently" in warn
+    assert "warns without stopping the round" in warn
+    assert "aborts the analyzer stage" not in warn
     assert "aborts the analyzer stage" in error
+    assert "warns without stopping the round" not in error
 
 
 def test_headroom_note_interpolates_the_task_share_bar():
@@ -1538,9 +1604,10 @@ def test_headroom_note_interpolates_the_task_share_bar():
 def test_headroom_note_orders_the_target_walk_structurally():
     block = _norm(headroom_ledger_analyzer_note())
     assert "## Target implementation" in block
-    assert "execution order" in block
-    # The substantive reason, not just readability.
-    assert "structural order makes *missing coverage visible*" in block
+    assert "model **execution order**" in block
+    assert "Include empirical, unmodeled, and non-kernel stages" in block
+    assert "from the ledger and correlation artifacts" in block
+    assert "engineering-gap ranking as a derived view" in block
 
 
 def test_headroom_reporter_guidance_renders_rather_than_rederives():
@@ -1619,3 +1686,48 @@ def test_dump_clears_a_previous_launch_stale_role(tmp_path):
 
     assert not (directory / "retired_role.md").exists()
     assert (directory / "analyzer.md").is_file()
+
+
+def test_analyzer_emits_only_the_effective_config_and_replay_policies() -> None:
+    for headroom in (None, _HL_BLOCK):
+        bundle = build_perf_optimize_prompts(
+            approaches=["code"], include_sol=True, headroom_ledger=headroom
+        )
+        prompt = _norm(bundle.analyzer)
+        assert prompt.count("Effective profiling point policy") == 1
+        assert "--extra_llm_api_options <active tuning config>" in prompt
+        assert "Treat it and the accepted config snapshot as read-only" in prompt
+        assert "only when** `task.yaml` sets" not in prompt
+        assert "Ignore the earlier instruction" not in prompt
+        assert "every item must be `approach: config`" not in prompt
+        assert "still measure and report every point" not in prompt
+        assert "**One run per concurrency point.**" not in prompt
+        if headroom:
+            assert "lowest and highest scored concurrency points" in prompt
+            assert "optimize.focus_concurrencies" in prompt
+            assert "replay only the **largest**" not in prompt
+        else:
+            assert "replay only the **largest**" in prompt
+            assert "lowest and highest scored concurrency points" not in prompt
+
+
+def test_analyzer_omits_other_roles_implementation_and_verdict_instructions() -> None:
+    prompt = _norm(build_perf_optimize_prompts(approaches=["code"]).analyzer)
+    assert "**Optimizer**" not in prompt
+    assert "**Evaluator**" not in prompt
+    assert "Allowed roadmap approaches: `code`" in prompt
+    assert "`config` is off-limits" in prompt
+    assert "what you searched" in prompt
+    assert "how_to_apply" in prompt
+    assert "Never apply optimizations" in prompt
+    assert "Curve worked example" not in prompt
+
+
+def test_analyzer_replan_preserves_measurements_and_history() -> None:
+    prompt = _norm(_headroom_bundle().analyzer)
+    assert "launch no server, run no profiler" in prompt
+    assert "Do not regenerate measured artifacts" in prompt
+    assert "full profiling findings structure applies only to rounds that profile" in prompt
+    assert "freeze `baseline`" in prompt
+    assert "preserve all accepted / failed / in_progress items" in prompt
+    assert "Never renumber or reuse ids" in prompt

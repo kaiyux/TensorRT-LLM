@@ -24,12 +24,14 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     CASEBOOK_CONSULTATION,
     HTML_COMPANION,
     PROFILE_FINDINGS_CONTRACT,
+    PROFILING_RUNS_REFERENCE,
     SERVER_LIFECYCLE,
     SOL_ANALYZER_CONTEXT,
     SOL_CORRELATION_METHOD,
     SOL_METHODOLOGY_FALLBACK,
     SOL_REPORTER_GUIDANCE,
     TRTLLM_TAXONOMY_PATH,
+    build_profiling_runs_reference,
     profile_ranks_note,
 )
 
@@ -232,6 +234,46 @@ def test_analyzer_prompt_has_canonical_ncu_flags():
         assert flag in ANALYZER_SYSTEM_PROMPT, flag
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     assert "do not improvise the ncu flags" in prompt
+
+
+def test_profiling_builder_replaces_targeting_and_capture_settings_together():
+    default = build_profiling_runs_reference()
+    assert default == PROFILING_RUNS_REFERENCE
+    default_policy = "2. **Pick the targets from the timeline decomposition, not the kernel sum.**"
+    assert default_policy in default
+
+    coverage_policy = "2. **Cover all material kernels in bounded passes.**"
+    coverage = build_profiling_runs_reference(
+        coverage_policy, launch_count="24", artifact_suffix="_pass2"
+    )
+    assert coverage.count(coverage_policy) == 1
+    assert default_policy not in coverage
+    assert "choose 3–6 stems" not in coverage
+    assert "--launch-count 40" not in coverage
+    assert "--launch-count 24" in coverage
+    assert "-o <workspace>/server_ncu_pass2 -f" in coverage
+    for artifact in ("server_ncu_pass2.ncu-rep", "ncu_details_pass2.txt", "ncu_raw_pass2.csv"):
+        assert artifact in coverage
+    for stale_artifact in ("server_ncu.ncu-rep", "ncu_details.txt", "ncu_raw.csv"):
+        assert stale_artifact not in coverage
+    # Changing Run B's policy preserves earlier captures and the shared
+    # replay safeguards, and inserts the policy before its capture command.
+    assert coverage.split("## Run B")[0] == default.split("## Run B")[0]
+    assert coverage.index("## Run B") < coverage.index(coverage_policy)
+    assert coverage.index(coverage_policy) < coverage.index("3. Relaunch")
+    for flag in _NCU_CANONICAL_FLAGS:
+        assert flag in coverage
+    assert "Exclude cross-rank allreduce/allgather stems" in coverage
+    assert "**not measurements** of serving performance" in coverage
+
+
+def test_profiling_reintegrates_metrics_once_after_the_additional_capture():
+    prompt = PROFILING_RUNS_REFERENCE
+    metrics_flag = "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite"
+    assert prompt.count(metrics_flag) == 1
+    assert prompt.index("### Pass A2a") < prompt.index(metrics_flag)
+    assert prompt.index(metrics_flag) < prompt.index("## Run B")
+    assert "it reads the sampling capture, never the timing one" in _norm(prompt)
 
 
 def test_analyzer_loads_ncu_analysis_skill_and_degrades():
@@ -1069,8 +1111,10 @@ def test_jitter_step_is_read_with_its_verdict():
     assert "imbalance_operator" in prompt
     # The spread alone is not actionable — pinned and rotating need
     # opposite fixes.
-    assert "always with `straggler.verdict` beside the spread, never without" in prompt
-    assert "need opposite fixes" in prompt
+    assert "Include `straggler.verdict`" in prompt
+    assert "the spread is never reported without it" in prompt
+    assert "repeated straggler at `threshold_pct`" in prompt
+    assert "a changing identity" in prompt
     # Lateness needs a shared clock; a one-rank part has no jitter at all.
     assert "only with its `floor_ms` beside it" in prompt
     assert "A part holding one rank has a `null` `jitter_cost`" in prompt

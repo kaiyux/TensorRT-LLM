@@ -4833,6 +4833,48 @@ def test_headroom_driving_prompts_name_the_ledger_and_the_bracket(tmp_path):
     assert "headroom_ledger.yaml" not in prompts["qa"]
 
 
+@pytest.mark.parametrize(
+    ("headroom", "concurrency", "focus", "expected"),
+    [
+        (True, [8, 32, 128, 256], [32, 128], "scored concurrencies [32, 128]"),
+        (True, [8, 32, 128, 256], None, "scored concurrencies [8, 256]"),
+        (True, [8, 32, 128, 256], [32], "scored concurrencies [32]"),
+        (False, [8, 32, 128, 256], [32, 128], "largest concurrency point, 256, only"),
+        (False, 32, None, "scalar mode: one replay at the configured concurrency"),
+    ],
+)
+def test_analyzer_driving_prompt_selects_effective_profiling_points(
+    tmp_path: Path,
+    headroom: bool,
+    concurrency: int | list[int],
+    focus: list[int] | None,
+    expected: str,
+) -> None:
+    """The replay instruction agrees with the scored bracket and workload shape."""
+    extra = {
+        "benchmark": {
+            "concurrency": concurrency,
+            "num_prompts": [4 * point for point in concurrency]
+            if isinstance(concurrency, list)
+            else 128,
+        }
+    }
+    if headroom:
+        extra["profile"] = {"kernel_coverage": {}, "headroom_ledger": {}}
+    if focus is not None:
+        extra["optimize"] = {"focus_concurrencies": focus}
+    analyzer = _capture_driving_prompts(tmp_path, extra)["analyzer"]
+    replay = analyzer.split("replay the canonical benchmark load", 1)[1].split(", and drive", 1)[0]
+    assert expected in replay
+    if headroom:
+        assert "once per distinct point" in replay
+        assert "largest concurrency point" not in replay
+    if isinstance(concurrency, list):
+        assert "`benchmark.num_prompts` is a list, use the entry paired" in replay
+        assert "each selected point in `benchmark.concurrency`" in replay
+        assert "otherwise use the scalar prompt count" in replay
+
+
 def test_report_only_driving_prompt_does_not_rank_on_targets(tmp_path):
     prompts = _capture_driving_prompts(tmp_path, _hl_extra(target_layer="report_only"))
     assert "report-only" in prompts["analyzer"]

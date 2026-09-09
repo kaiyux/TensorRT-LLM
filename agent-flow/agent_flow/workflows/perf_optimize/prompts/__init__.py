@@ -20,8 +20,10 @@ from ._common import (
     approach_restriction_note,
     headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
+    kernel_coverage_ncu_targeting,
 )
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
+from .analyzer import build_analyzer_prompt
 from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
 from .evaluator import SYSTEM_PROMPT as EVALUATOR_SYSTEM_PROMPT
 from .integrator import SYSTEM_PROMPT as INTEGRATOR_SYSTEM_PROMPT
@@ -192,12 +194,27 @@ def build_perf_optimize_prompts(
     wrong.
     """
     bundle = DEFAULT_PROMPTS
+    if kernel_coverage is not None or headroom_ledger is not None:
+        ncu_targeting = (
+            kernel_coverage_ncu_targeting(
+                float(kernel_coverage["min_share_pct"]),
+                float(kernel_coverage["coverage_target_pct"]),
+            )
+            if kernel_coverage is not None
+            else None
+        )
+        bundle = dataclasses.replace(
+            bundle,
+            analyzer=build_analyzer_prompt(
+                ncu_targeting=ncu_targeting, headroom_ledger=headroom_ledger is not None
+            ),
+        )
     if sol_methodology != "full":
         bundle = dataclasses.replace(bundle, projector=build_projector_prompt(sol_methodology))
     restriction = approach_restriction_note(approaches) if approaches is not None else ""
     if restriction:
         bundle = bundle.with_extensions(
-            analyzer=restriction,
+            analyzer=approach_restriction_note(approaches or (), analyzer_only=True),
             optimizer=restriction,
             evaluator=restriction,
         )
@@ -216,15 +233,6 @@ def build_perf_optimize_prompts(
             optimizer=SOL_OPTIMIZER_CONTEXT,
             reporter=SOL_OPTIMIZE_REPORTER_GUIDANCE,
         )
-    if include_disagg:
-        bundle = bundle.with_extensions(
-            benchmarker=DISAGG_CAMPAIGN,
-            analyzer=DISAGG_CAMPAIGN,
-            optimizer=DISAGG_CAMPAIGN,
-            evaluator=DISAGG_CAMPAIGN,
-            integrator=DISAGG_CAMPAIGN,
-            qa=DISAGG_CAMPAIGN,
-        )
     if kernel_coverage is not None:
         bundle = bundle.with_extensions(
             analyzer=kernel_coverage_analyzer_note(
@@ -241,6 +249,15 @@ def build_perf_optimize_prompts(
                 float(headroom_ledger["min_share_pct"]),
             ),
             reporter=HEADROOM_LEDGER_REPORTER_GUIDANCE,
+        )
+    if include_disagg:
+        bundle = bundle.with_extensions(
+            benchmarker=DISAGG_CAMPAIGN,
+            analyzer=DISAGG_CAMPAIGN,
+            optimizer=DISAGG_CAMPAIGN,
+            evaluator=DISAGG_CAMPAIGN,
+            integrator=DISAGG_CAMPAIGN,
+            qa=DISAGG_CAMPAIGN,
         )
     context = build_remote_execution_context(remote_execution, campaign_name)
     if context:

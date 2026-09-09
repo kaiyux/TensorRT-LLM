@@ -2808,6 +2808,26 @@ class PerfOptimizeWorkflow:
                 f"of the gap gets a new item or an evidence-backed reason it "
                 f"cannot be closed in this campaign.\n\n"
             )
+        replay_note = " (scalar mode: one replay at the configured concurrency)"
+        if self._curve_mode() and self._curve_points():
+            if self._headroom_ledger() is not None:
+                points = self._focus_points() or self._curve_points()
+                bracket = sorted({min(points), max(points)})
+                replay_note = (
+                    " (Pareto-curve mode with the headroom ledger: replay at the "
+                    f"lowest and highest scored concurrencies {bracket}, once per "
+                    "distinct point"
+                )
+            else:
+                replay_note = (
+                    " (Pareto-curve mode: one replay at the largest concurrency "
+                    f"point, {self._curve_points()[-1]}, only"
+                )
+            replay_note += (
+                "; when `benchmark.num_prompts` is a list, use the entry paired "
+                "with each selected point in `benchmark.concurrency`; otherwise "
+                "use the scalar prompt count)"
+            )
         self.analyzer(
             self._disagg_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no}\n"
@@ -2826,14 +2846,7 @@ class PerfOptimizeWorkflow:
             f"system prompt directs, then profile the current build under the "
             f"methods in `profile.methods`: relaunch `trtllm-serve` with "
             f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
-            f"tuning config), replay the canonical benchmark load"
-            + (
-                f" (Pareto-curve mode: one replay at the largest concurrency "
-                f"point, {self._curve_points()[-1]}, only)"
-                if self._curve_mode() and self._curve_points()
-                else ""
-            )
-            + f", and drive "
+            f"tuning config), replay the canonical benchmark load" + replay_note + f", and drive "
             f"nsys from the **canonical `nsys profile` command in your system "
             f"prompt** (don't improvise nsys flags). "
             f"{profile_ranks_note(self._profile_ranks())} Then **decompose that "

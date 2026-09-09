@@ -59,7 +59,9 @@ __all__ = [
     "HEADROOM_LEDGER_REPORTER_GUIDANCE",
     "KERNEL_COVERAGE_REPORTER_GUIDANCE",
     "KERNEL_REUSE",
+    "KERNEL_REUSE_ANALYZER",
     "MEASUREMENT_PROTOCOL",
+    "MEASUREMENT_METRICS",
     "OPTIMIZE_HTML_COMPANION",
     "PROFILE_FINDINGS_CONTRACT",
     "PROFILING_KNOB_VERIFICATION",
@@ -79,6 +81,7 @@ __all__ = [
     "approach_restriction_note",
     "headroom_ledger_analyzer_note",
     "kernel_coverage_analyzer_note",
+    "kernel_coverage_ncu_targeting",
 ]
 
 
@@ -139,9 +142,8 @@ Rules that keep the loop deterministic:
 - **List order is priority order.** Pending items are sorted by
   `expected_gain_pct`, descending — the orchestrator always picks the
   *first* `pending` item, so a mis-ordered list optimizes the wrong thing.
-- **Expected gains are grounded, not vibes.** Every item cites the
-  profiling evidence (trace file + numbers) and, when one matches, the
-  casebook precedent its estimate leans on.
+- **Evidence:** cite artifacts and recovery arithmetic, following the
+  analyzer's evidence contract and dormant-capability exception.
 - **`nsys_items` accounts for the timeline analysis, one row per id.**
   Required whenever that round's `nsys_analysis/items.json` exists;
   omitted entirely when it does not (nsys not in `profile.methods`, or
@@ -149,8 +151,8 @@ Rules that keep the loop deterministic:
   `disposition: item` `ref` must name a real roadmap item id, any
   status: an opportunity whose fix was already tried *was* considered.
   A `dismissed` `ref` is the evidence for dismissing it, never a bare
-  restatement. **Round N > 1**: author the block fresh from *this*
-  round's `items.json`. An `nsys-NN` id is local to the analysis that
+  restatement. **Profiling rounds**: author the block fresh from this
+  round's `items.json`; replan-only rounds use the standing analysis. An `nsys-NN` id is local to the analysis that
   wrote it — a re-profile renumbers from `nsys-01` — so unlike a roadmap
   item id it is never carried forward, and a previous round's row never
   covers this round's same-numbered opportunity. Re-state a judgement
@@ -158,6 +160,11 @@ Rules that keep the loop deterministic:
   earlier round in `ref` when that saves re-deriving the evidence. A row
   naming an id absent from the current file fails validation exactly as
   an unaccounted id does.
+- **Initialization and ids.** In round 1, read the target metric from
+  `baseline/benchmark_results.md` and seed `current_best` equal to
+  `baseline`, including any curve. Thereafter freeze `baseline` and
+  preserve all accepted / failed / in_progress items. Never renumber or
+  reuse ids; allocate fresh ids continuing the sequence.
 - **Ownership.** Only the **analyzer** writes item content (ids, titles,
   categories, evidence, gains, ordering) and may mark still-pending items
   `obsolete` when fresh evidence — a re-profile, or the verdicts a
@@ -240,39 +247,24 @@ reverts rejected attempts with `git reset --hard` + `git clean -fd`:
 # Kernel reuse (analyzer / optimizer / evaluator)
 # --------------------------------------------------------------------------- #
 
-KERNEL_REUSE = """\
+KERNEL_REUSE_ANALYZER = """\
 ## Prefer existing kernels over writing new ones
 
-When an optimization calls for a kernel — a fusion, an attention or GEMM
-variant, a norm/RoPE/quantization pattern — the fix is usually **wiring
-up a kernel that already exists**, not authoring one. A hand-written
-kernel that duplicates what an existing provider ships is the wrong
-change whatever it measures: it forfeits the provider's tuning and
-testing and adds unmaintained surface to the diff. The preference is
-conditional on a suitable kernel existing, though — when the search
-below comes up empty, **writing a new kernel is the encouraged
-realization of the item, not a rule violation**: a real opportunity
-abandoned as "no existing kernel fits" is a worse outcome than a scoped,
-tested new kernel. Before any new kernel, search in priority order:
+Before planning kernel work, search in priority order:
+1. The TRT-LLM checkout's custom ops, kernels and gated paths.
+2. The installed **flashinfer** version and its existing TRT-LLM call sites.
+3. Other integrated providers: CUTLASS / cuBLAS / cuDNN, DeepGEMM and
+   vendored Triton ops.
 
-1. **The TRT-LLM checkout itself** (`trtllm_repo_path`) — the custom-op
-   layer and kernel library already cover many fusions behind an op, a
-   backend selector, or a config knob that this code path simply is not
-   calling yet.
-2. **flashinfer** — attention variants, fused norm + quantization, RoPE,
-   sampling, and more; check the version installed in this environment
-   and the call sites TRT-LLM already has for it.
-3. **Any other kernel provider already integrated** in the checkout
-   (CUTLASS / cuBLAS / cuDNN, DeepGEMM, vendored Triton ops, ...).
+Name the suitable existing kernel/op and source location in `how_to_apply`.
+If none fits, plan a scoped **new kernel**, name the convention/API it must
+match, and record what you searched. Reuse is conditional on a suitable
+implementation existing; missing reuse alone does not dismiss an opportunity.
+"""
 
-What this means per role:
-
-- **Analyzer** — a roadmap item that needs kernel work must name, in
-  `how_to_apply`, the existing kernel/op to wire up and where you found
-  it. When your search comes up empty, still plan the item: have
-  `how_to_apply` say "write a new kernel" (naming the convention/API it
-  must match) and record what you searched — the gain is pursued, not
-  dropped.
+KERNEL_REUSE = (
+    KERNEL_REUSE_ANALYZER
+    + """
 - **Optimizer** — re-run that search before implementing (the roadmap may
   predate your knowledge of the tree). When the item names a kernel to
   wire up but nothing suitable actually exists, fall back to writing the
@@ -290,6 +282,7 @@ What this means per role:
   correctness and targeted tests, measured gain), not to a reuse rule it
   cannot satisfy.
 """
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -299,14 +292,8 @@ What this means per role:
 DORMANT_CAPABILITY_SWEEP = """\
 ## Dormant-capability sweep (round 1)
 
-Profiling only ranks work the build already executes — it is
-structurally blind to shipped-but-dormant acceleration surfaces, which
-never appear in any trace precisely because they never run. A
-multi-token-prediction head sitting unused in the checkpoint, or a
-fusion path gated off by an env-var default, can be worth more than
-every trace-visible item combined, and no amount of re-profiling will
-surface it. Once per campaign, in round 1 **before** authoring the
-roadmap, sweep for them explicitly:
+In round 1 before authoring the roadmap, inspect capabilities that do
+not appear in traces because they are disabled:
 
 1. **Checkpoint config** (`config.json` under `checkpoint_path`):
    speculative-decode / multi-token-prediction heads
@@ -468,8 +455,31 @@ rounded-up numbers poison every later round.
 # Measurement protocol (benchmarker / evaluator / qa)
 # --------------------------------------------------------------------------- #
 
-MEASUREMENT_PROTOCOL = """\
+MEASUREMENT_METRICS = """\
 ## Measurement protocol
+
+- Metric keys in the result JSON: `output_throughput` (output tok/s — the
+  default target metric), `total_token_throughput`, `request_throughput`,
+  and latency keys `mean_ttft_ms` / `median_ttft_ms` / `p99_ttft_ms`
+  (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). The active target is
+  `optimize.target_metric` in `task.yaml`.
+- **Direction rule:** throughput metrics are better when higher; `*_ms`
+  latency metrics are better when lower. Always report `gain_pct`
+  normalized so **positive = improvement**:
+  - throughput: `gain_pct = (new − reference) / reference × 100`
+  - latency (`*_ms`): `gain_pct = (reference − new) / reference × 100`
+- State which reference you compared against (baseline vs current best)
+  next to every gain you report. In curve mode, gains are per point
+  (same-concurrency reference entry) and aggregate as the **mean** —
+  over `optimize.focus_concurrencies` when `task.yaml` sets it (the
+  scored subset), else over all points. Profiling replays alone do not
+  provide a scored curve measurement.
+"""
+
+
+MEASUREMENT_PROTOCOL = (
+    """\
+## Benchmark measurement procedure
 
 Comparable numbers are the loop's foundation — every measurement follows
 the same recipe:
@@ -489,22 +499,10 @@ the same recipe:
   mode `--result-dir <that directory>/concurrency_<c>` for the run at
   point `<c>` — and read the metrics from that JSON (not from eyeballing
   stdout).
-- Metric keys in the result JSON: `output_throughput` (output tok/s — the
-  default target metric), `total_token_throughput`, `request_throughput`,
-  and latency keys `mean_ttft_ms` / `median_ttft_ms` / `p99_ttft_ms`
-  (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). The active target is
-  `optimize.target_metric` in `task.yaml`.
-- **Direction rule:** throughput metrics are better when higher; `*_ms`
-  latency metrics are better when lower. Always report `gain_pct`
-  normalized so **positive = improvement**:
-  - throughput: `gain_pct = (new − reference) / reference × 100`
-  - latency (`*_ms`): `gain_pct = (reference − new) / reference × 100`
-- State which reference you compared against (baseline vs current best)
-  next to every gain you report. In curve mode, gains are per point
-  (same-concurrency reference entry) and aggregate as the **mean** —
-  over `optimize.focus_concurrencies` when `task.yaml` sets it (the
-  scored subset; still measure and report every point), else over all
-  points.
+"""
+    + "\n"
+    + MEASUREMENT_METRICS
+    + """
 
 Curve worked example (target `output_throughput`, `expected_gain_pct`
 5.0, `accept_fraction` 0.5, `noise_floor_pct` 1.0) —
@@ -513,6 +511,7 @@ measured: 846.1, 1755.2, 2201.2. Per-point gains: +4.20%, +5.93%,
 −0.40%; mean = +3.24%. Gate: 3.24 ≥ 0.5×5.0 = 2.5 ✓; 3.24 ≥ 1.0 ✓;
 worst point −0.40% ≥ −1.0% ✓ → the perf axis passes.
 """
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -758,74 +757,43 @@ SOL_ANALYZER_CONTEXT = (
     """\
 ## SOL projection as context (the projector stage ran)
 
-The Projector ran once, after the baseline benchmark, and left
-`sol_projection.md` in the workspace — an analytical speed-of-light
-(SOL) ceiling for this model/hardware/operating point, derived with the
-`internal-perf-sol-analysis` skill, with a baseline-vs-SOL gap analysis.
-`Read` it (or call `read_latest_progress` with `agent: "projector"`)
-after `baseline/benchmark_results.md` and use it as **context, not
-evidence**:
+Read `sol_projection.md` after `baseline/benchmark_results.md` (or use
+`read_latest_progress` with `agent: "projector"`). It models the SOL
+ceiling for this model, hardware, and operating point; its measured
+column is the baseline snapshot.
 
-- Let the projected headroom (% of SOL) and the bound mix (compute /
-  memory / launch) inform which casebook families you prioritize and
-  how you rank roadmap items — e.g. a low % of SOL with a memory bound
-  raises the prior on memory-bandwidth items; a gap far beyond what the
-  ceiling can explain points at host/scheduling overhead (the ceiling
-  models kernel execution plus per-launch latency only, so
-  serving-stack scheduler and queueing costs are invisible to it).
-- **Sanity-bound `expected_gain_pct` against the ceiling**: an item
-  cannot plausibly recover more than the SOL headroom says is available
-  on its bound side — an estimate that would push the metric past the
-  ceiling is over-promised; tighten it and say so in
-  `expected_gain_rationale`.
-- The ceiling stays valid across rounds (it is a property of the
-  hardware + model + operating point, not of the optimizations you
-  apply). Its measured-vs-SOL table is the **baseline** snapshot: in
-  round N > 1 compare your fresh measurements against the same ceiling
-  — never re-derive it, never treat its measured column as current.
-- Measured trace evidence always outranks the projection: when they
-  disagree, trust the trace and note the disagreement. In
-  `profile_findings.md`, say where the profile **confirms or
-  contradicts** the projection (a sentence per ranked hypothesis is
-  enough).
-- **No silent exhaustion — account for the gap you leave behind.** In
-  any round where you leave `roadmap.yaml` with no actionable pending
-  item while the projection says meaningful headroom remains, close
-  `profile_findings.md` with a **## Remaining-gap attribution** section:
-  decompose the remaining gap-to-SOL into named parts (from the
-  projection's bound mix, your fresh profile — the correlation table's
-  per-op gap rows are the natural part names — and the failed items'
-  `evaluation.md` evidence — their *Gap implication* lines) and give
-  every part exactly one of: a **new roadmap item** that attacks it, or
-  an **evidence-backed reason it cannot be closed in this campaign**
-  (mechanism already present in the build, needs a rebuild the campaign
-  cannot do, accuracy risk the task forbids, allowed-approach
-  restriction, host/scheduler cost outside the ceiling's model — cite
-  the artifact, not a hunch). A part no evidence explains is recorded
-  as **unexplained**, never absorbed into the other buckets. The
-  Reporter's remaining-gap accountability is built from this section —
-  the campaign must never end with headroom that is neither attacked
-  nor accounted for.
-- Projected numbers are not measurements — never present a SOL number
-  as a measured one. If `sol_projection.md` is missing or declares
-  itself unavailable, ignore it for ranking, skip the correlation
-  below, and record that in *Caveats*.
+- Use the projected bound mix to prioritize hypotheses and bound
+  `expected_gain_pct` by recoverable headroom on the binding resource.
+  Host/scheduler/queueing costs are outside the projection's model of
+  kernel execution plus per-launch latency.
+- Reuse the ceiling across rounds. A documented model defect may justify
+  a correction; when the headroom ledger is enabled, record it through
+  `model_revisions`. An optimization failure alone never changes SOL.
+- Fresh measured evidence outranks the projection. In
+  `profile_findings.md`, state where each ranked hypothesis confirms or
+  contradicts it. Projected numbers must remain labeled as projections.
+- When no actionable item remains despite meaningful projected headroom,
+  include **## Remaining-gap attribution** in `profile_findings.md`.
+  Derive it from the standing correlation and headroom ledger when present:
+  name each part, its roadmap item or evidence-backed campaign constraint,
+  and any `unexplained` remainder. Cite failed items' `evaluation.md`
+  *Gap implication* evidence; apply the ledger's attribution rules rather
+  than making a separate accounting judgment for this table.
+- If the projection is missing or unavailable, skip correlation and its
+  use in ranking, and record the reason in *Caveats*.
 
 """
     + SOL_CORRELATION_METHOD
     + """
-Artifact placement in this workflow: `regions.json`, `sol.json`, and
-any `sol_recipes/` go in **this round's `analysis/` directory**; the
-peaks file stays campaign-level at `<workspace>/sol_work/peaks.json`.
-Re-run the correlation **every round that profiles** against that same
-peaks file — the ceilings do not move, your measured rows do, so the
-fresh per-op table is what re-ranks pending items, sanity-bounds their
-`expected_gain_pct` per op, and names the parts of any *Remaining-gap
-attribution*. A replan-only round produced no new measured rows: read
-the standing correlation, do not re-derive it.
+Keep `regions.json`, `sol.json`, and any `sol_recipes/` in this round's
+`analysis/` directory. The peaks file remains at
+`<workspace>/sol_work/peaks.json`. Re-run correlation in profiling rounds
+using fresh measurements and the standing ceiling (or a documented model
+revision). Replan-only rounds reuse the standing correlation. Human SOL
+and remaining-gap tables derive their numbers from these artifacts and
+`headroom_ledger.yaml` when present.
 """
 )
-
 
 SOL_OPTIMIZER_CONTEXT = """\
 ## SOL projection as context (the projector stage ran)
@@ -951,367 +919,198 @@ Weighing rules:
 # --------------------------------------------------------------------------- #
 
 
-def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: float) -> str:
-    """The analyzer's per-kernel coverage contract, with the task's bars.
+def kernel_coverage_ncu_targeting(min_share_pct: float, coverage_target_pct: float) -> str:
+    """Return Run B step 2 with the task's kernel coverage thresholds.
 
-    Appended only when ``task.yaml`` declares ``profile.kernel_coverage``.
-    It supersedes Run B's top-kernel target selection with coverage-driven
-    enumeration, poses the four per-kernel questions (eliminable?
-    faster? fusible? overlappable?), fixes the unit every materiality
-    claim is made in (wall clock, not GPU time), and defines
-    ``kernel_ledger.yaml`` — the machine-readable proof, validated by
-    the orchestrator each round, that every enumerated kernel's
-    elimination, optimization, fusion, and overlap possibility was
-    considered.
+    Args:
+        min_share_pct: Minimum in-window GPU share requiring a ledger row.
+        coverage_target_pct: Minimum combined GPU share of enumerated rows.
+    """
+    return f"""\
+2. **Select kernels by coverage and capture in bounded passes.** Enumerate
+   every kernel at/above **{min_share_pct}%** of in-window GPU time; add
+   next-largest kernels until their combined share reaches
+   **{coverage_target_pct}%**. Record the remaining tail as `other`.
+   Rank from `nsys_analysis/`: `cat_full.json`'s `per_category` and
+   `matched_kernels`, with `opgroup.json` / `module_slice.json` for the
+   residual. This decomposition clips the union of GPU activity to the
+   iteration window. Whole-capture `cuda_gpu_kern_sum` is only a fallback
+   when the pipeline cannot run; record that fallback in the ledger's
+   `source`. Record GPU busy vs idle from the same window in
+   `coverage.gpu_busy_pct`.
+
+   Related kernels may share a ledger row only when all four verdicts
+   agree; list every member in `full_name` and sum their `share_pct`.
+   Never group away a kernel with a different opportunity.
+
+   Run the canonical command below for up to **3 passes**, excluding
+   collectives from ncu replay. Pass 1 targets the hottest 3–6 stems.
+   Inspect each report with `ncu --import ... --page raw --csv`; later
+   passes target **only still-missing stems**. Use `--launch-count` ≈
+   8 × the pass's stem count (cap ~300), since per-layer kernels can
+   exhaust a launch-order budget before once-per-step kernels appear.
+   Each pass relaunches the server with the same iteration gate. Name
+   artifacts `server_ncu_pass<k>.ncu-rep`, `ncu_details_pass<k>.txt`, and
+   `ncu_raw_pass<k>.csv`. Retain uncaptured kernels in the ledger with
+   `ncu: "unavailable: <reason>"` and answer from nsys plus source.
+"""
+
+
+def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: float) -> str:
+    """Return the per-kernel ledger contract for the task's coverage bars.
+
+    Args:
+        min_share_pct: Minimum in-window GPU share requiring a ledger row.
+        coverage_target_pct: Minimum combined GPU share of enumerated rows.
     """
     return f"""\
 ## Per-kernel coverage contract (this task declares `profile.kernel_coverage`)
 
-This campaign carries an exhaustiveness guarantee: **every kernel
-at/above the coverage bar gets an ncu SOL deep dive and an explicit
-answer to four questions — (1) can this kernel be eliminated? (2) can it
-be made faster? (3) can it be fused with its neighbors? (4) can it be
-overlapped with independent work on another stream? — each answer a
-roadmap item or an evidence-backed dismissal.** They are ordered by how
-much they presuppose, each asking less than the last: elimination
-presupposes only that the kernel runs today; faster and fusion
-presuppose the work is necessary *and* that the kernel must run alone;
-overlap drops the alone assumption. That is why a kernel legitimately
-closed on one question can still be this round's largest opportunity
-under another. You record the answers in
-`kernel_ledger.yaml` (contract below) in this round's `analysis/`
-directory, every round **that profiles**. The orchestrator
-schema-validates the ledger the moment your turn ends — a missing row,
-an unanswered question, an `item` ref that matches no roadmap id, or
-coverage below the target **aborts the stage**, exactly like an invalid
-roadmap. The campaign cannot conclude with a hot kernel nobody looked
-at.
+Every profiling round, write `analysis/kernel_ledger.yaml` for the kernels
+selected by Run B's coverage policy: all kernels at/above {min_share_pct}%
+and enough additional rows to cover {coverage_target_pct}% of GPU time.
+A missing row or question, invalid roadmap reference, or insufficient
+coverage aborts the stage. Replan-only and reused-analysis rounds reuse
+the standing ledger and owe no new capture or ledger.
 
-A round your instructions open as **replan-only** (or as a reused
-analysis) ran no ncu and is exempt: it owes no ledger, and the
-orchestrator waives the contract for it rather than aborting over an
-artifact the round was told not to produce. The standing ledger still
-describes that build — the round changed nothing about it.
+### Materiality and shared disposition rules
 
-### Coverage-driven ncu targeting (supersedes Run B's target selection)
-
-Run B's "top 3–6 stems, never profile every kernel blindly" rule is
-superseded — this task pays for breadth:
-
-- **Enumerate from the fresh nsys timeline decomposition**: every
-  kernel at or above **{min_share_pct}%** of in-window GPU time gets a
-  ledger row; when those rows sum below **{coverage_target_pct}%**, keep
-  taking the next-largest kernels until the target is covered. Roll
-  everything below the cut into a single explicit `other` share —
-  recorded, never silently dropped. What this supersedes is Run B's
-  *breadth* (3–6 stems), never its *source*: rank from `nsys_analysis/`
-  — `cat_full.json`'s `per_category` and `matched_kernels`, plus
-  `opgroup.json` / `module_slice.json` for the residual — because
-  `cuda_gpu_kern_sum` sums overlapping streams over the whole capture
-  while the decomposition is a union clipped to the iteration window,
-  and the two rank kernels differently. Where the pipeline could not
-  run, `kern_sum` is the honest fallback — say so in the ledger's
-  `source`. Record the window's **GPU busy share** in
-  `coverage.gpu_busy_pct` from the same trace (busy vs idle over the
-  captured iterations) — every materiality claim below is denominated in
-  it.
-- **Group where the disposition is genuinely shared**: closely related
-  kernels (e.g. a family of small elementwise/cast variants between the
-  same producers and consumers) may share one row, with the members
-  named in `full_name` and their summed share in `share_pct`. Grouping
-  is for honest shared verdicts — never to bury a kernel whose answer
-  would differ.
-- **Capture ncu in bounded passes, not one blind sweep.** One pass's
-  `--launch-count` is consumed in launch order, so per-layer hot kernels
-  exhaust it before once-per-step kernels (final norm, logits GEMM,
-  sampler) ever match. Run Run B's canonical command up to **3 passes**:
-  pass 1 filters on the hottest stems exactly as Run B describes; then
-  check which enumerated stems the report actually captured (`ncu
-  --import ... --page raw --csv`), and each further pass filters on
-  **only the still-missing stems** (so its budget is spent on them),
-  with `--launch-count` ≈ 8 × that pass's stem count (cap ~300). Name
-  the artifacts `server_ncu_pass<k>.ncu-rep` (+ per-pass
-  `ncu_details_pass<k>.txt` / `ncu_raw_pass<k>.csv`); each pass is its
-  own server relaunch, gated to the same iteration window.
-- **Degrade honestly, never fabricate**: a kernel no pass captured (or
-  ncu itself unavailable) keeps its ledger row with
-  `ncu: "unavailable: <reason>"` — all four questions are still owed,
-  answered from the nsys timeline and the source.
-
-### The materiality unit — wall clock, not GPU time
-
-`share_pct` is a share of **profiled GPU time**. Every gate downstream —
-`optimize.noise_floor_pct`, an item's `expected_gain_pct`, the
-evaluator's measured gain on the target metric — is a share of **wall
-clock**. The two are equal only when the GPU is busy 100% of the window.
-Convert before every materiality claim, using the busy share you
-recorded in `coverage.gpu_busy_pct`:
+`share_pct` and `coverage.gpu_busy_pct` are percentages (0–100):
 
 ```
-wall_clock_share   = share_pct x gpu_busy_pct / 100
-best_case_gain_pct = wall_clock_share x recovery_fraction
+wall_clock_share_pct = share_pct x gpu_busy_pct / 100
+best_case_gain_pct   = wall_clock_share_pct x recovery_fraction
 ```
 
-An 8% kernel in a window that is 60% GPU-busy is worth at most 4.8% of
-wall clock; a fix recovering half of it is 2.4%. That is the number a
-`below-materiality` dismissal compares against `optimize.noise_floor_pct`
-and the number an item's `expected_gain_pct` may claim. Doing the
-arithmetic in GPU-time units overstates every candidate by `1 / busy` and
-buys the campaign items that cannot move the target metric even when they
-work exactly as designed — each one costing a full evaluator benchmark to
-disprove.
+Use this wall-clock estimate in `expected_gain_rationale` and compare it
+with `optimize.noise_floor_pct` for every `below-materiality` dismissal.
+For example, 8% GPU share at 60% busy with half recoverable yields 2.4%.
+Choose the affected time and recovery bound for the question:
 
-A low `gpu_busy_pct` is itself a finding: the gap between the two units
-*is* the host-overhead opportunity. Say so in your findings and put it on
-the roadmap as its own item (the taxonomy's launch/host category) rather
-than spreading it thin across every kernel row.
+| Question | Maximum recoverable time |
+|----------|--------------------------|
+| Eliminate | Whole row; measured padded fraction for skipping wasted work |
+| Faster | Row share x best-case recovery fraction |
+| Fuse | Whole affected chain x best-case saving fraction |
+| Overlap | `min(wall_clock_share_pct_A, wall_clock_share_pct_B)`, reduced by contention |
+
+Record low GPU utilization as a separate host/launch finding and an item
+when the evidence, materiality, and allowed approaches support it.
+All kernel work follows *Prefer existing kernels*. Shared dismissal tags:
+
+- `below-materiality` — show the applicable wall-clock arithmetic above.
+- `needs-rebuild: <artifact>` — cite why the artifact cannot be rebuilt
+  **and** why a replacement kernel cannot help: no Python-reachable
+  dispatch to reroute, or no credible headroom over the tuned incumbent
+  near its bound-class ceiling. Otherwise plan the replacement, including
+  a newly written fused kernel where appropriate.
+- `approach-restricted` / `accuracy-scope` — cite the disallowed approach
+  or forbidden lossy change in *Out-of-scope opportunities*.
+
+Answer **all four questions for every row**, even when elimination is an
+item. Prioritize elimination over that row's alternative implementations;
+do not add their expected gains together. Likewise, when fusion and
+overlap recover the same time, identify them as alternatives in the
+second item's `expected_gain_rationale` and count the saving once.
 
 ### Question 1 per kernel — can it be eliminated?
 
-Ask this **first**, because a `yes` moots the other three and recovers
-the row's **whole** wall-clock share rather than a fraction of it — the
-only question whose ceiling is the kernel's entire cost. Questions 2-4
-all presuppose the work is necessary; this one asks whether it is. Four
-recurring shapes, checked against the source and the NVTX-annotated
-timeline rather than the ncu metrics:
+Use source and the NVTX timeline to check these cases first:
 
-- **Redundant** — it produces something already available: a cast whose
-  result exists in the needed dtype upstream, a copy that could be a
-  view, a layout transform undone a few kernels later, the same
-  reduction or index computation done twice in one step.
-- **Wasted** — it runs over data that cannot affect the output: positions
-  padded to `max_seq_len`, masked-out tokens, inactive experts, the dummy
-  slots a padded CUDA-graph batch carries. The recoverable fraction is
-  the padded fraction — measure it, do not assume it.
-- **Hoistable** — it recomputes per step (or per layer) something
-  invariant across steps: weight preprocessing/requantization, scale
-  computation, block-table or index math, RoPE tables. The fix moves it
-  to load/warmup or caches it, and the kernel leaves the steady-state
-  loop entirely.
-- **Accidental slow path** — it exists only because an intended fast path
-  did not fire: an `is_fused=False` fallback, an unsupported-shape or
-  unsupported-dtype guard, a backend selector landing on the generic
-  implementation. Here elimination means *making the intended path fire*,
-  not editing this kernel. This is the per-kernel, per-round teeth on
-  round 1's dormant-capability sweep: the sweep looks for gated-off
-  capabilities globally and only once, while a kernel that should not
-  exist is the sweep's signal showing up in the profile.
+- **Redundant:** duplicate computation, removable cast/copy, or an undone
+  layout transform.
+- **Wasted:** padded/masked tokens, inactive experts, or dummy graph slots;
+  measure the fraction that cannot affect the output.
+- **Hoistable:** invariant preprocessing, scales, indices, or tables that
+  can move to load/warmup or a cache.
+- **Accidental slow path:** identify a fast-path flag, backend selector,
+  or shape/dtype guard whose inactive path creates the kernel. Enabling
+  that path is elimination; a faster implementation of necessary work
+  belongs to question 2.
 
-Distinguish this from question 2. "A better kernel exists for this
-shape" is *faster*; "this work does not need to happen" is *elimination*.
-When the kernel disappears rather than improves, it belongs here.
+Lead dismissal `ref` with the applicable tag and evidence:
 
-The recurring legitimate dismissals — lead the `ref` with the matching
-tag:
-
-- `mandatory-math: <what>` — model-defined work on real data every step,
-  not duplicated and not invariant. Cite the consumer in `why_it_runs`;
-  this is the correct and most common answer for a GEMM or attention
-  kernel.
-- `padding-minimal: <n>%` — the padded/masked fraction it processes is
-  small enough that skipping it lands under the noise floor (show the
-  fraction and the wall-clock arithmetic).
-- `already-hoisted` — the invariant part already runs once at load or
-  warmup; what remains per step is genuinely per-step (cite where the
-  hoisted part lives).
-- `fast-path-active` — this kernel **is** the intended path; the gated
-  alternative is already on (cite the flag / selector / config value you
-  read, not an assumption).
-- `fast-path-blocked: <guard>` — a better path exists but its guard
-  cannot be satisfied here (unsupported dtype, shape, or hardware —
-  quote the guard). If the guard *can* be satisfied, that is an item,
-  not this tag.
-- `below-materiality` — the whole kernel's wall-clock share is under the
-  noise floor, so even deleting it outright would not register (show the
-  arithmetic).
-- `approach-restricted` / `accuracy-scope` — as in question 2.
-
-**An elimination item outranks the row's other answers.** Removing the
-work is worth more than speeding it up, and both cannot be banked: when
-`elimination` is an `item`, rank it above any other item this row
-produces and do not add their expected gains together — the other three
-answers describe a kernel this item intends to delete.
+- `mandatory-math: <what>` — necessary per-step work on real data, neither
+  duplicated nor invariant; cite its consumer in `why_it_runs`.
+- `padding-minimal: <n>%` — measured wasted fraction is below materiality.
+- `already-hoisted` — cite where the invariant part runs at load/warmup.
+- `fast-path-active` — cite the live selector/flag/config.
+- `fast-path-blocked: <guard>` — quote the unsatisfiable hardware, shape,
+  or dtype guard; a satisfiable guard instead supports an item.
+- `below-materiality`, `approach-restricted`, or `accuracy-scope` as above.
 
 ### Question 2 per kernel — can it be made faster?
 
-Classify the kernel with the `perf-nsight-compute-analysis` skill's
-thresholds and take the levers for that class from its bottleneck
-guide. What the guide cannot tell you is where they live in this
-codebase:
+Classify using the `perf-nsight-compute-analysis` skill's thresholds and
+bottleneck guide. For memory-bound work, also inspect removable round
+trips (question 3); for compute-bound work, inspect backend/kernel choices
+and permitted precision changes. For latency-bound work, distinguish
+inter-launch gaps (graph/launch amortization) from a kernel underfilling
+the device inside a graph replay (question 4).
 
-- **memory-bound** → the round trip may be removable outright, which is
-  question 3.
-- **compute-bound** → a better kernel/backend for the shape usually
-  already exists (the checkout's backend selectors, flashinfer,
-  provider GEMMs); lower-precision math only where the task's accuracy
-  scope allows.
-- **latency-bound** → most often a CUDA-graph / launch-amortization
-  roadmap item rather than a kernel edit. Note that graphs only collapse
-  the gaps *between* launches; a kernel that is latency-bound *inside* a
-  step (already replayed from a graph, still not filling the device) is
-  answered by question 4, not here.
-- Whatever the class, run the *Prefer existing kernels* search first —
-  the faster variant usually already ships somewhere in the checkout or
-  its providers.
+Dismissal tags:
 
-A `dismissed` answer must name its evidence. The recurring legitimate
-dismissals — lead the `ref` with the matching tag when one fits:
-
-- `at-sol-floor: <side> SOL <n>%` — the binding side already runs at
-  ~≥85% of its ceiling; nothing material left in this kernel alone.
-- `below-materiality: <wall-clock share>% × best-case recovery < noise
-  floor` — show the arithmetic **in wall-clock units** (convert per *The
-  materiality unit* above) against `optimize.noise_floor_pct`. A
-  dismissal quoting a raw `share_pct` is not evidence, it is the wrong
-  unit.
-- `needs-rebuild: <artifact>` — the lever lives in compiled artifacts
-  this campaign cannot rebuild (cite how you verified). Being unable to
-  rebuild the incumbent does **not** by itself close the kernel: the
-  campaign can still write a *replacement* kernel (Triton / CuTe DSL /
-  an inline-compiled extension — the *Prefer existing kernels* fallback)
-  and reroute the Python call site to it. The tag is legitimate only
-  when the replacement path is also ruled out: no Python-reachable
-  dispatch point to reroute (the launch is internal to a compiled op
-  you cannot intercept), or the incumbent is a tuned provider kernel
-  near enough its bound-class ceiling that a hand-written kernel has no
-  credible headroom (say which, with evidence). Otherwise the answer is
-  an item, not this tag: write the new kernel and swap the call site —
-  the accept gate already ensures the swap only lands if it measures
-  faster.
-- `approach-restricted` / `accuracy-scope` — the only lever needs a
-  disallowed approach or a lossy change the task forbids; record the
-  insight under *Out-of-scope opportunities* in the findings and point
-  the ref there.
+- `at-sol-floor: <side> SOL <n>%` — binding-side utilization ~≥85%, with
+  no material faster-execution headroom. Still evaluate fusion/overlap.
+- `below-materiality`, `needs-rebuild`, `approach-restricted`, or
+  `accuracy-scope` under the shared rules.
 
 ### Question 3 per kernel — can it be fused with its neighbors?
 
-Fusion verdicts rest on **observed adjacency, not guesses**. Derive each
-kernel's neighborhood from the traces: the launch sequence inside one
-steady-state step (`nsys stats --report cuda_gpu_trace`, or the
-timeline around the kernel's instances) gives the predecessor/successor
-kernels; the NVTX ranges around them, read against the source, give the
-producer/consumer tensors. Record it in the row's `fusion.neighbors`.
-Then test the candidate patterns:
+Derive predecessor/successor launches from `cuda_gpu_trace` or the
+steady-state timeline, and producer/consumer tensors from NVTX plus
+source. Record `fusion.neighbors`. Check elementwise/cast/activation
+chains, norm + quantization, RoPE + KV-cache write, dequant + GEMM
+prologue/epilogue, and attention-adjacent glue. Use the whole chain's
+materiality bound.
 
-- elementwise/cast/activation chains between two anchors → one fused
-  kernel or the producer's epilogue;
-- norm + quantization, RoPE + KV-cache write, dequant + GEMM
-  prologue/epilogue, attention-adjacent glue;
-- the *existing kernels first* rule applies — a fusion item's
-  `how_to_apply` names the shipped fused op to wire up when one exists,
-  and a new kernel is the encouraged realization when none does.
+Dismissal tags:
 
-Judge materiality on the **whole chain**, not the single kernel: a
-0.6% kernel between two 0.5% neighbors in one fusible chain is a ~1.6%
-opportunity **of GPU time** — 1.3% of wall clock at `gpu_busy_pct: 80`,
-and that converted number is what the noise floor judges. The recurring
-legitimate dismissals:
-
-- `multi-consumer-pinned` — the intermediate feeds >1 consumer, so
-  fusion cannot remove the round trip (cite the consumers from the
-  timeline / source).
-- `already-fused` — the kernel is itself the fused form of its
-  neighborhood; nothing adjacent left to absorb.
-- `phase-boundary` — the neighbors sit across a CUDA-graph capture,
-  stream, or prefill/decode phase boundary a fusion cannot cross.
-- `neighbors-at-bandwidth-floor` — every byte both sides move is
-  mandatory model/KV traffic; fusing saves no traffic (show the bytes).
-- `below-materiality` — the whole chain's share × best-case saving is
-  under the noise floor (show the arithmetic, converted to wall clock).
-- `needs-rebuild` — same bar as question 2's tag: "absorbing the
-  neighbor means editing a compiled kernel" dismisses the fusion only
-  when a *newly written* fused kernel replacing the incumbent plus its
-  glue is also ruled out (no reroutable call site, or no credible
-  headroom over the tuned incumbent — with evidence).
+- `multi-consumer-pinned` — cite consumers preventing removal of the
+  intermediate round trip.
+- `already-fused` — no adjacent work remains to absorb.
+- `phase-boundary` — name the capture, stream, or prefill/decode boundary
+  this fusion cannot cross.
+- `neighbors-at-bandwidth-floor` — show mandatory bytes on both sides;
+  fusion removes no traffic.
+- `below-materiality` or `needs-rebuild` under the shared rules.
 
 ### Question 4 per kernel — can it be overlapped with independent work?
 
-Questions 2 and 3 both presuppose the kernel must run **alone**; this one
-asks whether it has to. A kernel dismissed `at-sol-floor` on one resource
-is by definition *not* saturating the others — a memory-bound kernel at
-89% mem SOL / 11% SM SOL leaves nearly all the math units idle for its
-whole duration — and running it concurrently with independent work
-recovers up to the shorter of the two, i.e. the **whole** kernel rather
-than a fraction of it. That is why a row can be legitimately `dismissed`
-on both earlier questions and still be this round's largest item.
+Inspect low SOL on both sides/low occupancy, lopsided SOL, and small grids
+or partial waves. A faster-execution dismissal does not settle overlap.
+From the same timeline and source used for fusion, prove the partner's
+data independence: neither reads what the other writes, with disjoint
+outputs and step state. In `overlap.concurrent_with`, name the partner
+and evidence that they are serialized today. Sum demand on the binding
+resource and show it remains under ~100%; account for contention in the
+pair's recovery bound.
 
-**Spot the candidates from metrics you already have** in the row's `ncu`
-block:
+Use `maybe_execute_in_parallel(fn0, fn1, event0, event1, aux_stream)` in
+`tensorrt_llm/_torch/modules/multi_stream_utils.py`. Name the wrapped call
+site and existing `AuxStreamType` slot (`tensorrt_llm/_torch/utils.py`,
+allocated in model `__init__`) in `how_to_apply`; do not hand-roll a
+parallel stream/event mechanism. The casebook's *Overlap, launch &
+scheduling knobs* covers shared/routed-expert and MLA RoPE/uk-BGEMM
+precedents for `casebook_ref`.
 
-- **low on both SOL sides** (`bound: latency`, low `occupancy_pct`) — the
-  kernel occupies the GPU without using it.
-- **lopsided SOL** (high one side, low the other) — pair it with a kernel
-  lopsided the other way.
-- **small grid / partial wave** — too few CTAs to fill the device; the
-  spare SMs are free real estate.
+**Check the live CUDA-graph config first.** The runner activates
+`with_multi_stream(True)` during capture; otherwise the helper executes
+`fn0(); fn1()` sequentially. With graphs disabled, dismiss overlap as
+`graph-disabled`. Plan graph enablement only if the task permits it;
+otherwise record that prerequisite in *Out-of-scope opportunities*.
 
-**The partner must be data-independent, and proving that is the hard
-part.** Derive the pair from the same traces question 3 uses: the launch
-sequence (`cuda_gpu_trace`) says what runs before/after it and on which
-stream, and the NVTX ranges around them, read against the source, say
-whether the two touch the same data. The pair qualifies only when neither reads what
-the other writes — disjoint output slices, disjoint step state. Record
-the partner **and the evidence the two are serialized today** in the
-row's `overlap.concurrent_with`.
+Dismissal tags:
 
-**Overlap only pays when the machine is idle.** Two kernels each at 80%
-mem SOL do not overlap into anything: they serialize on HBM no matter
-which stream issued them. Before writing an item, add up the pair's
-demand on the *binding* resource and show the sum stays under ~100%. The
-ceiling on the gain is `min(wall_clock_share_A, wall_clock_share_B)` —
-converted per *The materiality unit* — and less whenever that sum
-exceeds 100%.
-
-**Apply via the shipped idiom** — the *Prefer existing kernels* rule's
-analogue for scheduling. The PyTorch backend already carries
-`maybe_execute_in_parallel(fn0, fn1, event0, event1, aux_stream)`
-(`tensorrt_llm/_torch/modules/multi_stream_utils.py`), with per-purpose
-aux streams enumerated in `AuxStreamType` (`tensorrt_llm/_torch/utils.py`)
-and allocated in each model's `__init__`. The casebook's
-runtime-execution family carries the precedents under *Overlap, launch &
-scheduling knobs* — the multi-stream shared/routed-expert and MLA
-RoPE/uk-BGEMM rows — so a real overlap item can name a `casebook_ref`.
-An item's `how_to_apply` names the call site to wrap and the aux-stream
-slot to use — never a hand-rolled stream/event pair alongside the
-existing one.
-
-**The CUDA-graph gate is a hard precondition.** Multi-stream
-self-activates only under graph capture (the runner wraps capture in
-`with_multi_stream(True)`, and `maybe_execute_in_parallel` falls back to
-sequential `fn0(); fn1()` whenever it is off) because stream switching
-costs host overhead that only graph replay hides. Check the **live tuning
-config** before planning any overlap item; with CUDA graphs off, every
-row's honest answer is `graph-disabled` and the item to write instead is
-enabling graphs.
-
-The recurring legitimate dismissals:
-
-- `graph-disabled` — CUDA graphs are off in the live tuning config, so
-  the multi-stream path no-ops (cite the config).
-- `no-independent-partner` — every candidate within reach reads what this
-  kernel writes or writes what it reads (cite the tensors).
-- `resource-saturated` — the kernel and every candidate partner contend
-  for the same binding resource; concurrency cannot beat a shared ceiling
-  (show the summed SOL).
-- `already-concurrent` — the timeline already shows it running on a
-  non-default stream alongside other work (cite the stream ids and the
-  overlapped span).
-- `below-materiality` — `min()` of the pair's wall-clock shares is under
-  the noise floor (show the arithmetic).
-- `phase-boundary` — the only independent work sits across a graph
-  capture, stream, or prefill/decode boundary the pairing cannot cross.
-
-**Never book the same saving twice.** Questions 3 and 4 compete for one
-adjacency: a pair can be fused *or* overlapped, and either way the saving
-is the same time. When a row answers `item` on both, say in the second
-item's `expected_gain_rationale` that it is an alternative realization of
-the first, and do not sum their expected gains — the roadmap's ordering
-is only as good as those numbers being independent.
+- `graph-disabled` — cite the live config.
+- `no-independent-partner` — cite the tensors creating dependencies.
+- `resource-saturated` — show the pair's summed binding-resource SOL.
+- `already-concurrent` — cite stream ids and the observed overlapped span.
+- `below-materiality` — use the pair's bound in the materiality table.
+- `phase-boundary` — name the capture, stream, or prefill/decode boundary
+  preventing the pairing.
 
 ### The kernel ledger contract (`kernel_ledger.yaml`)
-
-Write one ledger per round into this round's `analysis/` directory. Its
-exact shape:
 
 ```yaml
 version: 1
@@ -1320,8 +1119,7 @@ coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct
   other_share_pct: 3.2          # the explicit below-bar tail (they must total ~100)
   min_share_pct: {min_share_pct}
-  gpu_busy_pct: 82.4            # GPU busy share of the profiled window; share_pct
-                                # x this = share of WALL CLOCK (see the unit above)
+  gpu_busy_pct: 82.4            # GPU busy %; wall-clock share = share_pct x gpu_busy_pct / 100
 kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
@@ -1374,53 +1172,33 @@ kernels:                        # descending share_pct; one row per kernel/group
       ref: "no-independent-partner: the collective is the layer's barrier"
 ```
 
-Rules:
-
-- **All four questions, every row.** `disposition: item` refs a roadmap item
-  id — one existing already, or one you author this round; several rows
-  may share one item (a fusion item covers every kernel it merges; an
-  overlap item covers both kernels of the pair, cited from each; one
-  "make the fused path fire" item may eliminate a whole family of
-  fallback kernels), and
-  the referenced item may already be `accepted`/`failed` (the
-  possibility *was* considered — that is the point). `disposition:
-  dismissed` carries the evidence in `ref`, tagged per the vocabularies
-  above, citing the artifact (an ncu row, the nsys timeline, a source
-  file, a failed item's `evaluation.md`).
-- **Say "not measured", never guess it.** A collective never goes under
-  `ncu` — kernel replay deadlocks it — so disposition an allreduce from
-  its nsys share and the source, give `ncu` the `unavailable: <reason>`
-  string, and record `bound: comm` **on the row, beside `ncu`**. When a
-  pass reaches a kernel but a section comes back empty, null that metric
-  and say why in `note`, rather than fabricating a percentage or
-  throwing away the numbers you did measure. `bound` is the one field
-  always owed, and the schema enforces it in both shapes: inside `ncu`
-  when `ncu` is a metrics mapping, on the row when `ncu` is the degrade
-  string. `neighbors` and `concurrent_with` are the evidence a fusion or
-  overlap *dismissal* rests on — a promoted `item` carries its adjacency
-  or its partner in the roadmap entry `ref` names.
-- **An unactionable item is not an answer.** Do not park a kernel on an
-  item whose `expected_gain_pct` sits below `optimize.noise_floor_pct`
-  (the orchestrator never dispatches it) — that is a
-  `below-materiality` dismissal wearing an item costume.
-- **Round N > 1**: author a fresh ledger from the fresh profile. Carry a
-  dismissal forward only when the kernel is unchanged (share within
-  ~20% relative, same bound class, no accepted item touched it) — cite
-  the original round's evidence plus `carried from round <k>`;
-  re-derive every row an accepted item changed, and give fresh rows to
-  kernels that newly crossed the bar. A `fusion` or `overlap` dismissal
-  additionally depends on the **other side** of the pair: re-derive it
-  when the neighbor or partner changed, even if this kernel did not, and
-  re-derive every row's materiality arithmetic when `gpu_busy_pct` moved
-  (an accepted host-side item changes what every kernel is worth).
-- **Mirror it for humans**: add a `## Kernel disposition ledger` section
-  to `profile_findings.md` — the same rows as a table (kernel, share %
-  of GPU time, share % of wall clock, bound, eliminate →, faster →,
-  fusion →, overlap →) with a one-line rationale each, headed by the
-  window's `gpu_busy_pct`, and marking every row whose `bound` did *not*
-  come from an ncu capture (the degrade string, or a null metric's
-  `note`) so the table cannot be read as more measured than it is. The
-  YAML file is authoritative; the findings section carries the prose.
+- `disposition: item` references an existing or newly authored roadmap id;
+  accepted/failed items are valid historical references. Multiple rows
+  may share an item: cite fusion items from every affected kernel and
+  overlap items from both partners. `dismissed` refs use the tags above
+  and cite an ncu row, timeline, source file, or failed evaluation.
+- Collectives never go under ncu replay because it deadlocks ranks. Use
+  `ncu: "unavailable: <reason>"` for them or other uncaptured kernels,
+  with `bound` on the row (`comm` for collectives). For captured kernels,
+  `bound` lives inside the `ncu` mapping; an absent metric is `null` with
+  an explanatory `note`. Keep measured metrics and never invent others.
+  `bound` is required in either shape.
+- A fusion/overlap dismissal requires `neighbors`/`concurrent_with`;
+  an item may carry that evidence in its referenced roadmap entry.
+- Items below `optimize.noise_floor_pct` are not actionable; use
+  `below-materiality` rather than a roadmap reference to such an item.
+- **Subsequent profiling rounds:** author a fresh ledger. Carry a
+  dismissal only if share changed by no more than ~20% relative, bound
+  class is unchanged, and no accepted item touched the kernel. Cite its
+  original evidence plus `carried from round <k>`. Re-derive changed
+  rows, include newly qualifying kernels, and re-derive fusion/overlap
+  when the neighbor/partner changed. Recompute materiality whenever
+  `gpu_busy_pct` changes. Replan-only rounds keep standing measurements.
+- Derive **## Kernel disposition ledger** in `profile_findings.md` from
+  the authoritative YAML: kernel, GPU share %, wall-clock share %, bound,
+  eliminate →, faster →, fusion →, overlap →, plus one-line rationales.
+  Show `gpu_busy_pct` and mark every unmeasured bound using the degrade
+  reason or null metric's `note`; do not independently author accounting.
 """
 
 
@@ -1496,72 +1274,51 @@ def headroom_ledger_analyzer_note(
     enforcement: str = "warn",
     min_share_pct: float = 0.5,
 ) -> str:
-    """The analyzer's headroom-ledger contract, with the task's knobs.
+    """Return the campaign's headroom accounting and target contract.
 
-    Appended only when ``task.yaml`` declares
-    ``profile.headroom_ledger``. It defines the campaign's per-part gap
-    accounting, the three-tier ``sol <= target <= measured`` model, the
-    rules that stop a round talking itself out of real headroom, and the
-    ``## Target implementation`` walk the reporter lifts into the final
-    report.
+    Args:
+        target_layer: Whether targets guide ranking or remain report-only.
+        enforcement: Whether invalid ledgers abort the stage or warn.
+        min_share_pct: Minimum GPU share requiring an empirical part.
     """
     if target_layer == "ranking":
         ranking_rule = """\
-**Rank the roadmap on the engineering gap.** `expected_gain_pct` is
-sized against `measured_ms - target_ms` — the distance to an
-implementation someone knows how to write — not against
-`measured_ms - sol_ms`. Say which in `expected_gain_rationale`. A part
-whose `target.basis` is `none-known` has **no** engineering gap: its
-whole distance is structural, and an item against it is research, not
-an estimate."""
+**Size expected gains from the engineering gap.** Bound an item's
+`expected_gain_pct` by recoverable `measured_ms - target_ms`, and identify
+that implementation in `expected_gain_rationale`. Keep pending roadmap
+items ordered by expected gain on the scored points. `basis: none-known`
+means zero engineering gap: its distance to SOL is structural, so a
+proposal against it is research rather than a supported gain estimate."""
     else:
         ranking_rule = """\
 **The target layer is report-only this campaign.** Author and report
-targets exactly as specified, but keep ranking the roadmap and sizing
-`expected_gain_pct` on measured evidence as you did before. The layer's
-whole value is estimate quality, and that claim is being scored against
-measured outcomes before it is allowed to steer GPU time."""
+targets, but continue sizing gains from measured evidence and ordering
+pending roadmap items by `expected_gain_pct`; targets do not steer it."""
     consequence = (
         "aborts the analyzer stage"
         if enforcement == "error"
-        else "warns without stopping the round — so a sloppy ledger degrades "
-        "the campaign's accounting silently rather than announcing itself"
+        else "warns without stopping the round"
     )
     return f"""\
 ## The headroom ledger (`headroom_ledger.yaml`)
 
-This task declares `profile.headroom_ledger`, which adds the campaign's
-**accounting layer**: a durable, per-part record of where the remaining
-gap-to-SOL sits, what every round proved about it, and what a named,
-buildable implementation would achieve. It lives at the workspace root
-(campaign-scoped, unlike the per-round `kernel_ledger.yaml`) and you
-author it every round.
-
-Why it exists: without it, a failed optimization teaches the campaign
-almost nothing. Its whole durable payload is `status: failed` plus a
-number, while the finding it actually paid for — *which* lever is now
-spent against *which* part, and what that leaves — survives only as
-prose in a round directory. A later round is then free to re-propose
-exactly what was disproved.
+Update this campaign-level file at the workspace root every round. It
+records per-part headroom, spent levers, and buildable targets. Replan-only
+rounds incorporate new verdicts using standing measurements; profiling
+rounds refresh measurements under the effective profiling policy.
 
 ### The three tiers
 
 ```
-sol_ms      <=   target_ms    <=   measured_ms
-(physics)      (best known)       (today)
+sol_ms <= target_ms <= measured_ms
 ```
 
-- `sol_ms` — mandatory work at hardware peak, ideal structure assumed.
-  A bound no kernel may beat, and usually none reaches.
-- `target_ms` — what a **named, buildable** implementation would
-  achieve.
-- `measured_ms` — what runs today.
+- `sol_ms`: mandatory work at hardware peak with ideal structure.
+- `target_ms`: a named, buildable implementation's predicted time.
+- `measured_ms`: current observed time.
 
-That splits the gap in two, with different owners: `measured - target`
-is the **engineering gap** (a better implementation is known — this is
-where roadmap items come from) and `target - sol` is the **structural
-gap** (no known implementation reaches the floor — research it, or
-record it and move on).
+`measured_ms - target_ms` is the **engineering gap**;
+`target_ms - sol_ms` is the **structural gap** without a known realization.
 
 {ranking_rule}
 
@@ -1570,8 +1327,8 @@ record it and move on).
 ```yaml
 version: 1
 operating_point:                # the model is valid ONLY for these points
-  concurrency: [64, 512]        # lowest and highest scored concurrency;
-  isl: 1024                     #   every part is measured at BOTH
+  concurrency: [64, 512]        # points from the effective profiling policy
+  isl: 1024
   osl: 1024
   build_sha: <the profiled HEAD>
   node: <node>
@@ -1615,120 +1372,91 @@ measurement_revisions: []             # the ONLY way a measured_ms is restated
 target_revisions: []                  # the ONLY way target_ms moves
 ```
 
-You own every field above. `dispositions` and `history` are
-**orchestrator-owned**: it appends them from the evaluators' structured
-verdicts after each batch closes. Read them; never write them.
+You own the fields above. `dispositions` and `history` are
+**orchestrator-owned**, appended from evaluator verdicts after each batch.
+Read them without modifying them.
 
-### Parts, and honest coverage
+### Parts, coverage, and the kernel join
 
-- **`analytic`** parts take their id verbatim from that round's
-  `sol.json` `per_op[].region` — those are the parts the projection
-  actually bounds.
-- **`empirical`** parts take their id from the `kernel_ledger.yaml` row
-  label. Every ledger row at/above {min_share_pct}% that no analytic
-  part claims becomes one, so its time stays in the accounting instead
-  of vanishing.
-- **`unmodeled`** parts take a fixed structural-stage name
-  (`host:response-walk`, `host:index-setup`, ...) for time that is
-  counted but carries no ceiling at all.
+- `analytic`: use `sol.json`'s `per_op[].region` verbatim as the part id.
+- `empirical`: use the kernel-ledger row label. Every row at/above
+  {min_share_pct}% unclaimed by an analytic part becomes an empirical part.
+- `unmodeled`: use a stable structural-stage name such as
+  `host:response-walk` for counted time without a ceiling.
 
-Coverage is mandatory and must reconcile, because "the modeled parts
-have little gap" is not the same statement as "there is little
-headroom", and a campaign that cannot tell them apart will spend its
-item budget on unbounded time while bounded gap sits untouched.
+Coverage is mandatory. Reconcile its modeled, empirical, unmodeled,
+non-kernel, and residual buckets to `step_ms`; retain the residual.
+`parts[].kernels` is the authoritative join into the kernel ledger:
 
-### The kernel join is arithmetic, not judgement
+```
+sum(kernels[].share_pct) / 100 x kernel_ms = part measured_ms in regions.json
+```
 
-`sum(kernels[].share_pct) x kernel_ms` must equal that part's
-`measured_ms` in **`regions.json`** — *not* in `sol.json`, which
-substitutes `exposed_ms` for communication rows. The orchestrator checks
-it, and a mismatch reports the residual in both ms and share_pct, which
-usually names the row you left out: a 0.674% residual is the row whose
-share is 0.674%. Author the join once per part; the ids are stable
-across rounds, so you are not re-deriving it every time.
+Use `regions.json` for this check: `sol.json` substitutes `exposed_ms`
+for communication rows. The orchestrator reports join residuals in ms
+and share_pct. Reuse stable ids across rounds, updating membership when
+kernels change. An optional `part: <part id>` on kernel-ledger rows is a
+reverse annotation derived from this join, not a second accounting source.
 
-### Two concurrencies, because a gap is not concurrency-invariant
+### Concurrency sensitivity
 
-Profile and enter every part at **both** bracketing points. The primary
-output is not the interpolated middle — it is `sensitivity`:
+Enter each part at the operating points required by the effective
+profiling policy. Sensitivity requires two distinct bracketing points;
+a single point cannot establish it. With both endpoints, classify the gap:
 
-- `flat` — the gap is comparable at both ends; safe to rank once.
-- `steep` — materially different; the part must be ranked **per scored
-  point**, and any `expected_gain_pct` against it must say which points
-  it claims.
+- `flat`: comparable at both ends.
+- `steep`: materially different; estimate its benefit separately at each
+  scored point and say which points `expected_gain_pct` claims.
 
-This is not hypothetical. A real host-work reduction on this class of
-deployment was worth +1.4% at the top concurrency and **nothing** below
-it, because at lower concurrency there was no exposed host time to
-recover. One number per part would have ranked it identically at every
-point, and been wrong at three of four.
-
-### The partition, and what a failed item actually proves
+### The partition and attribution
 
 ```
 gap_ms = closed_ms + attributed_ms + open_ms + unexplained_ms
 ```
 
-- `closed` — recovered by an accepted item;
-- `attributed` — **proven** not closable in this campaign;
-- `open` — targeted by a pending item;
-- `unexplained` — nothing accounts for it. This is the remainder, and
-  the campaign's work queue: rank by it.
+- `closed`: recovered by an accepted item.
+- `attributed`: proven not closable in this campaign.
+- `open`: targeted by a pending item.
+- `unexplained`: remaining unaccounted time; prioritize it for further
+  investigation. Execution priority remains the roadmap's expected gain.
 
-**A failed item closes a LEVER, not a part.** This is the distinction
-that keeps the ledger honest and the easiest one to get wrong. A verdict
-establishing that a tuned launch mapping is gated on a shape this
-deployment does not have proves that *launch-geometry tuning* cannot
-reach the gap. It does **not** prove the gap is unreachable — the same
-verdict may name a different, untried lever. Booking that time as
-`attributed` would retire real headroom on evidence that does not
-support the conclusion.
+**A failed item rules out its lever, not the whole part.** Positive
+`attribution.attributed_ms` requires one validated `basis`:
 
-So `attribution.attributed_ms > 0` requires a `basis` that actually
-holds, and the orchestrator checks it in Python:
+- `kernel-ledger-exhaustive`: every joined kernel has all four questions
+  dispositioned `dismissed`.
+- `convergent-levers`: at least **two** dispositions with distinct `lever`
+  values and `gap_implication` in
+  {{`applied-but-no-gain`, `mechanism-already-present`}}.
 
-- `kernel-ledger-exhaustive` — every kernel in this part's `kernels`
-  has all four `kernel_ledger.yaml` questions dispositioned `dismissed`;
-- `convergent-levers` — at least **two** dispositions with *distinct*
-  `lever` values and `gap_implication` in
-  {{`applied-but-no-gain`, `mechanism-already-present`}}. One failure is
-  an anecdote. A `change-not-live` or `blocked-by-constraint`
-  disposition never counts toward either, because in both the mechanism
-  was never actually tested against the part.
+`change-not-live` and `blocked-by-constraint` dispositions do not establish
+that the mechanism was tested and never count toward either basis.
+Without a qualifying basis, keep the time `unexplained` and retain the
+spent-lever history.
 
-Until one holds, the time stays `unexplained` and keeps its place in the
-queue, carrying its accumulating list of spent levers.
+### Revision evidence
 
-### The evidence burden is asymmetric
+Only `model_revisions` changes `sol_ms`; only `measurement_revisions`
+restates a measurement; only `target_revisions` changes a target.
+Every revision requires `cause` from its closed enum, a non-empty `detail`
+naming the specific defect, and a resolving `evidence` reference. Merely
+restating the cause in `detail` is rejected and reopens adjudication.
+Examples of concrete evidence:
 
-Three operations permanently remove headroom from the queue: raising a
-`sol_ms`, restating a `measured_ms` downward, and declaring a gap
-`attributed`. Leaving time `unexplained` costs nothing but another look.
-So the bar scales with what the decision forecloses, and **the symptom
-is never the fact**:
+- `missing-factor`: the recipe counted 1 layer instead of 92; cite
+  `<recipe>@<sha>` and the model's layer count.
+- `wrong-peak`: sparse TFLOPS were used instead of dense; cite
+  `peaks.json`'s source and the correct value.
+- `wrong-parallelism`: the recipe assumed all SMs, but the grid has N
+  blocks; cite ncu `launch__grid_size`.
+- `mixed-state-capture`: state how many iterations were host-bound and
+  how compute absence exposed communication; cite `regions.json`.
 
-- `missing-factor` — not *"the SOL looks too aggressive"*, but *"the
-  recipe multiplied by 1 layer where the model has 92 —
-  `<recipe>@<sha>`"*.
-- `wrong-peak` — not *"this GPU should be faster"*, but *"the peak used
-  the sparse TFLOPS column; dense is X — `peaks.json` `source`"*.
-- `wrong-parallelism` — not *"occupancy seems off"*, but *"the recipe
-  assumed all SMs; the kernel launches N blocks — ncu
-  `launch__grid_size`"*.
-- `mixed-state-capture` — not *"the number looked high"*, but *"26 of 47
-  iterations were host-bound, so compute is absent and the collective
-  stands exposed — both values in `regions.json`"*.
-
-Every revision entry needs **all three** of `cause` (from its closed
-enum), a non-empty `detail` naming the specific defect, and an
-`evidence` reference that resolves. A revision whose `detail` restates
-its `cause` is rejected and the adjudication re-opens.
-
-**A failed optimization is never, by itself, grounds to lower a
-ceiling.** It is grounds to open an adjudication into which of three
-things was wrong: the implementation (ordinary — that is a roadmap
-item), the model (`model_revisions`), or the measurement
-(`measurement_revisions`).
+An optimization failure alone cannot revise SOL or retire headroom.
+Investigate an implementation defect, a model defect, or a measurement
+defect and use the appropriate path. Raising SOL, restating measured
+time downward, and attributing a gap each require evidence for the
+headroom they remove from consideration.
 
 ### The target block
 
@@ -1755,7 +1483,7 @@ item), the model (`model_revisions`), or the measurement
         fusion is unbuildable and target_ms collapses to measured_ms.
 ```
 
-`target_ms` is **computed, not asserted**:
+Compute targets using the same mandatory-work arithmetic as the ceiling:
 
 ```
 target_ms = mandatory_work / achieved_efficiency
@@ -1763,102 +1491,51 @@ target_ms = mandatory_work / achieved_efficiency
           + observed_serialization
 ```
 
-This is the section most likely to produce confident fiction, so:
+- `basis: none-known`: when no real implementation can be named, set
+  `target_ms == measured_ms`, omit `delta`, and leave the gap structural.
+- `existing-impl`: cite a resolving reference to the existing kernel.
+- `derived`: reuse the same recipe arithmetic as `sol_ms` to avoid
+  incompatible units or double-counted savings.
+- `achieved_efficiency`: **measured**, with a named source — this part's
+  ncu metrics, a same-class reference kernel in the same trace, or a
+  profiled `existing-impl`.
+- Named `delta` causes must be observable in traces or kernel/launch
+  counts. Include an explicit `unattributed` remainder and reconcile the
+  total to `measured_ms - target_ms`.
+- `falsifier`: required; name the dependency or constraint that would
+  make the target unbuildable.
+- Author targets for the largest gaps first; parts without targets retain
+  their accounting and do not acquire an invented engineering estimate.
 
-- **`basis: none-known` is legal and expected.** When you cannot name a
-  real implementation, say so: `target_ms == measured_ms`, no `delta`,
-  and the whole gap is structural. "I do not know how to build this" is
-  a result, not a failure to fill in the form.
-- `existing-impl` must cite a kernel that exists — in this checkout,
-  FlashInfer, CUTLASS, or a vendor library — with a ref that resolves.
-- `derived` must reuse the **same recipe arithmetic** as `sol_ms`, so
-  the tiers stay commensurable and a saving cannot be double-counted.
-- `achieved_efficiency` must be **measured** with a named source: this
-  part's own ncu metrics, a reference kernel of the same class elsewhere
-  in the same trace, or an `existing-impl` you profiled. An efficiency
-  with no source is the single easiest way to fabricate a target.
-- Every named `delta` cause must be **observable** — a trace, a kernel
-  count, a launch count — never a guess, and `delta` always carries an
-  explicit `unattributed` remainder. Requiring the named causes alone to
-  balance would force you to invent one.
-- `falsifier` is required: the dependency or constraint that, if real,
-  makes the target unbuildable. A target nobody can falsify is an essay.
-- Author targets for the **top parts by gap** first. A part without one
-  simply behaves as the accounting above describes.
-
-**When an attempt falsifies a target, correct the target — never the
-ceiling.** The optimizer records what it actually hit; the evaluator
-confirms it against the diff and the source and forwards it; you decide
-whether it warrants a `target_revisions` entry, whose `cause` comes from
-the existing dismissal vocabulary (`multi-consumer-pinned`,
+When an attempt falsifies a target, evaluate its optimizer finding and
+supporting evaluator/source evidence for a `target_revisions` entry.
+Use the dismissal vocabulary for `cause` (`multi-consumer-pinned`,
 `phase-boundary`, `resource-saturated`, `fast-path-blocked: <guard>`,
-`needs-rebuild: <artifact>`, ...). The `detail` must name what the
-attempt *found* — the extra consumer it read, the dependency in the
-trace, the register pressure the compiler reported, the guard that gated
-the fast path. "On reflection this seems hard" is not a finding, and an
-attempt that produced none has not falsified anything. A target
-revision moves time from the engineering gap to the structural gap; it
-is a re-classification, not a foreclosure, which is why its burden sits
-below an attribution's.
+`needs-rebuild: <artifact>`, ...). Its `detail` must identify the observed
+consumer, dependency, compiler register pressure, or blocking guard.
+A target revision reclassifies engineering gap as structural; it does
+not establish attribution or change the SOL ceiling.
 
 ### `## Target implementation` — the findings section
 
-Every profiling round, emit this section into `profile_findings.md`. It
-walks the model in **execution order**, not gap order:
+Every profiling round, derive this section in `profile_findings.md` from
+the ledger and correlation artifacts, using model **execution order**:
+layer stages, attention/MoE blocks, tail, then runtime plumbing. Include
+empirical, unmodeled, and non-kernel stages so uncovered work is visible.
+Use columns `today | target structure | basis | measured | target | SOL
+| eng. gap | struct. gap`; append an engineering-gap ranking as a derived
+view. Do not independently author a second set of numbers or dispositions.
 
-```
-## Target implementation
+### Roadmap linkage and progress
 
-Decode step, per layer (x N layers), then the tail.
+Give every roadmap item a `parts` list naming the parts it attacks;
+`parts: []` is reserved for a whole-deployment change. Measure progress
+in absolute milliseconds (`closed_ms`, `attributed_ms`, `open_ms`,
+`unexplained_ms`, `eliminated_ms`). A % of SOL changes its denominator
+when a part is eliminated and cannot replace this accounting.
 
-  [linear-attention layers]
-    input norm                  ...
-    gdn state update            5 kernels -> 1 persistent   3.132 / 2.62 / 2.139
-    o_proj                      ...
-  [full-attention layers]
-    paged KV read               fmha_paged_kv_Q32Kv128      1.510 / ... / 1.100
-  [both]
-    tensor-parallel AllReduce   ar_fusion oneshot lamport   1.350 / ... / 0.622
-  [MoE block]
-    router / routing indices    routingIndices*             (empirical only)
-    gate_up + swiglu            moe_gemm_fc1_swiglu_nvfp4   1.805 / ... / 0.933
-  [tail]
-    lm_head                     lm_head_gemm_fp4            0.219 / ... / 0.088
-  [runtime plumbing]
-    host: response walk, index setup    (non_kernel_ms, no ceiling)
-```
-
-with columns `today | target structure | basis | measured | target | SOL
-| eng. gap | struct. gap`.
-
-**Why structural order and not gap order.** A reader can hold it against
-the model source and follow along — but the substantive reason is that
-structural order makes *missing coverage visible*. Ranking by gap
-silently omits everything the model does not bound: a part with no
-`sol_ms` simply is not in the list. Walking the structure turns every
-uncovered stage into a visible hole, which is exactly where a campaign's
-item budget goes to die. The engineering-gap ranking still exists — it
-is what orders the roadmap — but print it **after** the walk, as a
-derived view.
-
-### Also owed
-
-- Give every `roadmap.yaml` item a `parts` list naming the ledger parts
-  it attacks. Write `parts: []` only for a genuine whole-deployment
-  change. An item with no `parts` cannot be booked against anything, so
-  the time it targeted can never leave the `unexplained` queue.
-- Optionally add `part: <part id>` to `kernel_ledger.yaml` rows. Rows
-  with no `part` are exactly what makes `coverage.empirical_kernel_ms`
-  non-zero, so the field is how the two accounting systems reconcile.
-- Progress is measured in **absolute milliseconds** (`closed_ms`,
-  `attributed_ms`, `open_ms`, `unexplained_ms`, `eliminated_ms`), never
-  in % of SOL. The denominator moves whenever an accepted item deletes a
-  part — removing *inefficient* work raises the average and removing
-  *efficient* work lowers it — so the ratio changes for reasons
-  unrelated to whether the deployment got faster.
-
-The orchestrator validates the ledger the moment your turn ends, and an
-invalid one {consequence}.
+The orchestrator validates the ledger when your turn ends; an invalid
+ledger {consequence}.
 """
 
 
@@ -1950,11 +1627,12 @@ _APPROACH_GUARDS = {
 }
 
 
-def approach_restriction_note(allowed: Sequence[str]) -> str:
+def approach_restriction_note(allowed: Sequence[str], *, analyzer_only: bool = False) -> str:
     """The prompt block for a run restricted to a subset of ``APPROACHES``.
 
     Returns ``""`` when every approach is allowed (nothing to say). The
     block is appended to the analyzer / optimizer / evaluator prompts —
+    ``analyzer_only`` emits only planning constraints; otherwise
     each role gets its consequence of ``optimize.approaches`` spelled
     out, mirroring the deterministic enforcement in the orchestrator
     (item-selection filter + post-optimizer auto-reject).
@@ -1965,6 +1643,16 @@ def approach_restriction_note(allowed: Sequence[str]) -> str:
         return ""
     allowed_str = ", ".join(f"`{a}`" for a in allowed)
     disallowed_str = ", ".join(f"`{a}`" for a in disallowed)
+    if analyzer_only:
+        return f"""\
+## Approach restriction (`optimize.approaches`)
+
+Allowed roadmap approaches: {allowed_str}. {disallowed_str} is off-limits.
+Record disallowed opportunities under "Out-of-scope opportunities" in
+`profile_findings.md`, with evidence. Do not disguise a config change as
+code by editing a default or env-var fallback. If no allowed approach can
+affect the active runtime, report the blocker and leave no unactionable item.
+"""
     guards = "\n".join(_APPROACH_GUARDS[a] for a in disallowed)
     return f"""\
 ## Approach restriction (`optimize.approaches`)
