@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import shutil
@@ -14,6 +15,7 @@ import yaml
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
 from agent_flow.workflows.perf_optimize import (
+    headroom_ledger,
     kernel_ledger,
     nsys_items,
     roadmap_schema,
@@ -4464,3 +4466,312 @@ def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
     assert "only these ranks are wrapped" in analyzer
     assert "Step 0 survey" in analyzer
     assert "straggler verdict" in analyzer
+
+
+# ------------------------------------------------------------- headroom ledger
+
+# The ledger keys its analytic parts on the SOL correlation's regions and
+# closes its join against the per-kernel ledger, so the task must carry
+# both. Two concurrency points so the bracket is a real bracket.
+_HL_EXTRA = {
+    "profile": {"kernel_coverage": {}, "headroom_ledger": {}},
+    "benchmark": {"concurrency": [8, 64], "num_prompts": [8, 64]},
+}
+
+
+def _hl_extra(**headroom) -> dict:
+    extra = copy.deepcopy(_HL_EXTRA)
+    extra["profile"]["headroom_ledger"] = headroom
+    return extra
+
+
+def _headroom_yaml(**overrides) -> str:
+    data = {
+        "version": headroom_ledger.HEADROOM_LEDGER_VERSION,
+        "operating_point": {
+            "concurrency": [8, 64],
+            "isl": 1024,
+            "osl": 1024,
+            "build_sha": "b" * 10,
+            "node": "node-1",
+            "capture_state": "gpu-bound",
+        },
+        "timing": {"step_ms": 10.0, "kernel_ms": 9.0},
+        "coverage": {
+            "modeled_kernel_ms": 6.0,
+            "modeled_pct": 66.7,
+            "empirical_kernel_ms": 2.0,
+            "unmodeled_kernel_ms": 1.0,
+            "non_kernel_ms": 1.0,
+        },
+        "parts": [
+            {
+                "id": "gdn_state:linear_attn:bf16",
+                "source": "analytic",
+                "at": {
+                    8: {"measured_ms": 1.0, "sol_ms": 0.6, "gap_ms": 0.4},
+                    64: {"measured_ms": 4.0, "sol_ms": 2.0, "gap_ms": 2.0},
+                },
+                "sensitivity": "steep",
+                "bound": "memory",
+                "kernels": ["gdn_bf16_state"],
+                "partition": {
+                    "closed_ms": 0.0,
+                    "attributed_ms": 0.0,
+                    "open_ms": 0.0,
+                    "unexplained_ms": 2.0,
+                },
+            },
+            {
+                # Counted, but carrying no analytic ceiling — the bucket
+                # that keeps "no modeled gap" from reading as "no headroom".
+                "id": "host:response-walk",
+                "source": "unmodeled",
+                "at": {
+                    8: {"measured_ms": 0.4, "sol_ms": None, "gap_ms": None},
+                    64: {"measured_ms": 1.0, "sol_ms": None, "gap_ms": None},
+                },
+                "sensitivity": "steep",
+                "bound": "latency",
+            },
+        ],
+    }
+    data.update(overrides)
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+_HL_PART = "gdn_state:linear_attn:bf16"
+
+# Curve mode is on (two concurrency points), so the stub analyzer owes a
+# baseline curve covering exactly them.
+_HL_CURVE = [
+    {"concurrency": 8, "value": 90.0, "tok_s_user": 20.0, "tok_s_gpu": 90.0},
+    {"concurrency": 64, "value": 110.0, "tok_s_user": 12.0, "tok_s_gpu": 110.0},
+]
+_HL_MEASURED_CURVE = [
+    {"concurrency": 8, "value": 94.1, "tok_s_user": 21.0, "tok_s_gpu": 94.1},
+    {"concurrency": 64, "value": 116.2, "tok_s_user": 12.6, "tok_s_gpu": 116.2},
+]
+
+
+def _stub_agents_with_headroom(workflow, ledger_yaml=None, **kwargs):
+    """`_stub_agents_with_ledger` plus a headroom ledger and its inputs.
+
+    The analyzer writes the campaign ledger and gives every roadmap item
+    a `parts` list; the evaluator emits the structured verdict fields the
+    orchestrator books dispositions from.
+    """
+    kwargs.setdefault("analyzer_items", [[_item(parts=[_HL_PART])]])
+    kwargs.setdefault("baseline_curve", _HL_CURVE)
+    kwargs.setdefault("evaluator_curve", _HL_MEASURED_CURVE)
+    trace = _stub_agents_with_ledger(workflow, **kwargs)
+    original_analyzer = workflow._run_analyzer
+    original_evaluator = workflow._run_evaluator
+
+    def analyzer_with_headroom(state):
+        original_analyzer(state)
+        if (
+            workflow.headroom_ledger_path.is_file()
+            and workflow.headroom_ledger_path.read_text(encoding="utf-8").strip()
+        ):
+            # Round N > 1 updates in place; the orchestrator-owned
+            # dispositions and history are read, never rewritten.
+            return
+        workflow.headroom_ledger_path.write_text(
+            ledger_yaml if ledger_yaml is not None else _headroom_yaml(), encoding="utf-8"
+        )
+
+    def evaluator_with_fields(state, *, agent=None, progress_ctx=None):
+        original_evaluator(state, agent=agent, progress_ctx=progress_ctx)
+        for path in filter(None, (workflow.progress_path, getattr(progress_ctx, "path", None))):
+            data = progress_module.read_progress(path)
+            for entry in data["optimization"]:
+                if entry.get("agent") == "evaluator" and entry.get("item_id"):
+                    entry.setdefault("gap_implication", "mechanism-inapplicable")
+                    entry.setdefault("gap_implication_note", "gated on a shape this build lacks")
+                    entry.setdefault("lever", "launch-geometry-tuning")
+                    entry.setdefault("parts", [_HL_PART])
+            progress_module.write_progress(path, data)
+
+    workflow._run_analyzer = analyzer_with_headroom
+    workflow._run_evaluator = evaluator_with_fields
+    return trace
+
+
+def test_headroom_ledger_run_completes_and_resolves_the_contract(tmp_path, fake_git):
+    task = _write_task(tmp_path, _HL_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_headroom(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+    resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
+    assert resolved["profile"]["headroom_ledger"] == {
+        "enforcement": "warn",
+        "target_layer": "ranking",
+        "tolerance_pct": 1.0,
+        "min_share_pct": 0.5,
+    }
+    assert (ws / "headroom_ledger.yaml").is_file()
+
+
+def test_headroom_ledger_books_the_verdict_as_a_disposition(tmp_path, fake_git):
+    """A failed item leaves a machine-readable fact, not a paragraph."""
+    task = _write_task(tmp_path, _HL_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_headroom(
+        workflow, evaluator_verdicts=[("REJECT", "perf_shortfall", 0.0, 100.0)]
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    ledger = yaml.safe_load((ws / "headroom_ledger.yaml").read_text(encoding="utf-8"))
+    (disposition,) = ledger["parts"][0]["dispositions"]
+    assert disposition["item"] == "opt-001"
+    assert disposition["outcome"] == "failed"
+    assert disposition["gap_implication"] == "mechanism-inapplicable"
+    assert disposition["lever"] == "launch-geometry-tuning"
+    assert disposition["note"] == "gated on a shape this build lacks"
+    assert disposition["evidence"].endswith("evaluation.md")
+    # The lever is spent, but the part is NOT retired: one failure is an
+    # anecdote, and the time keeps its place in the work queue.
+    assert ledger["parts"][0]["partition"]["unexplained_ms"] == 2.0
+    assert ledger["parts"][0].get("attribution") is None
+    # And the roadmap carries the same implication without a progress read.
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap["items"][0]["gap_implication"] == "mechanism-inapplicable"
+
+
+def test_headroom_ledger_records_history_once_per_round(tmp_path, fake_git):
+    task = _write_task(tmp_path, _HL_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_headroom(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    history = yaml.safe_load((ws / "headroom_ledger.yaml").read_text(encoding="utf-8"))["parts"][0][
+        "history"
+    ]
+    # One row per closed batch, at the primary (highest bracketing) point.
+    assert [row["round"] for row in history] == sorted({row["round"] for row in history})
+    assert history[0] == {"round": 1, "measured_ms": 4.0, "gap_ms": 2.0}
+
+
+def test_headroom_ledger_warns_but_does_not_stop_the_round(tmp_path, fake_git):
+    """The default gate must not wedge a campaign on bookkeeping.
+
+    `kernel_ledger.yaml` already aborts a round on invalidity; stacking a
+    second aborting gate over a far richer schema is how a campaign dies
+    on an accounting detail instead of on a measurement.
+    """
+    task = _write_task(tmp_path, _HL_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    broken = _headroom_yaml(version=99)
+    _stub_agents_with_headroom(workflow, ledger_yaml=broken)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_headroom_ledger_error_enforcement_parks_the_checkpoint(tmp_path, fake_git):
+    task = _write_task(tmp_path, _hl_extra(enforcement="error"))
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_headroom(workflow, ledger_yaml=_headroom_yaml(version=99))
+    try:
+        with pytest.raises(RuntimeError, match="headroom-ledger contract"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_headroom_ledger_error_enforcement_reports_a_missing_ledger(tmp_path, fake_git):
+    task = _write_task(tmp_path, _hl_extra(enforcement="error"))
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_ledger(
+        workflow, analyzer_items=[[_item(parts=[_HL_PART])]], baseline_curve=_HL_CURVE
+    )
+    try:
+        with pytest.raises(RuntimeError, match="was not written"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+
+def test_headroom_ledger_reports_an_item_that_named_no_parts(tmp_path, fake_git):
+    # An item with no `parts` cannot be booked anywhere, so the time it
+    # targeted can never leave the unexplained queue.
+    task = _write_task(tmp_path, _hl_extra(enforcement="error"))
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_headroom(workflow, analyzer_items=[[_item()]])
+    try:
+        with pytest.raises(RuntimeError, match="declares no 'parts'"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+
+def test_headroom_ledger_snapshot_lets_the_next_round_detect_a_moved_ceiling(tmp_path, fake_git):
+    task = _write_task(tmp_path, _HL_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_headroom(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    snapshots = list(ws.glob("rounds/round_*/analysis/headroom_ledger.yaml.snapshot"))
+    assert snapshots, "a validated ledger is frozen so the next round can diff against it"
+
+
+def test_without_the_block_no_headroom_ledger_is_required(tmp_path, fake_git):
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_ledger(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+    assert not (ws / "headroom_ledger.yaml").is_file()
+
+
+def test_headroom_driving_prompts_name_the_ledger_and_the_bracket(tmp_path):
+    prompts = _capture_driving_prompts(tmp_path, _HL_EXTRA)
+    analyzer = prompts["analyzer"]
+    assert "headroom_ledger.yaml" in analyzer
+    assert "[8, 64]" in analyzer
+    assert "engineering gap" in analyzer
+    reporter = prompts["reporter"]
+    assert "Headroom Accounting" in reporter
+    # The gate stays measured-vs-measured.
+    assert "headroom_ledger.yaml" not in prompts["evaluator"]
+    assert "headroom_ledger.yaml" not in prompts["qa"]
+
+
+def test_report_only_driving_prompt_does_not_rank_on_targets(tmp_path):
+    prompts = _capture_driving_prompts(tmp_path, _hl_extra(target_layer="report_only"))
+    assert "report-only" in prompts["analyzer"]
+    assert "engineering gap" not in prompts["analyzer"]
+
+
+def test_default_driving_prompts_omit_the_headroom_ledger(tmp_path):
+    prompts = _capture_driving_prompts(tmp_path)
+    assert "headroom_ledger.yaml" not in prompts["analyzer"]
+    assert "Headroom Accounting" not in prompts["reporter"]

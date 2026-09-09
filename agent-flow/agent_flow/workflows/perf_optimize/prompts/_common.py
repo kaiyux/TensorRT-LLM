@@ -17,7 +17,10 @@ variant for the optimizer, the optimization report's HTML companion
 spec, and the SOL-projection consumption blocks (``SOL_ANALYZER_CONTEXT``
 / ``SOL_OPTIMIZER_CONTEXT`` / ``SOL_OPTIMIZE_REPORTER_GUIDANCE``,
 appended only when the projector stage is enabled — the default, unless
-``task.yaml`` sets ``sol.enabled: false``).
+``task.yaml`` sets ``sol.enabled: false``), and the headroom-ledger
+contract (``headroom_ledger_analyzer_note`` /
+``HEADROOM_LEDGER_REPORTER_GUIDANCE``, appended only when ``task.yaml``
+declares ``profile.headroom_ledger``).
 """
 
 from typing import Sequence
@@ -53,6 +56,7 @@ __all__ = [
     "EXECUTION_SLURM_BOOTSTRAP",
     "EXPECTATION_GATE",
     "GIT_DISCIPLINE",
+    "HEADROOM_LEDGER_REPORTER_GUIDANCE",
     "KERNEL_COVERAGE_REPORTER_GUIDANCE",
     "KERNEL_REUSE",
     "MEASUREMENT_PROTOCOL",
@@ -73,6 +77,7 @@ __all__ = [
     "SOL_PROJECTOR_METHODOLOGY",
     "TUNING_CONFIG_NOTE",
     "approach_restriction_note",
+    "headroom_ledger_analyzer_note",
     "kernel_coverage_analyzer_note",
 ]
 
@@ -1478,6 +1483,448 @@ Rigor rules for this section:
 - If the final round's ledger is missing or invalid, say so plainly
   ("Kernel coverage ledger unavailable (<reason>)") — never reconstruct
   rows from memory.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Headroom ledger (analyzer / reporter) — built per run
+# --------------------------------------------------------------------------- #
+
+
+def headroom_ledger_analyzer_note(
+    target_layer: str = "ranking",
+    enforcement: str = "warn",
+    min_share_pct: float = 0.5,
+) -> str:
+    """The analyzer's headroom-ledger contract, with the task's knobs.
+
+    Appended only when ``task.yaml`` declares
+    ``profile.headroom_ledger``. It defines the campaign's per-part gap
+    accounting, the three-tier ``sol <= target <= measured`` model, the
+    rules that stop a round talking itself out of real headroom, and the
+    ``## Target implementation`` walk the reporter lifts into the final
+    report.
+    """
+    if target_layer == "ranking":
+        ranking_rule = """\
+**Rank the roadmap on the engineering gap.** `expected_gain_pct` is
+sized against `measured_ms - target_ms` — the distance to an
+implementation someone knows how to write — not against
+`measured_ms - sol_ms`. Say which in `expected_gain_rationale`. A part
+whose `target.basis` is `none-known` has **no** engineering gap: its
+whole distance is structural, and an item against it is research, not
+an estimate."""
+    else:
+        ranking_rule = """\
+**The target layer is report-only this campaign.** Author and report
+targets exactly as specified, but keep ranking the roadmap and sizing
+`expected_gain_pct` on measured evidence as you did before. The layer's
+whole value is estimate quality, and that claim is being scored against
+measured outcomes before it is allowed to steer GPU time."""
+    consequence = (
+        "aborts the analyzer stage"
+        if enforcement == "error"
+        else "warns without stopping the round — so a sloppy ledger degrades "
+        "the campaign's accounting silently rather than announcing itself"
+    )
+    return f"""\
+## The headroom ledger (`headroom_ledger.yaml`)
+
+This task declares `profile.headroom_ledger`, which adds the campaign's
+**accounting layer**: a durable, per-part record of where the remaining
+gap-to-SOL sits, what every round proved about it, and what a named,
+buildable implementation would achieve. It lives at the workspace root
+(campaign-scoped, unlike the per-round `kernel_ledger.yaml`) and you
+author it every round.
+
+Why it exists: without it, a failed optimization teaches the campaign
+almost nothing. Its whole durable payload is `status: failed` plus a
+number, while the finding it actually paid for — *which* lever is now
+spent against *which* part, and what that leaves — survives only as
+prose in a round directory. A later round is then free to re-propose
+exactly what was disproved.
+
+### The three tiers
+
+```
+sol_ms      <=   target_ms    <=   measured_ms
+(physics)      (best known)       (today)
+```
+
+- `sol_ms` — mandatory work at hardware peak, ideal structure assumed.
+  A bound no kernel may beat, and usually none reaches.
+- `target_ms` — what a **named, buildable** implementation would
+  achieve.
+- `measured_ms` — what runs today.
+
+That splits the gap in two, with different owners: `measured - target`
+is the **engineering gap** (a better implementation is known — this is
+where roadmap items come from) and `target - sol` is the **structural
+gap** (no known implementation reaches the floor — research it, or
+record it and move on).
+
+{ranking_rule}
+
+### The shape
+
+```yaml
+version: 1
+operating_point:                # the model is valid ONLY for these points
+  concurrency: [64, 512]        # lowest and highest scored concurrency;
+  isl: 1024                     #   every part is measured at BOTH
+  osl: 1024
+  build_sha: <the profiled HEAD>
+  node: <node>
+  capture_state: gpu-bound      # gpu-bound | host-bound | mixed
+timing:
+  step_ms: 18.372               # anchored median iteration
+  kernel_ms: 17.335             # per-rank-step kernel time
+coverage:                       # MANDATORY; must reconcile to step_ms
+  modeled_kernel_ms: 10.210     #   analytic parts (a sol_ms exists)
+  modeled_pct: 58.9
+  empirical_kernel_ms: 6.342    #   ncu bound class only, no ceiling
+  unmodeled_kernel_ms: 0.784    #   counted but not bounded (the below-bar tail)
+  non_kernel_ms: 1.037          #   host/scheduler/idle, outside the model
+  residual_ms: 0.001            #   what the buckets miss — recorded, never absorbed
+parts:
+  - id: gdn_state:linear_attn:bf16    # == the sol.json per_op[] region id
+    source: analytic                  # analytic | empirical | unmodeled
+    at:
+      64:  {{measured_ms: 0.412, sol_ms: 0.267, gap_ms: 0.145}}
+      512: {{measured_ms: 3.1321, sol_ms: 2.1386, gap_ms: 0.9935}}
+    sensitivity: steep                # flat | steep (null only if one point)
+    bound: memory
+    kernels: [_cached_replay_kernel]  # the join into kernel_ledger.yaml rows
+    partition:                        # sums to gap_ms at the HIGHEST point
+      closed_ms: 0.0
+      attributed_ms: 0.0
+      open_ms: 0.0
+      unexplained_ms: 0.9935
+    attribution:                      # the only field that FORECLOSES
+      attributed_ms: 0.0
+      basis: null                     # kernel-ledger-exhaustive | convergent-levers
+      note: null                      # required and non-empty when > 0
+    target:                           # see "The target block" below
+      target_ms: 2.62
+      ...
+part_lifecycle:                       # a part an accepted item deleted
+  - {{round: 2, part: logits_upcast:bf16_to_fp32, event: eliminated,
+     by: opt-001, measured_ms: 0.9792, sol_ms: 0.2871}}
+model_revisions: []                   # the ONLY way sol_ms moves
+measurement_revisions: []             # the ONLY way a measured_ms is restated
+target_revisions: []                  # the ONLY way target_ms moves
+```
+
+You own every field above. `dispositions` and `history` are
+**orchestrator-owned**: it appends them from the evaluators' structured
+verdicts after each batch closes. Read them; never write them.
+
+### Parts, and honest coverage
+
+- **`analytic`** parts take their id verbatim from that round's
+  `sol.json` `per_op[].region` — those are the parts the projection
+  actually bounds.
+- **`empirical`** parts take their id from the `kernel_ledger.yaml` row
+  label. Every ledger row at/above {min_share_pct}% that no analytic
+  part claims becomes one, so its time stays in the accounting instead
+  of vanishing.
+- **`unmodeled`** parts take a fixed structural-stage name
+  (`host:response-walk`, `host:index-setup`, ...) for time that is
+  counted but carries no ceiling at all.
+
+Coverage is mandatory and must reconcile, because "the modeled parts
+have little gap" is not the same statement as "there is little
+headroom", and a campaign that cannot tell them apart will spend its
+item budget on unbounded time while bounded gap sits untouched.
+
+### The kernel join is arithmetic, not judgement
+
+`sum(kernels[].share_pct) x kernel_ms` must equal that part's
+`measured_ms` in **`regions.json`** — *not* in `sol.json`, which
+substitutes `exposed_ms` for communication rows. The orchestrator checks
+it, and a mismatch reports the residual in both ms and share_pct, which
+usually names the row you left out: a 0.674% residual is the row whose
+share is 0.674%. Author the join once per part; the ids are stable
+across rounds, so you are not re-deriving it every time.
+
+### Two concurrencies, because a gap is not concurrency-invariant
+
+Profile and enter every part at **both** bracketing points. The primary
+output is not the interpolated middle — it is `sensitivity`:
+
+- `flat` — the gap is comparable at both ends; safe to rank once.
+- `steep` — materially different; the part must be ranked **per scored
+  point**, and any `expected_gain_pct` against it must say which points
+  it claims.
+
+This is not hypothetical. A real host-work reduction on this class of
+deployment was worth +1.4% at the top concurrency and **nothing** below
+it, because at lower concurrency there was no exposed host time to
+recover. One number per part would have ranked it identically at every
+point, and been wrong at three of four.
+
+### The partition, and what a failed item actually proves
+
+```
+gap_ms = closed_ms + attributed_ms + open_ms + unexplained_ms
+```
+
+- `closed` — recovered by an accepted item;
+- `attributed` — **proven** not closable in this campaign;
+- `open` — targeted by a pending item;
+- `unexplained` — nothing accounts for it. This is the remainder, and
+  the campaign's work queue: rank by it.
+
+**A failed item closes a LEVER, not a part.** This is the distinction
+that keeps the ledger honest and the easiest one to get wrong. A verdict
+establishing that a tuned launch mapping is gated on a shape this
+deployment does not have proves that *launch-geometry tuning* cannot
+reach the gap. It does **not** prove the gap is unreachable — the same
+verdict may name a different, untried lever. Booking that time as
+`attributed` would retire real headroom on evidence that does not
+support the conclusion.
+
+So `attribution.attributed_ms > 0` requires a `basis` that actually
+holds, and the orchestrator checks it in Python:
+
+- `kernel-ledger-exhaustive` — every kernel in this part's `kernels`
+  has all four `kernel_ledger.yaml` questions dispositioned `dismissed`;
+- `convergent-levers` — at least **two** dispositions with *distinct*
+  `lever` values and `gap_implication` in
+  {{`applied-but-no-gain`, `mechanism-already-present`}}. One failure is
+  an anecdote. A `change-not-live` or `blocked-by-constraint`
+  disposition never counts toward either, because in both the mechanism
+  was never actually tested against the part.
+
+Until one holds, the time stays `unexplained` and keeps its place in the
+queue, carrying its accumulating list of spent levers.
+
+### The evidence burden is asymmetric
+
+Three operations permanently remove headroom from the queue: raising a
+`sol_ms`, restating a `measured_ms` downward, and declaring a gap
+`attributed`. Leaving time `unexplained` costs nothing but another look.
+So the bar scales with what the decision forecloses, and **the symptom
+is never the fact**:
+
+- `missing-factor` — not *"the SOL looks too aggressive"*, but *"the
+  recipe multiplied by 1 layer where the model has 92 —
+  `<recipe>@<sha>`"*.
+- `wrong-peak` — not *"this GPU should be faster"*, but *"the peak used
+  the sparse TFLOPS column; dense is X — `peaks.json` `source`"*.
+- `wrong-parallelism` — not *"occupancy seems off"*, but *"the recipe
+  assumed all SMs; the kernel launches N blocks — ncu
+  `launch__grid_size`"*.
+- `mixed-state-capture` — not *"the number looked high"*, but *"26 of 47
+  iterations were host-bound, so compute is absent and the collective
+  stands exposed — both values in `regions.json`"*.
+
+Every revision entry needs **all three** of `cause` (from its closed
+enum), a non-empty `detail` naming the specific defect, and an
+`evidence` reference that resolves. A revision whose `detail` restates
+its `cause` is rejected and the adjudication re-opens.
+
+**A failed optimization is never, by itself, grounds to lower a
+ceiling.** It is grounds to open an adjudication into which of three
+things was wrong: the implementation (ordinary — that is a roadmap
+item), the model (`model_revisions`), or the measurement
+(`measurement_revisions`).
+
+### The target block
+
+```yaml
+    target:
+      target_ms: 2.62
+      structure: >-
+        One persistent kernel per layer: load S and the conv window once
+        into registers/SMEM, apply the update chain without round-tripping
+        S through HBM, store S once.
+      basis: derived            # existing-impl | published | derived | none-known
+      basis_ref: >-
+        same recipe arithmetic as sol_ms (<recipe>): S read once, written once
+      today: "5 kernels: _cached_replay, _causal_conv1d_update, ..."
+      achieved_efficiency:      # MEASURED, with a named source
+        value: 0.78
+        source: "moe_gemm_fc1 demonstrates 78% MBU on this node and workload"
+      delta:                    # must sum to measured_ms - target_ms
+        - {{cause: state-round-trip, ms: 0.42, evidence: "cuda_gpu_trace step 120"}}
+        - {{cause: launch-overhead, ms: 0.09, evidence: "5 launches vs 1; alpha from peaks.json"}}
+        - {{cause: unattributed, ms: 0.00}}
+      falsifier: >-
+        if the reduction cannot be held in registers at heads_local=16 the
+        fusion is unbuildable and target_ms collapses to measured_ms.
+```
+
+`target_ms` is **computed, not asserted**:
+
+```
+target_ms = mandatory_work / achieved_efficiency
+          + n_launches x alpha_launch          # alpha from peaks.json
+          + observed_serialization
+```
+
+This is the section most likely to produce confident fiction, so:
+
+- **`basis: none-known` is legal and expected.** When you cannot name a
+  real implementation, say so: `target_ms == measured_ms`, no `delta`,
+  and the whole gap is structural. "I do not know how to build this" is
+  a result, not a failure to fill in the form.
+- `existing-impl` must cite a kernel that exists — in this checkout,
+  FlashInfer, CUTLASS, or a vendor library — with a ref that resolves.
+- `derived` must reuse the **same recipe arithmetic** as `sol_ms`, so
+  the tiers stay commensurable and a saving cannot be double-counted.
+- `achieved_efficiency` must be **measured** with a named source: this
+  part's own ncu metrics, a reference kernel of the same class elsewhere
+  in the same trace, or an `existing-impl` you profiled. An efficiency
+  with no source is the single easiest way to fabricate a target.
+- Every named `delta` cause must be **observable** — a trace, a kernel
+  count, a launch count — never a guess, and `delta` always carries an
+  explicit `unattributed` remainder. Requiring the named causes alone to
+  balance would force you to invent one.
+- `falsifier` is required: the dependency or constraint that, if real,
+  makes the target unbuildable. A target nobody can falsify is an essay.
+- Author targets for the **top parts by gap** first. A part without one
+  simply behaves as the accounting above describes.
+
+**When an attempt falsifies a target, correct the target — never the
+ceiling.** The optimizer records what it actually hit; the evaluator
+confirms it against the diff and the source and forwards it; you decide
+whether it warrants a `target_revisions` entry, whose `cause` comes from
+the existing dismissal vocabulary (`multi-consumer-pinned`,
+`phase-boundary`, `resource-saturated`, `fast-path-blocked: <guard>`,
+`needs-rebuild: <artifact>`, ...). The `detail` must name what the
+attempt *found* — the extra consumer it read, the dependency in the
+trace, the register pressure the compiler reported, the guard that gated
+the fast path. "On reflection this seems hard" is not a finding, and an
+attempt that produced none has not falsified anything. A target
+revision moves time from the engineering gap to the structural gap; it
+is a re-classification, not a foreclosure, which is why its burden sits
+below an attribution's.
+
+### `## Target implementation` — the findings section
+
+Every profiling round, emit this section into `profile_findings.md`. It
+walks the model in **execution order**, not gap order:
+
+```
+## Target implementation
+
+Decode step, per layer (x N layers), then the tail.
+
+  [linear-attention layers]
+    input norm                  ...
+    gdn state update            5 kernels -> 1 persistent   3.132 / 2.62 / 2.139
+    o_proj                      ...
+  [full-attention layers]
+    paged KV read               fmha_paged_kv_Q32Kv128      1.510 / ... / 1.100
+  [both]
+    tensor-parallel AllReduce   ar_fusion oneshot lamport   1.350 / ... / 0.622
+  [MoE block]
+    router / routing indices    routingIndices*             (empirical only)
+    gate_up + swiglu            moe_gemm_fc1_swiglu_nvfp4   1.805 / ... / 0.933
+  [tail]
+    lm_head                     lm_head_gemm_fp4            0.219 / ... / 0.088
+  [runtime plumbing]
+    host: response walk, index setup    (non_kernel_ms, no ceiling)
+```
+
+with columns `today | target structure | basis | measured | target | SOL
+| eng. gap | struct. gap`.
+
+**Why structural order and not gap order.** A reader can hold it against
+the model source and follow along — but the substantive reason is that
+structural order makes *missing coverage visible*. Ranking by gap
+silently omits everything the model does not bound: a part with no
+`sol_ms` simply is not in the list. Walking the structure turns every
+uncovered stage into a visible hole, which is exactly where a campaign's
+item budget goes to die. The engineering-gap ranking still exists — it
+is what orders the roadmap — but print it **after** the walk, as a
+derived view.
+
+### Also owed
+
+- Give every `roadmap.yaml` item a `parts` list naming the ledger parts
+  it attacks. Write `parts: []` only for a genuine whole-deployment
+  change. An item with no `parts` cannot be booked against anything, so
+  the time it targeted can never leave the `unexplained` queue.
+- Optionally add `part: <part id>` to `kernel_ledger.yaml` rows. Rows
+  with no `part` are exactly what makes `coverage.empirical_kernel_ms`
+  non-zero, so the field is how the two accounting systems reconcile.
+- Progress is measured in **absolute milliseconds** (`closed_ms`,
+  `attributed_ms`, `open_ms`, `unexplained_ms`, `eliminated_ms`), never
+  in % of SOL. The denominator moves whenever an accepted item deletes a
+  part — removing *inefficient* work raises the average and removing
+  *efficient* work lowers it — so the ratio changes for reasons
+  unrelated to whether the deployment got faster.
+
+The orchestrator validates the ledger the moment your turn ends, and an
+invalid one {consequence}.
+"""
+
+
+HEADROOM_LEDGER_REPORTER_GUIDANCE = """\
+## Headroom Accounting (this task declares `profile.headroom_ledger`)
+
+The campaign maintained `headroom_ledger.yaml` at the workspace root:
+per-part gap accounting, the levers each round spent, and — where the
+analyzer authored one — a named target implementation per part. `Read`
+it and add one section to `optimization_report.md`, placed **between
+"Projection vs Measured" and "Config & Code Diff Summary"** (the HTML
+companion mirrors it like every other section):
+
+```
+## Headroom Accounting
+
+<Open with the coverage headline from `coverage`: modeled X ms of the
+kernel step (Y%), empirical Z ms carrying only a bound class, unmodeled
+W ms carrying no ceiling at all, plus non-kernel V ms outside the
+ceiling's model — stated in that order, because a reader who sees only
+the modeled share will mistake "little modeled gap" for "little
+headroom".
+
+Then the per-part table, in descending `unexplained_ms`, with the
+columns: part, source, measured, target, SOL, eng. gap, struct. gap,
+closed, attributed, open, unexplained, levers spent —
+where `levers spent` lists each disposition's `lever` with its
+`gap_implication`, and the campaign outcome of the item that produced
+it. Follow with the campaign totals in absolute milliseconds, and the
+`eliminated_ms` credit for any part an accepted item deleted outright.
+
+Lift the analyzer's `## Target implementation` walk from the final
+profiling round's `profile_findings.md` in structural (execution) order,
+unchanged. Print the engineering-gap ranking after it as a derived view.
+
+Close with every `model_revisions` and `measurement_revisions` entry
+**verbatim** — cause, detail and evidence. Those are the entries that
+moved the bar the campaign was measured against, and a reader cannot
+audit the result without seeing them.>
+```
+
+Rigor rules for this section:
+
+- **Every number comes from the ledger.** Do not re-derive a partition
+  from the round markdown, and do not soften an `unexplained` bucket
+  into an attributed one. `unexplained` is a finding, not a gap in the
+  report.
+- **Absolute milliseconds, not % of SOL.** Quote a % of SOL only
+  alongside the part set it was computed over: an accepted item that
+  deletes an inefficient part raises the average without anything
+  getting faster.
+- **Report the partition to the precision the noise floor justifies.**
+  Four decimals on a sub-millisecond bucket implies a confidence
+  repeated measurement on this hardware does not support; say so where
+  an item carries `measurement_confidence: not-reproducible` or a
+  pooled estimate that differs from the scored one.
+- **A target is a plan, not a measurement.** Never present `target_ms`
+  as something achieved, and carry each target's `basis` into the table
+  so a `derived` target never reads like a profiled one. A part with
+  `basis: none-known` is reported as such — its whole gap is structural.
+- **This section replaces the remaining-gap accountability table** that
+  *Projection vs Measured* would otherwise re-derive; that section keeps
+  its headroom-captured headline and points here.
+- If the ledger is missing or invalid, say so plainly ("Headroom ledger
+  unavailable (<reason>)") and fall back to the projection's own
+  accountability breakdown — never reconstruct a partition from memory.
 """
 
 

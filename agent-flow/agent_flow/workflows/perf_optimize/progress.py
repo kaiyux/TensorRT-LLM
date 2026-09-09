@@ -100,6 +100,62 @@ _CURVE_FIELD_SCHEMA: dict[str, Any] = {
     "mode.",
 }
 
+# What a terminal verdict proved about the bottleneck the item targeted.
+# Promoted out of the free-text ``summary`` because the ``Gap
+# implication:`` line has been written four different ways inside a
+# single campaign, and regex over prose is not a contract. Mirrors
+# :data:`headroom_ledger.GAP_IMPLICATIONS`.
+GAP_IMPLICATIONS = (
+    "mechanism-already-present",
+    "mechanism-inapplicable",
+    "applied-but-no-gain",
+    "change-not-live",
+    "blocked-by-constraint",
+)
+
+# How much the recorded gain can be trusted. A scored arm the evaluator
+# itself repeated and disowned must not be inherited as fact by anything
+# downstream.
+MEASUREMENT_CONFIDENCES = ("single-arm", "repeated", "not-reproducible")
+
+# The optimizer's finding when the planned implementation could not be
+# built, verified by the evaluator against the diff and the source.
+# Forwarded, never authored here: the evaluator cannot see the target it
+# blocks, so it reports a fact about the code and the analyzer decides
+# what that fact means for the plan.
+_TARGET_BLOCKER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cause": {
+            "type": "string",
+            "description": "The blocker's leading dismissal tag "
+            "(multi-consumer-pinned, phase-boundary, resource-saturated, "
+            "fast-path-blocked: <guard>, needs-rebuild: <artifact>, ...).",
+        },
+        "detail": {
+            "type": "string",
+            "description": "What the optimizer actually found — the extra "
+            "consumer it read in the source, the dependency in the trace, the "
+            "register pressure the compiler reported, the guard that gated the "
+            "fast path. 'On reflection this seems hard' is not a finding.",
+        },
+        "evidence": {
+            "type": "string",
+            "description": "Path to the attempt artifact the finding came from.",
+        },
+        "confirmed": {
+            "type": "boolean",
+            "description": "Whether you verified the optimizer's claim against "
+            "the diff and the source yourself.",
+        },
+    },
+    "required": ["cause", "detail", "evidence", "confirmed"],
+    "description": "Optional. Forward the optimizer's blocker from "
+    "optimization_summary.md when its attempt hit a real wall, with your own "
+    "confirmation. Omit when the attempt produced no such finding — an attempt "
+    "that failed for some other reason has not falsified anything.",
+}
+
 
 def _coerce_curve(curve: Any) -> list[dict[str, Any]]:
     """Coerce a tool-supplied curve into plain int/float entries."""
@@ -275,6 +331,13 @@ class ProgressContext:
     current_round: int = 0
     current_attempt: int | None = None
     current_item_id: str = ""
+    # Whether this campaign runs the headroom ledger. The new evaluator
+    # fields stay optional in the tool schema either way — a required
+    # field would break every campaign that does not have the ledger —
+    # but with the contract on, a terminal verdict that omits its gap
+    # implication is rejected here rather than silently losing the one
+    # fact a failed attempt paid a full benchmark to learn.
+    headroom_ledger: bool = False
     _tool_cache: list[Any] | None = field(default=None, repr=False, compare=False)
 
 
@@ -455,6 +518,55 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     "task.yaml sets it. 0 if the benchmark could not run.",
                 },
                 "curve": _CURVE_FIELD_SCHEMA,
+                "gap_implication": {
+                    "type": "string",
+                    "enum": list(GAP_IMPLICATIONS),
+                    "description": "On PUSH_BACK/REJECT: what this outcome "
+                    "proves about the bottleneck the item targeted, judged "
+                    "from your own evidence. Use change-not-live when the "
+                    "change never executed in the measured binary (a config "
+                    "key ignored, a dead path, a flag with no read site) — "
+                    "that bounds nothing, because the mechanism was never "
+                    "tested. Omit on APPROVE.",
+                },
+                "gap_implication_note": {
+                    "type": "string",
+                    "description": "One sentence backing the gap_implication, "
+                    "naming the mechanism and the evidence.",
+                },
+                "parts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The roadmap item's `parts` — which parts of "
+                    "the model this verdict bears on. Pass the item's list "
+                    "unless your evidence says the verdict actually bears on "
+                    "different parts; an empty list is legitimate for a "
+                    "whole-deployment change.",
+                },
+                "lever": {
+                    "type": "string",
+                    "description": "Short label for the mechanism family this "
+                    "attempt spent (e.g. 'launch-geometry-tuning', "
+                    "'glue-chain-fusion', 'host-work-removal'). A failed "
+                    "attempt closes a LEVER, not a part, so two attempts on "
+                    "the same part must carry different labels when they tried "
+                    "genuinely different mechanisms.",
+                },
+                "target_blocker": _TARGET_BLOCKER_SCHEMA,
+                "measured_gain_pooled_pct": {
+                    "type": "number",
+                    "description": "Your best estimate when you repeated the "
+                    "measurement and it disagrees with the scored arm — the "
+                    "pooled value across arms. Omit when you measured once.",
+                },
+                "measurement_confidence": {
+                    "type": "string",
+                    "enum": list(MEASUREMENT_CONFIDENCES),
+                    "description": "single-arm (measured once) | repeated (you "
+                    "re-measured and it held) | not-reproducible (you "
+                    "re-measured and it did not). Never let a number you "
+                    "yourself disowned be inherited downstream as fact.",
+                },
             },
             "required": [
                 "summary",
@@ -466,14 +578,41 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         },
     )
     async def append_evaluator_progress(args: dict[str, Any]) -> dict[str, Any]:
+        decision = args["decision"]
+        implication = args.get("gap_implication")
+        if ctx.headroom_ledger and decision != "APPROVE" and not implication:
+            raise ValueError(
+                "this campaign runs the headroom ledger, so a PUSH_BACK or "
+                "REJECT must carry `gap_implication` (one of "
+                f"{list(GAP_IMPLICATIONS)}) plus `gap_implication_note` and "
+                "`lever`. A verdict without them discards the only durable "
+                "finding a failed attempt paid a full benchmark to produce."
+            )
         entry = _base_entry("evaluator")
         entry["summary"] = args["summary"]
-        entry["decision"] = args["decision"]
+        entry["decision"] = decision
         entry["reason_category"] = args["reason_category"]
         entry["measured_gain_pct"] = float(args["measured_gain_pct"])
         entry["measured_value"] = float(args["measured_value"])
         if args.get("curve"):
             entry["curve"] = _coerce_curve(args["curve"])
+        if implication:
+            entry["gap_implication"] = implication
+        for field_name in ("gap_implication_note", "lever", "measurement_confidence"):
+            if args.get(field_name):
+                entry[field_name] = str(args[field_name])
+        if args.get("parts") is not None:
+            entry["parts"] = [str(part) for part in args["parts"]]
+        if args.get("target_blocker"):
+            blocker = args["target_blocker"]
+            entry["target_blocker"] = {
+                "cause": str(blocker.get("cause", "")),
+                "detail": str(blocker.get("detail", "")),
+                "evidence": str(blocker.get("evidence", "")),
+                "confirmed": bool(blocker.get("confirmed")),
+            }
+        if args.get("measured_gain_pooled_pct") is not None:
+            entry["measured_gain_pooled_pct"] = float(args["measured_gain_pooled_pct"])
         stored = _append_for_context(entry)
         _log_progress_write("evaluator", stored)
         return {

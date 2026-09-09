@@ -192,6 +192,33 @@ than inventing values:
   overlap possibility considered before done" guarantee; it needs `nsys` +
   `ncu` in `profile.methods` and adds profiling wall-clock to every
   round that profiles.
+- `profile.headroom_ledger`: include (an empty mapping enables the
+  defaults `enforcement: warn`, `target_layer: ranking`,
+  `tolerance_pct: 1.0`, `min_share_pct: 0.5`) when the user wants the
+  **headroom ledger** — the campaign's per-part gap accounting at
+  `<workspace>/headroom_ledger.yaml`. Without it, a failed optimization's
+  entire durable payload is `status: failed` plus a number, and the
+  finding it paid a full benchmark for ("the remaining gap is a
+  mapping/layout problem, not a launch-geometry one — do not author
+  launch tuning against these kernels again") survives only as prose in a
+  round directory, so a later round is free to re-propose exactly what
+  was disproved. With it, every round records per part where the gap
+  sits at **both** bracketing focus concurrencies (so a
+  concurrency-localized win is not ranked identically everywhere), which
+  kernels the part is made of, how its gap splits into
+  closed/attributed/open/unexplained, and — the target layer — what a
+  named, buildable implementation would achieve, giving
+  `sol_ms <= target_ms <= measured_ms` and letting `expected_gain_pct` be
+  sized against a real implementation instead of a floor no kernel
+  reaches. Requires the SOL projector and `profile.kernel_coverage`.
+  Two things to tell the user up front: it **warns rather than aborts**
+  by default (raise to `enforcement: error` only once a campaign has run
+  the contract, since a second round-aborting gate over a rich schema is
+  how a campaign dies on bookkeeping), and the target layer is the part
+  most likely to produce confident fiction — offer
+  `target_layer: report_only` if they would rather score its predictions
+  for a campaign before letting them steer GPU time. It costs analyst
+  attention per round plus a second profiled concurrency point.
 - `accuracy`: include only if the user has an eval command they want the
   final verification to run at campaign end; omit the block otherwise.
 - `extra_llm_api_options`: starting server tuning YAML, if they have one.
@@ -283,6 +310,11 @@ Poll the workspace (and the launch log) rather than waiting silently:
 - `roadmap.yaml` — the ranked plan; watch item `status` and measured
   gains vs `expected_gain_pct`; `current_best` tracks the last accepted
   measurement.
+- `headroom_ledger.yaml` (with a `profile.headroom_ledger` block) — the
+  per-part accounting. Ranking its parts by `unexplained_ms` is the
+  campaign's real work queue: it is where you see headroom nothing has
+  attacked, and the spent levers accumulating against the parts that
+  have been.
 - `baseline/benchmark_results.md` (and `sol_projection.md` right after
   it unless `sol.enabled: false`), then per-round
   `rounds/round_<n>/` (`analysis/profile_findings.md`,

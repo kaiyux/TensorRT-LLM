@@ -223,13 +223,27 @@ feedback: what exactly failed and what a passing retry would look like.
 On REJECT, state why the item's premise is broken — why no retry would
 help. On PUSH_BACK/REJECT, close with one line —
 `Gap implication: <mechanism-already-present | mechanism-inapplicable |
-applied-but-no-gain | blocked-by-constraint> — <one sentence>` —
+applied-but-no-gain | change-not-live | blocked-by-constraint> — <one
+sentence>` —
 what this outcome says about the bottleneck the item targeted, judged
 from your own evidence (the diff, the source you read, your
 measurements). The Analyzer re-plans from these lines and the final
 report attributes the remaining headroom with them, so a vague or
 missing gap implication hides exactly the finding a failed attempt
-paid for.>
+paid for.
+
+**`change-not-live` is the value people forget, and it is the one that
+matters most.** Use it when the change was applied but never actually
+executed in the binary you measured — a config key silently ignored, a
+dead code path, an env var that never reached the server process, a flag
+with no read site on this model's path. That outcome looks identical to
+`applied-but-no-gain` from the numbers alone and means the opposite:
+`applied-but-no-gain` bounds the bottleneck's headroom, while
+`change-not-live` bounds nothing, because the mechanism was never
+tested. Recording one as the other retires real headroom on evidence
+that does not support it. Verify which you are looking at — a log line,
+a counter, a kernel that did or did not change in the trace — before you
+choose.>
 ```
 
 """
@@ -269,6 +283,39 @@ them into `roadmap.yaml`. In Pareto-curve mode also pass the sixth field
 `curve` — the per-point `{concurrency, value, tok_s_user, tok_s_gpu}`
 rows you measured, ascending — which the orchestrator records as
 `current_best.curve` on APPROVE.
+
+The tool also takes optional structured fields. They are what turn a
+failed attempt into a durable fact instead of a paragraph, so fill them
+in whenever they apply:
+
+- `gap_implication` — the same value as your verdict's line, as a
+  field. Prose is not a contract: that line has been written four
+  different ways inside a single campaign, and nothing downstream can
+  parse it reliably.
+- `gap_implication_note` — one sentence backing it, naming the
+  mechanism and the evidence.
+- `parts` — the roadmap item's `parts` list, so the outcome can be
+  booked against the parts of the model it actually bears on. Pass the
+  item's list unless your own evidence says otherwise.
+- `lever` — a short label for the *mechanism family* this attempt spent
+  (`launch-geometry-tuning`, `glue-chain-fusion`, `host-work-removal`).
+  Two attempts against the same bottleneck must carry different labels
+  when they tried genuinely different mechanisms: a failed attempt
+  closes a lever, not a bottleneck, and only *distinct* levers
+  converging can retire headroom.
+- `measured_gain_pooled_pct` and `measurement_confidence` — when you
+  repeated the measurement and it disagrees with the scored arm, record
+  your pooled estimate and mark it `repeated` or `not-reproducible`.
+  `measured_gain_pct` stays exactly as scored, but a number you yourself
+  disowned must never be inherited downstream as fact.
+- `target_blocker` — when the Optimizer's `optimization_summary.md`
+  reports hitting a real wall (an extra consumer it read in the source,
+  a dependency visible in the trace, register pressure the compiler
+  reported, a guard that gated a fast path), forward
+  `{cause, detail, evidence}` with `confirmed: true|false` after
+  checking the claim against the diff and the source yourself. Forward,
+  never author: this is a fact about the code, and an attempt that
+  produced no such finding failed for some other reason.
 
 """
     + EVIDENCE_DISCIPLINE

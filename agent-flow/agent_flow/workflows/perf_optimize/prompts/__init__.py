@@ -7,12 +7,14 @@ from agent_flow.workflows.perf_analyze.prompts import build_remote_execution_con
 from ._common import (
     DISAGG_CAMPAIGN,
     EXECUTION_SLURM_BOOTSTRAP,
+    HEADROOM_LEDGER_REPORTER_GUIDANCE,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
     REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
     approach_restriction_note,
+    headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
 )
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
@@ -99,6 +101,7 @@ def build_perf_optimize_prompts(
     approaches: Sequence[str] | None = None,
     include_sol: bool = False,
     kernel_coverage: Mapping[str, Any] | None = None,
+    headroom_ledger: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
 ) -> PromptBundle:
@@ -159,6 +162,15 @@ def build_perf_optimize_prompts(
     and consumed by the reporter, with the orchestrator's deterministic
     validation in between.
 
+    When ``headroom_ledger`` is set (the validated
+    ``profile.headroom_ledger`` block), the analyzer gets the campaign's
+    per-part gap-accounting contract — the three ``sol <= target <=
+    measured`` tiers, the rules that stop a round talking itself out of
+    real headroom, and the ``## Target implementation`` walk — and the
+    reporter gets the "Headroom Accounting" section that renders it. The
+    evaluator and QA get nothing: their gates stay measured-vs-measured,
+    and the target layer is a *plan*, which must never anchor a verdict.
+
     When ``include_disagg`` is True (the task spec carries a ``disagg``
     block), the disaggregated-serving section is appended to every role
     that launches or measures a server. It supersedes the single-server
@@ -216,6 +228,15 @@ def build_perf_optimize_prompts(
                 float(kernel_coverage["coverage_target_pct"]),
             ),
             reporter=KERNEL_COVERAGE_REPORTER_GUIDANCE,
+        )
+    if headroom_ledger is not None:
+        bundle = bundle.with_extensions(
+            analyzer=headroom_ledger_analyzer_note(
+                str(headroom_ledger["target_layer"]),
+                str(headroom_ledger["enforcement"]),
+                float(headroom_ledger["min_share_pct"]),
+            ),
+            reporter=HEADROOM_LEDGER_REPORTER_GUIDANCE,
         )
     context = build_remote_execution_context(remote_execution, campaign_name)
     if context:

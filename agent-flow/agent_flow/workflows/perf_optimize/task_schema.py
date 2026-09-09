@@ -31,7 +31,7 @@ its own:
   end, and compares the score against ``baseline_score`` /
   ``max_drop_pct``. When absent, QA does sanity completions only.
 
-It also honors one perf-optimize-only key inside the shared ``profile``
+It also honors two perf-optimize-only keys inside the shared ``profile``
 block (the base validator preserves unknown ``profile`` keys):
 
 - ``profile.kernel_coverage`` — optional; when present (an empty mapping
@@ -45,6 +45,19 @@ block (the base validator preserves unknown ``profile`` keys):
   evidence-backed dismissal per question). Requires ``nsys`` (the
   enumeration source) and ``ncu`` (the per-kernel metrics) in
   ``profile.methods``.
+- ``profile.headroom_ledger`` — optional; when present (an empty mapping
+  is valid — all defaults) it activates the **headroom ledger**, the
+  campaign-scoped accounting layer at ``<workspace>/headroom_ledger.yaml``
+  (see :mod:`.headroom_ledger`): where the remaining gap-to-SOL sits per
+  part, what each round proved about it, and what a named, buildable
+  implementation would achieve. ``enforcement`` decides whether a ledger
+  problem warns or parks the round (``warn`` by default — a second
+  round-aborting gate over a much richer schema risks wedging campaigns
+  on bookkeeping); ``target_layer`` decides whether the target tier ranks
+  the roadmap or is only reported. Requires the SOL projector (the
+  analytic parts *are* the correlation's regions) and
+  ``profile.kernel_coverage`` (the kernel→part join closes against its
+  shares).
 
 Base validation is delegated to
 :func:`agent_flow.workflows.perf_analyze.task_schema.load_and_validate_task_yaml`
@@ -147,6 +160,9 @@ KNOWN_OPTIMIZE_KEYS: frozenset[str] = frozenset(
 )
 KNOWN_ACCURACY_KEYS: frozenset[str] = frozenset({"command", "baseline_score", "max_drop_pct"})
 KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "coverage_target_pct"})
+KNOWN_HEADROOM_LEDGER_KEYS: frozenset[str] = frozenset(
+    {"enforcement", "target_layer", "tolerance_pct", "min_share_pct"}
+)
 
 # Defaults merged under ``profile.kernel_coverage`` when the block is
 # present (its presence is the opt-in; absent ⇒ the bounded top-kernel
@@ -160,6 +176,41 @@ KERNEL_COVERAGE_DEFAULTS: dict[str, Any] = {
     # extends down the timeline decomposition (grouping related kernels
     # is fine) until met.
     "coverage_target_pct": 95.0,
+}
+
+# ``profile.headroom_ledger`` enforcement modes. The gate **warns** by
+# default and for good reason: ``kernel_ledger.yaml`` already aborts a
+# round on invalidity, and a second aborting gate over a much richer
+# schema risks wedging campaigns on bookkeeping rather than on
+# measurements. A campaign that has run the contract before and wants it
+# binding sets ``enforcement: error``.
+HEADROOM_ENFORCEMENTS = ("warn", "error")
+
+# Whether the target layer ranks the roadmap or is only reported.
+# ``ranking`` sizes every ``expected_gain_pct`` against
+# ``measured - target`` — the distance to a named, buildable
+# implementation — instead of against a physics floor no kernel reaches.
+# ``report_only`` authors and reports the same targets without letting
+# them order the plan, which is the conservative first-campaign mode:
+# the layer's whole value is estimate quality, and that claim can be
+# scored against measured outcomes before it steers GPU time.
+HEADROOM_TARGET_LAYERS = ("ranking", "report_only")
+
+# Defaults merged under ``profile.headroom_ledger`` when the block is
+# present (its presence is the opt-in; absent ⇒ no ledger at all, which
+# is every campaign written before this contract existed).
+HEADROOM_LEDGER_DEFAULTS: dict[str, Any] = {
+    "enforcement": "warn",
+    "target_layer": "ranking",
+    # Reconciliation slack on the coverage and join closures. The
+    # reference campaign's own two sources for "modeled ms" disagree by
+    # 0.36% because the note and the roll-up were computed slightly
+    # differently; demanding exact closure would wedge the round on
+    # rounding.
+    "tolerance_pct": 1.0,
+    # Kernel-ledger rows at/above this share that belong to no part must
+    # become `empirical` parts rather than vanishing from the accounting.
+    "min_share_pct": 0.5,
 }
 
 
@@ -342,6 +393,77 @@ def _validate_kernel_coverage(data: Mapping[str, Any], errors: list[str]) -> dic
     return merged
 
 
+def _validate_headroom_ledger(data: Mapping[str, Any], errors: list[str]) -> dict[str, Any] | None:
+    """Validate the optional ``profile.headroom_ledger`` block.
+
+    Returns the normalized block (defaults merged) when present and
+    valid, else ``None`` with the problems appended to ``errors``. Lives
+    in this schema — not the base one — for the same reason
+    ``kernel_coverage`` does: the artifact it enables exists only in
+    perf-optimize, and the base validator preserves the key untouched.
+
+    Unknown keys are **rejected** rather than ignored. A silently dropped
+    knob is how a campaign ends up running under a budget nobody set, and
+    every knob here changes what the campaign builds or how hard the gate
+    bites.
+    """
+    profile = data.get("profile")
+    if not isinstance(profile, Mapping) or profile.get("headroom_ledger") is None:
+        return None
+    block = profile["headroom_ledger"]
+    if not isinstance(block, dict):
+        errors.append(
+            f"'profile.headroom_ledger' must be a mapping (an empty one enables "
+            f"the defaults), got {type(block).__name__}"
+        )
+        return None
+    unknown = sorted(str(key) for key in block if key not in KNOWN_HEADROOM_LEDGER_KEYS)
+    if unknown:
+        errors.append(
+            f"'profile.headroom_ledger' has unknown field(s) "
+            f"{', '.join(repr(key) for key in unknown)} — valid fields are "
+            f"{', '.join(repr(key) for key in sorted(KNOWN_HEADROOM_LEDGER_KEYS))}"
+        )
+        return None
+    merged = {**HEADROOM_LEDGER_DEFAULTS, **block}
+    if merged["enforcement"] not in HEADROOM_ENFORCEMENTS:
+        errors.append(
+            f"'profile.headroom_ledger.enforcement' must be one of "
+            f"{list(HEADROOM_ENFORCEMENTS)}, got {merged['enforcement']!r}"
+        )
+    if merged["target_layer"] not in HEADROOM_TARGET_LAYERS:
+        errors.append(
+            f"'profile.headroom_ledger.target_layer' must be one of "
+            f"{list(HEADROOM_TARGET_LAYERS)}, got {merged['target_layer']!r}"
+        )
+    for field in ("tolerance_pct", "min_share_pct"):
+        value = merged[field]
+        if not _is_number(value) or not (0 < value <= 100):
+            errors.append(
+                f"'profile.headroom_ledger.{field}' must be a number in (0, 100], got {value!r}"
+            )
+    # The ledger is an accounting layer *over* two existing artifacts: it
+    # keys its analytic parts on the SOL correlation's regions and closes
+    # its kernel join against the per-kernel ledger. Without either it
+    # would have nothing to bound or reconcile against, so say so at the
+    # CLI boundary rather than producing an empty contract at round 1.
+    if not sol_enabled(data):
+        errors.append(
+            "'profile.headroom_ledger' requires the SOL projector stage — its "
+            "analytic parts are the correlation's regions, and without a "
+            "ceiling there is no gap to account for. Drop `sol.enabled: false` "
+            "or drop the block"
+        )
+    if profile.get("kernel_coverage") is None:
+        errors.append(
+            "'profile.headroom_ledger' requires 'profile.kernel_coverage' — the "
+            "kernel->part join closes against the per-kernel ledger's shares, "
+            "and a 'kernel-ledger-exhaustive' attribution is checked against "
+            "its four dispositions"
+        )
+    return merged
+
+
 def _validate_accuracy_block(
     data: Mapping[str, Any], accuracy: Mapping[str, Any], errors: list[str]
 ) -> None:
@@ -449,6 +571,7 @@ def load_and_validate_task_yaml(
     _validate_max_regression_pct(data, optimize, errors)
     normalized_focus = _validate_focus_concurrencies(data, optimize, errors)
     normalized_kernel_coverage = _validate_kernel_coverage(data, errors)
+    normalized_headroom_ledger = _validate_headroom_ledger(data, errors)
     accuracy = _mapping_block(data, "accuracy", errors)
     _validate_accuracy_block(data, accuracy, errors)
 
@@ -469,6 +592,8 @@ def load_and_validate_task_yaml(
         data["optimize"]["focus_concurrencies"] = normalized_focus
     if normalized_kernel_coverage is not None:
         data["profile"]["kernel_coverage"] = normalized_kernel_coverage
+    if normalized_headroom_ledger is not None:
+        data["profile"]["headroom_ledger"] = normalized_headroom_ledger
     if max_rounds_override is not None:
         data["optimize"]["max_rounds"] = max_rounds_override
     if has_accuracy_check(data):
@@ -514,6 +639,22 @@ def kernel_coverage(data: Mapping[str, Any]) -> dict[str, Any] | None:
     return merged
 
 
+def headroom_ledger(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The validated headroom-ledger contract, or ``None`` (off).
+
+    ``None`` — the default — means no ``headroom_ledger.yaml`` is
+    authored, validated, or required, which is exactly how every campaign
+    written before this contract behaved.
+    """
+    profile = data.get("profile")
+    if not isinstance(profile, Mapping):
+        return None
+    value = profile.get("headroom_ledger")
+    if not isinstance(value, Mapping):
+        return None
+    return {**HEADROOM_LEDGER_DEFAULTS, **value}
+
+
 def focus_concurrencies(data: Mapping[str, Any]) -> list[int] | None:
     """The validated spec's gate-scored concurrency subset, or ``None``.
 
@@ -532,8 +673,12 @@ def focus_concurrencies(data: Mapping[str, Any]) -> list[int] | None:
 
 __all__ = [
     "ACCURACY_DEFAULTS",
+    "HEADROOM_ENFORCEMENTS",
+    "HEADROOM_LEDGER_DEFAULTS",
+    "HEADROOM_TARGET_LAYERS",
     "KERNEL_COVERAGE_DEFAULTS",
     "KNOWN_ACCURACY_KEYS",
+    "KNOWN_HEADROOM_LEDGER_KEYS",
     "KNOWN_KERNEL_COVERAGE_KEYS",
     "KNOWN_OPTIMIZE_KEYS",
     "ITEM_EXECUTIONS",
@@ -545,6 +690,7 @@ __all__ = [
     "dump_task_yaml",
     "focus_concurrencies",
     "has_accuracy_check",
+    "headroom_ledger",
     "cluster_ssh",
     "has_slurm_environment",
     "is_curve_mode",

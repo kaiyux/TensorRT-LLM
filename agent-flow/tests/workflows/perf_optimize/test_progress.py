@@ -371,3 +371,132 @@ def test_read_latest_progress_tool_filters_by_agent(tmp_path):
     read2 = _tool(progress_module.build_progress_tools(ctx2), "qa", "read_latest_progress")
     out = _call(read2.handler, {})
     assert "No optimization entries yet" in out["content"][0]["text"]
+
+
+# ---------------------------------------------- headroom-ledger evaluator fields
+
+
+def _evaluator_tool(path, **ctx_kwargs):
+    progress_module.init_progress_file(path)
+    ctx = progress_module.ProgressContext(
+        path=path,
+        current_step=4,
+        current_round=1,
+        current_attempt=1,
+        current_item_id="opt-004",
+        **ctx_kwargs,
+    )
+    return _tool(
+        progress_module.build_progress_tools(ctx), "evaluator", "append_evaluator_progress"
+    )
+
+
+_REJECT = {
+    "summary": "the tuned mapping never fired",
+    "decision": "REJECT",
+    "reason_category": "perf_shortfall",
+    "measured_gain_pct": 0.0,
+    "measured_value": 1200.0,
+}
+
+
+def test_headroom_fields_are_optional_in_the_schema(tmp_path):
+    # A required field would break every campaign that does not run the
+    # ledger, so the contract is enforced by the context flag instead.
+    append = _evaluator_tool(tmp_path / "progress.yaml")
+    schema = append.input_schema
+    for field in (
+        "gap_implication",
+        "gap_implication_note",
+        "parts",
+        "lever",
+        "target_blocker",
+        "measured_gain_pooled_pct",
+        "measurement_confidence",
+    ):
+        assert field in schema["properties"], field
+        assert field not in schema["required"], field
+    assert schema["properties"]["gap_implication"]["enum"] == [
+        "mechanism-already-present",
+        "mechanism-inapplicable",
+        "applied-but-no-gain",
+        "change-not-live",
+        "blocked-by-constraint",
+    ]
+
+
+def test_evaluator_records_the_structured_gap_implication(tmp_path):
+    path = tmp_path / "progress.yaml"
+    append = _evaluator_tool(path)
+    _call(
+        append.handler,
+        {
+            **_REJECT,
+            "gap_implication": "mechanism-inapplicable",
+            "gap_implication_note": "gated on T == 4; this deployment runs T == 3",
+            "parts": ["gdn_state:linear_attn:bf16", "conv_state_update:bf16:b512"],
+            "lever": "launch-geometry-tuning",
+            "measured_gain_pooled_pct": 0.57,
+            "measurement_confidence": "not-reproducible",
+        },
+    )
+    (entry,) = progress_module.read_progress(path)["optimization"]
+    assert entry["gap_implication"] == "mechanism-inapplicable"
+    assert entry["lever"] == "launch-geometry-tuning"
+    assert entry["parts"] == ["gdn_state:linear_attn:bf16", "conv_state_update:bf16:b512"]
+    # The scored number stays exactly as measured; the pooled estimate is
+    # recorded beside it rather than overwriting it.
+    assert entry["measured_gain_pct"] == pytest.approx(0.0)
+    assert entry["measured_gain_pooled_pct"] == pytest.approx(0.57)
+    assert entry["measurement_confidence"] == "not-reproducible"
+
+
+def test_evaluator_forwards_a_confirmed_target_blocker(tmp_path):
+    path = tmp_path / "progress.yaml"
+    append = _evaluator_tool(path)
+    _call(
+        append.handler,
+        {
+            **_REJECT,
+            "gap_implication": "mechanism-inapplicable",
+            "target_blocker": {
+                "cause": "multi-consumer-pinned",
+                "detail": "the gated-norm output also feeds the residual add",
+                "evidence": "rounds/round_3/item_1_opt-009/attempt_2/optimization_summary.md",
+                "confirmed": True,
+            },
+        },
+    )
+    (entry,) = progress_module.read_progress(path)["optimization"]
+    assert entry["target_blocker"]["cause"] == "multi-consumer-pinned"
+    assert entry["target_blocker"]["confirmed"] is True
+
+
+def test_scalar_runs_never_grow_the_new_keys(tmp_path):
+    path = tmp_path / "progress.yaml"
+    append = _evaluator_tool(path)
+    _call(append.handler, {**_REJECT, "decision": "APPROVE", "reason_category": "none"})
+    (entry,) = progress_module.read_progress(path)["optimization"]
+    for field in ("gap_implication", "lever", "parts", "target_blocker"):
+        assert field not in entry
+
+
+def test_ledger_campaign_requires_a_gap_implication_on_a_negative_verdict(tmp_path):
+    # The whole point of the artifact is that a failed attempt leaves a
+    # fact behind; a verdict that skips it discards what the benchmark
+    # was spent to learn.
+    path = tmp_path / "progress.yaml"
+    append = _evaluator_tool(path, headroom_ledger=True)
+    with pytest.raises(ValueError, match="gap_implication"):
+        _call(append.handler, dict(_REJECT))
+    assert progress_module.read_progress(path)["optimization"] == []
+
+
+def test_ledger_campaign_leaves_approvals_alone(tmp_path):
+    # An APPROVE has no gap implication by contract: the mechanism ran
+    # and the part got faster.
+    path = tmp_path / "progress.yaml"
+    append = _evaluator_tool(path, headroom_ledger=True)
+    _call(append.handler, {**_REJECT, "decision": "APPROVE", "reason_category": "none"})
+    (entry,) = progress_module.read_progress(path)["optimization"]
+    assert entry["decision"] == "APPROVE"

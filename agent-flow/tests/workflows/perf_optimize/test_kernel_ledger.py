@@ -493,3 +493,43 @@ def test_clean_ledger_cross_validates_clean(tmp_path):
 
 def test_filename_constant_matches_contract():
     assert kernel_ledger.LEDGER_FILENAME == "kernel_ledger.yaml"
+
+
+# ------------------------------------------------- the headroom-ledger part link
+
+
+def test_rows_may_name_the_headroom_ledger_part(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["part"] = "gdn_state:linear_attn:bf16"
+    loaded = load_ledger(_write(tmp_path, ledger))
+    assert loaded["kernels"][0]["part"] == "gdn_state:linear_attn:bf16"
+
+
+def test_the_part_link_is_optional(tmp_path):
+    # Rows with no `part` are exactly what makes the headroom ledger's
+    # empirical coverage bucket non-zero; absent, nothing changes.
+    loaded = load_ledger(_write(tmp_path, _ledger()))
+    assert "part" not in loaded["kernels"][0]
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 3, []])
+def test_a_present_part_link_must_be_a_real_id(tmp_path, bad):
+    ledger = _ledger()
+    ledger["kernels"][0]["part"] = bad
+    with pytest.raises(LedgerError, match="part"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_dismissal_tags_are_published_for_reuse(tmp_path):
+    # The headroom ledger's target_revisions ask exactly this question
+    # about a planned kernel, so they reuse this vocabulary rather than
+    # growing a parallel one that drifts.
+    for tag in ("multi-consumer-pinned", "phase-boundary", "needs-rebuild", "at-sol-floor"):
+        assert tag in kernel_ledger.DISMISSAL_TAGS
+    assert len(set(kernel_ledger.DISMISSAL_TAGS)) == len(kernel_ledger.DISMISSAL_TAGS)
+
+
+def test_dismissal_tag_splits_the_leading_tag(tmp_path):
+    assert kernel_ledger.dismissal_tag("mandatory-math") == "mandatory-math"
+    assert kernel_ledger.dismissal_tag("fast-path-blocked: head_dim guard") == "fast-path-blocked"
+    assert kernel_ledger.dismissal_tag("  at-sol-floor : mem SOL 89%") == "at-sol-floor"

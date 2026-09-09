@@ -30,6 +30,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     CASEBOOK_APPLY,
     EXPECTATION_GATE,
     GIT_DISCIPLINE,
+    HEADROOM_LEDGER_REPORTER_GUIDANCE,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
     KERNEL_REUSE,
     MEASUREMENT_PROTOCOL,
@@ -42,6 +43,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     SOL_OPTIMIZER_CONTEXT,
     TUNING_CONFIG_NOTE,
     approach_restriction_note,
+    headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
 )
 
@@ -1443,3 +1445,140 @@ def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
     assert "often not fixable in-campaign" in prompt
     # Bounded by the measured share, not the raw spread.
     assert "bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread" in prompt
+
+
+# --------------------------------------------------------------- headroom ledger
+
+_HL_BLOCK = {
+    "enforcement": "warn",
+    "target_layer": "ranking",
+    "tolerance_pct": 1.0,
+    "min_share_pct": 0.5,
+}
+
+
+def _headroom_bundle(**overrides):
+    return build_perf_optimize_prompts(headroom_ledger={**_HL_BLOCK, **overrides})
+
+
+def test_headroom_note_states_the_three_tiers_and_their_owners():
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "sol_ms <= target_ms <= measured_ms" in block
+    # The split is the point: one gap has an owner, the other has none.
+    assert "engineering gap" in block
+    assert "structural gap" in block
+
+
+def test_headroom_note_makes_the_lever_distinction_explicit():
+    # Booking a failed item as an attribution retires real headroom on
+    # evidence that does not support the conclusion.
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "A failed item closes a LEVER, not a part." in block
+    assert "kernel-ledger-exhaustive" in block
+    assert "convergent-levers" in block
+    assert "One failure is an anecdote." in block
+
+
+def test_headroom_note_says_which_artifact_the_join_closes_against():
+    # sol.json substitutes exposed_ms for comm rows, so joining against
+    # it would report a phantom residual on a correct join.
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "must equal that part's `measured_ms` in **`regions.json`**" in block
+    assert "not* in `sol.json`" in block
+
+
+def test_headroom_note_requires_both_bracketing_concurrencies():
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "sensitivity" in block
+    assert "flat" in block and "steep" in block
+    assert "ranked **per scored point**" in block
+
+
+def test_headroom_note_licenses_saying_the_target_is_unknown():
+    # An unsourced target manufactures headroom and sends rounds at it.
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "`basis: none-known` is legal and expected" in block
+    assert "not a failure to fill in the form" in block
+    assert "falsifier" in block
+
+
+def test_headroom_note_separates_the_symptom_from_the_fact():
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "the symptom is never the fact" in block
+    assert "the SOL looks too aggressive" in block
+    assert "A failed optimization is never, by itself, grounds to lower a ceiling." in block
+
+
+def test_headroom_note_reserves_dispositions_for_the_orchestrator():
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "orchestrator-owned" in block
+    assert "Read them; never write them." in block
+
+
+def test_headroom_note_switches_ranking_with_the_task_knob():
+    ranking = _norm(headroom_ledger_analyzer_note("ranking"))
+    report_only = _norm(headroom_ledger_analyzer_note("report_only"))
+    assert "Rank the roadmap on the engineering gap." in ranking
+    assert "Rank the roadmap on the engineering gap." not in report_only
+    assert "report-only this campaign" in report_only
+
+
+def test_headroom_note_states_the_real_consequence_of_an_invalid_ledger():
+    warn = _norm(headroom_ledger_analyzer_note(enforcement="warn"))
+    error = _norm(headroom_ledger_analyzer_note(enforcement="error"))
+    assert "degrades the campaign's accounting silently" in warn
+    assert "aborts the analyzer stage" in error
+
+
+def test_headroom_note_interpolates_the_task_share_bar():
+    assert "at/above 2.5%" in _norm(headroom_ledger_analyzer_note(min_share_pct=2.5))
+
+
+def test_headroom_note_orders_the_target_walk_structurally():
+    block = _norm(headroom_ledger_analyzer_note())
+    assert "## Target implementation" in block
+    assert "execution order" in block
+    # The substantive reason, not just readability.
+    assert "structural order makes *missing coverage visible*" in block
+
+
+def test_headroom_reporter_guidance_renders_rather_than_rederives():
+    block = _norm(HEADROOM_LEDGER_REPORTER_GUIDANCE)
+    assert "## Headroom Accounting" in block
+    assert "Do not re-derive a partition" in block
+    assert "verbatim" in block
+    assert "Absolute milliseconds, not % of SOL." in block
+
+
+def test_headroom_bundle_reaches_only_the_analyzer_and_reporter():
+    bundle = _headroom_bundle()
+    assert "headroom_ledger.yaml" in bundle.analyzer
+    assert "## Headroom Accounting" in bundle.reporter
+    # The gate stays measured-vs-measured: a plan must never anchor a
+    # verdict, and neither role may see the ledger, SOL, or the targets.
+    for role in ("evaluator", "qa", "optimizer", "benchmarker", "integrator", "projector"):
+        assert "headroom_ledger.yaml" not in getattr(bundle, role), role
+        assert "target_ms" not in getattr(bundle, role), role
+
+
+def test_default_prompts_omit_the_headroom_contract():
+    bundle = build_perf_optimize_prompts()
+    assert "headroom_ledger.yaml" not in bundle.analyzer
+    assert "## Headroom Accounting" not in bundle.reporter
+
+
+def test_evaluator_carries_the_change_not_live_implication():
+    # It looks identical to applied-but-no-gain in the numbers and means
+    # the opposite: one bounds the headroom, the other bounds nothing.
+    block = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "change-not-live" in block
+    assert "bounds nothing, because the mechanism was never tested" in block
+
+
+def test_evaluator_is_told_to_pass_the_structured_fields():
+    block = _norm(EVALUATOR_SYSTEM_PROMPT)
+    for field in ("gap_implication", "gap_implication_note", "parts", "lever", "target_blocker"):
+        assert field in block, field
+    assert "Prose is not a contract" in block
+    # The blocker is a fact about the code that it verifies, not authors.
+    assert "Forward, never author" in block

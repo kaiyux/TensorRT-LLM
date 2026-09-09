@@ -101,6 +101,43 @@ profile:
   #   min_share_pct: 0.5         # every kernel >= this share gets a row
   #   coverage_target_pct: 95    # rows must cover >= this much GPU time
 
+  # Optional: the HEADROOM LEDGER — the campaign's per-part gap
+  # accounting at <workspace>/headroom_ledger.yaml. Requires the SOL
+  # projector (its analytic parts ARE the correlation's regions) and
+  # kernel_coverage (its kernel->part join closes against those shares).
+  # Uncomment (an empty mapping is valid — all defaults) to have the
+  # analyzer record, every round, where the remaining gap-to-SOL sits per
+  # part, which lever each failed item spent against it, and — the target
+  # layer — what a named, buildable implementation would achieve
+  # (sol_ms <= target_ms <= measured_ms). Without it, a failed item's
+  # whole durable payload is `status: failed` plus a number, and the
+  # finding it paid a full benchmark for survives only as prose. Costs
+  # analyst attention per round, and a second profiled concurrency point.
+  # headroom_ledger:
+  #   enforcement: warn          # warn | error. warn (default) reports
+  #                              # ledger problems and continues; error
+  #                              # parks the round at the analyzer.
+  #                              # kernel_ledger.yaml already aborts on
+  #                              # invalidity, so a second aborting gate
+  #                              # over a much richer schema is how a
+  #                              # campaign dies on bookkeeping rather
+  #                              # than on a measurement — raise it only
+  #                              # once a campaign has run the contract.
+  #   target_layer: ranking      # ranking | report_only. ranking sizes
+  #                              # every expected_gain_pct against
+  #                              # measured - target (a named
+  #                              # implementation) instead of
+  #                              # measured - sol (a floor no kernel
+  #                              # reaches). report_only authors and
+  #                              # reports the same targets without
+  #                              # letting them order the plan — the
+  #                              # conservative first-campaign mode,
+  #                              # since the layer's value IS estimate
+  #                              # quality and that can be scored first.
+  #   tolerance_pct: 1.0         # slack on the coverage and join closures
+  #   min_share_pct: 0.5         # unclaimed kernel rows at/above this
+  #                              # share must become `empirical` parts
+
 # Optional: the optimization-loop knobs (defaults shown).
 # optimize:
 #   max_rounds: 5               # the loop RUNS this many rounds (each: an

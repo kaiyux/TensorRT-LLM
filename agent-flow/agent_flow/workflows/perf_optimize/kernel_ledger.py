@@ -50,6 +50,7 @@ Shape::
     kernels:
       - kernel: gdn_bf16_state              # distinctive stem / group label (unique)
         full_name: "void tensorrt_llm::..." # representative full name(s)
+        part: gdn_state:linear_attn:bf16    # optional: the headroom-ledger part
         share_pct: 18.4                     # % of in-window GPU time (nsys_analysis)
         ncu:                                # metrics mapping (or the string below)
           duration_us: 41.2
@@ -118,6 +119,49 @@ DISPOSITIONS = ("item", "dismissed")
 # The per-kernel questions every row must answer. Order is the order they
 # are posed in the analyzer prompt and rendered in the report.
 QUESTIONS = ("elimination", "faster", "fusion", "overlap")
+
+# The curated vocabulary of *why a kernel cannot be eliminated, made
+# faster, fused, or overlapped* — the leading tag of a `dismissed` ref,
+# spelled out per question in the analyzer prompt. Collected here so
+# consumers that need the same "why not" enum (a headroom-ledger
+# ``target_revisions`` cause, which asks exactly this question about a
+# planned kernel) reuse it rather than growing a parallel one that drifts.
+#
+# A ref is `tag` or `tag: <detail>`; :func:`dismissal_tag` splits it.
+# Not enforced on ``ref`` itself: a dismissal's value is its cited
+# evidence, and rejecting a well-evidenced ref for leading with an
+# unlisted tag would cost a whole analyzer re-run over a label.
+DISMISSAL_TAGS: tuple[str, ...] = (
+    # elimination — should this work happen at all?
+    "mandatory-math",
+    "padding-minimal",
+    "already-hoisted",
+    "fast-path-active",
+    "fast-path-blocked",
+    # faster — is there a better kernel for this shape?
+    "at-sol-floor",
+    "needs-rebuild",
+    # fusion — can a neighbor absorb it?
+    "multi-consumer-pinned",
+    "already-fused",
+    "phase-boundary",
+    "neighbors-at-bandwidth-floor",
+    # overlap — must it run alone?
+    "graph-disabled",
+    "no-independent-partner",
+    "resource-saturated",
+    "already-concurrent",
+    # scope and materiality — shared across the four
+    "below-materiality",
+    "approach-restricted",
+    "accuracy-scope",
+)
+
+
+def dismissal_tag(ref: str) -> str:
+    """The leading tag of a dismissal ``ref`` (``tag`` or ``tag: <detail>``)."""
+    return str(ref).split(":", 1)[0].strip()
+
 
 # Questions whose verdict rests on an observed relationship to other work:
 # question -> (field name, what the field must carry). Recorded so a
@@ -334,6 +378,17 @@ def _validate_row(row: Any, index: int, seen: set[str], errors: list[str]) -> No
     full_name = row.get("full_name")
     if not isinstance(full_name, str) or not full_name.strip():
         errors.append(f"'{where}.full_name' must be a non-empty string, got {full_name!r}")
+    # Optional link to the headroom ledger's part this row's time belongs
+    # to — formalizing what has been living in `regions.json` `_note`
+    # prose. Rows with no `part` are what makes the headroom ledger's
+    # `empirical` coverage bucket non-zero, so the field is how the two
+    # accounting systems reconcile; absent, the campaign behaves exactly
+    # as it did before the link existed.
+    part = row.get("part")
+    if part is not None and not (isinstance(part, str) and part.strip()):
+        errors.append(
+            f"'{where}.part' must be a non-empty headroom-ledger part id or omitted, got {part!r}"
+        )
     share = row.get("share_pct")
     if not _is_number(share) or share < 0:
         errors.append(f"'{where}.share_pct' must be a number >= 0, got {share!r}")

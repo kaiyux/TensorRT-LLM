@@ -384,3 +384,73 @@ def test_set_current_best_rejects_malformed_curve(tmp_path):
         )
     # The failed call must not have touched the file.
     assert roadmap_schema.load_roadmap(path)["current_best"] == VALID["current_best"]
+
+
+# ------------------------------------------------ headroom-ledger item fields
+
+
+def test_parts_is_optional_and_validated_when_present(tmp_path):
+    data = copy.deepcopy(VALID)
+    data["items"][0]["parts"] = ["gdn_state:linear_attn:bf16"]
+    loaded = roadmap_schema.load_roadmap(_write(tmp_path, data))
+    assert loaded["items"][0]["parts"] == ["gdn_state:linear_attn:bf16"]
+    # Absent is still valid: campaigns without the ledger are untouched.
+    assert "parts" not in roadmap_schema.load_roadmap(_write(tmp_path, VALID))["items"][0]
+
+
+@pytest.mark.parametrize("bad", ["gdn_state", [""], [3], {"a": 1}])
+def test_parts_must_be_a_list_of_part_ids(tmp_path, bad):
+    assert "parts" in _invalid_errors(tmp_path, lambda d: d["items"][0].__setitem__("parts", bad))
+
+
+def test_empty_parts_declares_a_whole_deployment_change(tmp_path):
+    # `parts: []` is a statement; omitting the key is the absence of one.
+    data = copy.deepcopy(VALID)
+    data["items"][0]["parts"] = []
+    assert roadmap_schema.load_roadmap(_write(tmp_path, data))["items"][0]["parts"] == []
+
+
+def test_items_missing_parts_names_only_the_silent_ones(tmp_path):
+    data = copy.deepcopy(VALID)
+    data["items"][0]["parts"] = []
+    missing = roadmap_schema.items_missing_parts(data)
+    assert data["items"][0]["id"] not in missing
+    assert [item["id"] for item in data["items"][1:]] == missing
+
+
+def test_obsolete_items_owe_no_parts(tmp_path):
+    # An item the analyzer retired is not going to be booked anywhere.
+    data = copy.deepcopy(VALID)
+    for item in data["items"]:
+        item["status"] = "obsolete"
+    assert roadmap_schema.items_missing_parts(data) == []
+
+
+def test_apply_evaluation_records_the_gap_implication_on_a_terminal_outcome(tmp_path):
+    path = _write(tmp_path, VALID)
+    item_id = VALID["items"][0]["id"]
+    roadmap_schema.apply_evaluation(
+        path,
+        item_id,
+        status="failed",
+        attempts=1,
+        measured_gain_pct=0.0,
+        gap_implication="mechanism-inapplicable",
+    )
+    item = roadmap_schema.find_item(roadmap_schema.load_roadmap(path), item_id)
+    assert item["gap_implication"] == "mechanism-inapplicable"
+
+
+def test_a_retry_records_no_gap_implication(tmp_path):
+    # A PUSH_BACK has not finished proving anything about the bottleneck.
+    path = _write(tmp_path, VALID)
+    item_id = VALID["items"][0]["id"]
+    roadmap_schema.apply_evaluation(
+        path,
+        item_id,
+        status="in_progress",
+        attempts=1,
+        gap_implication="applied-but-no-gain",
+    )
+    item = roadmap_schema.find_item(roadmap_schema.load_roadmap(path), item_id)
+    assert "gap_implication" not in item
