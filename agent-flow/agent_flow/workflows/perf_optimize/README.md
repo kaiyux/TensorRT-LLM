@@ -474,6 +474,7 @@ running the CLI.
 ```
 <workspace>/
 ├── task.yaml                        # resolved spec (defaults filled in)
+├── prompts/<role>.md                # composed system prompt per role, snapshotted at launch
 ├── roadmap.yaml                     # the ranked plan; statuses/gains updated as the loop runs
 ├── headroom_ledger.yaml             # per-part gap accounting + target layer (with a profile.headroom_ledger block)
 ├── sol_projection.md                # projector's SOL ceiling + baseline-vs-SOL gap (blank when sol.enabled: false)
