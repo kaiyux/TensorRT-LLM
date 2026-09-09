@@ -188,7 +188,9 @@ visible and whether memory is free between runs.
 """
 
 
-def build_server_lifecycle(active_tuning_config: bool = False) -> str:
+def build_server_lifecycle(
+    active_tuning_config: bool = False, *, allow_config_changes: bool = False
+) -> str:
     """Render the shared lifecycle with the workflow's configuration policy."""
     if active_tuning_config:
         config_flag = "--extra_llm_api_options <active tuning config>"
@@ -200,6 +202,13 @@ def build_server_lifecycle(active_tuning_config: bool = False) -> str:
             "If startup fails, diagnose `serve.log` and report the blocker. "
             "Do not change the read-only tuning config or benchmark an unready server."
         )
+        if allow_config_changes:
+            failure_policy = (
+                "If startup fails, diagnose `serve.log`. Correct only defects within "
+                "your assigned item or candidate-combination scope; never change "
+                "unrelated performance knobs to make startup succeed. Report other "
+                "blockers and do not benchmark an unready server."
+            )
     else:
         config_flag = "[--extra_llm_api_options <extra_llm_api_options>]"
         config_policy = (

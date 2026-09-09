@@ -71,6 +71,7 @@ shorthand (e.g. ``memory`` → ``memory-bw``) to the canonical enum.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -119,7 +120,7 @@ class RoadmapError(ValueError):
 def _is_number(value: Any) -> bool:
     # bool is an int subclass — reject it explicitly so ``true`` does not
     # slip through as a gain value.
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _validate_curve(key: str, curve: Any, errors: list[str]) -> None:

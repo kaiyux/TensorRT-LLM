@@ -4,6 +4,7 @@ from ._common import (
     DERIVED_METRICS_REFERENCE,
     EVIDENCE_DISCIPLINE,
     MEASUREMENT_PROTOCOL,
+    RUNTIME_CHECKOUT,
     SERVE_FLAGS_REFERENCE,
     SERVER_LIFECYCLE,
     TUNING_CONFIG_NOTE,
@@ -63,6 +64,8 @@ stages — do not touch them.
 """
     + SERVER_LIFECYCLE
     + "\n"
+    + RUNTIME_CHECKOUT
+    + "\n"
     + SERVE_FLAGS_REFERENCE
     + "\n"
     + TUNING_CONFIG_NOTE
@@ -117,7 +120,8 @@ In Pareto-curve mode (`benchmark.concurrency` is a list), the Metrics
 section instead carries **one Metrics table per concurrency point** (each
 labeled `### concurrency=<c>`, ascending) followed by the **curve summary
 table** from *Derived per-user / per-GPU metrics*, and the *Target
-metric* line reports the per-point values plus their **mean** — the mean
+metric* line reports the per-point values plus their **scored mean** —
+over `optimize.focus_concurrencies` when set, else all points. That mean
 becomes `baseline.value` and the per-point rows become `baseline.curve`
 in `roadmap.yaml`.
 

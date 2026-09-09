@@ -108,6 +108,23 @@ def _split_import(source: Path, workspace: Path, *, reanalyze: bool = False):
     )
 
 
+def _complete_analysis(source: Path, analysis: Path) -> None:
+    """Record the completion identity written after the analyzer gate passes."""
+    profile = analysis.parent / "profile"
+    manifest = validate_profile_manifest(profile)
+    _write(
+        analysis / "analysis_manifest.yaml",
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "analysis_id": analysis.parent.name,
+                "capture_id": manifest["capture_id"],
+                "profile_dir": str(profile.relative_to(source)),
+            }
+        ),
+    )
+
+
 # -------------------------------------------------------------------- discover
 
 
@@ -164,6 +181,7 @@ def test_discover_reuses_newest_ledger_for_selected_capture(tmp_path, provenance
     profile = _capture(source / "rounds" / "round_1" / "profile", "standing-capture")
     analysis = source / "rounds" / "round_1" / "analysis"
     findings = _write(analysis / reuse.FINDINGS_NAME, "full findings")
+    _complete_analysis(source, analysis)
     _write(analysis / reuse.KERNEL_LEDGER_NAME, "version: 2\n")
     _write(analysis / "nsys_analysis" / "summary.json", "{}")
     for number in (2, 10):
@@ -195,6 +213,7 @@ def test_discover_keeps_sibling_ledger_when_newer_provenance_does_not_match(tmp_
     _capture(source / "rounds" / "round_1" / "profile", "selected-capture")
     analysis = source / "rounds" / "round_1" / "analysis"
     _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
     sibling = _write(analysis / reuse.KERNEL_LEDGER_NAME, "version: 2\n")
     _capture(source / "rounds" / "round_2" / "profile", "different-capture")
     _capture(tmp_path / "outside", "outside-capture")
@@ -353,6 +372,7 @@ def test_import_preserves_replan_ledger_as_prior_art_with_source_provenance(tmp_
     _capture(source / "rounds" / "round_1" / "profile")
     analysis = source / "rounds" / "round_1" / "analysis"
     _write(analysis / reuse.FINDINGS_NAME, "full profiling findings")
+    _complete_analysis(source, analysis)
     _write(analysis / reuse.KERNEL_LEDGER_NAME, "version: 2\n")
     source_ledger = _write(
         source / "rounds" / "round_7" / "analysis" / reuse.KERNEL_LEDGER_NAME,
@@ -451,6 +471,7 @@ def test_default_reuse_keeps_findings_paired_with_their_capture(tmp_path):
     source = tmp_path / "source"
     first = _capture(source / "rounds" / "round_1" / "profile", "one")
     first_findings = _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME)
+    _complete_analysis(source, first_findings.parent)
     second = _capture(source / "rounds" / "round_2" / "profile", "two")
 
     ordinary = reuse.discover(source)
@@ -462,10 +483,72 @@ def test_default_reuse_keeps_findings_paired_with_their_capture(tmp_path):
     assert reanalysis.findings is None
 
 
+@pytest.mark.parametrize(
+    "identity", [None, "", "capture_id: wrong\nprofile_dir: rounds/round_2/profile"]
+)
+def test_partial_split_analysis_cannot_replace_completed_findings(tmp_path, identity):
+    source = tmp_path / "source"
+    first = _capture(source / "rounds" / "round_1" / "profile", "one")
+    findings = _write(first.parent / "analysis" / reuse.FINDINGS_NAME, "completed findings")
+    _complete_analysis(source, findings.parent)
+    second = _capture(source / "rounds" / "round_2" / "profile", "two")
+    interrupted = second.parent / "analysis"
+    _write(interrupted / reuse.FINDINGS_NAME, "partial conclusions before analyzer failure")
+    if identity is not None:
+        _write(interrupted / "analysis_manifest.yaml", identity)
+
+    reused = reuse.discover(source)
+    reanalyzed = reuse.discover(source, reanalyze=True)
+
+    assert reused.findings == findings
+    assert reused.profile_dir == first
+    assert reanalyzed.findings is None
+    assert reanalyzed.profile_dir == second
+
+
+@pytest.mark.parametrize("with_capture", [False, True])
+def test_split_partial_findings_do_not_use_legacy_prose_fallback(tmp_path, with_capture):
+    source = tmp_path / "source"
+    profile = source / "rounds" / "round_1" / "profile"
+    if with_capture:
+        _capture(profile)
+    else:
+        profile.mkdir(parents=True)
+    _write(profile.parent / "analysis" / reuse.FINDINGS_NAME, "unfinished analysis")
+
+    found = reuse.discover(source)
+
+    assert found.findings is None
+    assert found.profile_dir == (profile if with_capture else None)
+
+
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_analysis_import_preserves_comparative_taxonomy(tmp_path, reanalyze):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME, "classified findings")
+    _write(analysis / "taxonomy.json", '{"categories": ["attention", "gemm"]}')
+    _complete_analysis(source, analysis)
+    destination = tmp_path / "destination"
+
+    _split_import(source, destination, reanalyze=reanalyze)
+
+    imported_analysis = (
+        destination / reuse.REUSE_DIRNAME / reuse.PRIOR_ANALYSIS_DIRNAME
+        if reanalyze
+        else destination / "rounds" / "round_1" / "analysis"
+    )
+    assert (imported_analysis / "taxonomy.json").read_bytes() == (
+        analysis / "taxonomy.json"
+    ).read_bytes()
+
+
 def test_new_replan_note_does_not_replace_last_full_findings(tmp_path):
     source = tmp_path / "source"
     profile = _capture(source / "rounds" / "round_1" / "profile")
     findings = _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME)
+    _complete_analysis(source, findings.parent)
     _write(source / "rounds" / "round_2" / "analysis" / reuse.FINDINGS_NAME, "Replan note")
 
     found = reuse.discover(source)
@@ -499,6 +582,7 @@ def test_discovery_rejects_invalid_analysis_capture_identity(tmp_path, reference
     _capture(tmp_path / "profile", "outside")
     profile = _capture(source / "rounds" / "round_1" / "profile", "one")
     findings = _write(source / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME, "valid")
+    _complete_analysis(source, findings.parent)
     later = source / "rounds" / "round_2" / "analysis"
     _write(later / reuse.FINDINGS_NAME, "untrustworthy pointer")
     _write(
@@ -547,6 +631,7 @@ def test_reanalysis_preserves_prior_findings_separately_from_fresh_outputs(tmp_p
     _capture(source / "rounds" / "round_1" / "profile")
     analysis = source / "rounds" / "round_1" / "analysis"
     findings = _write(analysis / reuse.FINDINGS_NAME, "source conclusions")
+    _complete_analysis(source, analysis)
     _write(analysis / reuse.KERNEL_LEDGER_NAME, "source ledger")
     _write(analysis / "nsys_analysis" / "summary.json", '{"old_derivation":true}')
     workspace = tmp_path / "destination"

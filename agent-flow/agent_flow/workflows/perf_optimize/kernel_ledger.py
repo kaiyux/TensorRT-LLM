@@ -155,6 +155,8 @@ _NCU_METRIC_FIELDS = ("duration_us", "sm_sol_pct", "mem_sol_pct", "occupancy_pct
 _COVERAGE_SUM_TOLERANCE = 2.0
 # Slack on the coverage target itself (rounding of the enumerated sum).
 _COVERAGE_TARGET_TOLERANCE = 0.5
+# Rounding may differ between individual rows and their declared total.
+_COVERAGE_ROWS_TOLERANCE = 0.5
 
 
 class LedgerError(ValueError):
@@ -216,6 +218,17 @@ def _validate_bound(holder: dict[str, Any], where: str, errors: list[str], hint:
             bound = canonical
     if bound not in BOUND_CLASSES:
         errors.append(f"'{where}' must be one of {list(BOUND_CLASSES)}, got {bound!r}{hint}")
+
+
+def _enumerated_share(data: Mapping[str, Any]) -> float | None:
+    """Sum valid kernel rows, without trusting the declared coverage total."""
+    rows = data.get("kernels")
+    if not isinstance(rows, list) or not rows:
+        return None
+    shares = [row.get("share_pct") for row in rows if isinstance(row, Mapping)]
+    if len(shares) != len(rows) or any(not _is_number(share) or share < 0 for share in shares):
+        return None
+    return sum(shares)
 
 
 def _validate_ncu(row: dict[str, Any], where: str, errors: list[str]) -> None:
@@ -607,6 +620,17 @@ def load_ledger(path: str | Path) -> dict[str, Any]:
     for index, row in enumerate(kernels):
         _validate_row(row, index, seen, errors)
 
+    enumerated = _enumerated_share(data)
+    coverage = data.get("coverage")
+    declared = coverage.get("enumerated_share_pct") if isinstance(coverage, dict) else None
+    if enumerated is not None and _is_number(declared):
+        if abs(enumerated - declared) > _COVERAGE_ROWS_TOLERANCE:
+            errors.append(
+                f"'coverage.enumerated_share_pct' ({declared}) must match the sum of "
+                f"'kernels[].share_pct' ({enumerated:.3f}) within "
+                f"{_COVERAGE_ROWS_TOLERANCE} percentage points"
+            )
+
     _validate_models(data, errors)
     _validate_revisions(data, errors)
 
@@ -654,11 +678,10 @@ def cross_validate(
                     f"not match any roadmap item id — a disposition of 'item' "
                     f"must point at a real roadmap.yaml entry"
                 )
-    coverage = ledger.get("coverage", {})
-    enumerated = coverage.get("enumerated_share_pct")
-    if _is_number(enumerated) and enumerated < coverage_target_pct - _COVERAGE_TARGET_TOLERANCE:
+    enumerated = _enumerated_share(ledger)
+    if enumerated is not None and enumerated < coverage_target_pct - _COVERAGE_TARGET_TOLERANCE:
         errors.append(
-            f"'coverage.enumerated_share_pct' ({enumerated}) is below the task's "
+            f"sum of 'kernels[].share_pct' ({enumerated}) is below the task's "
             f"'profile.kernel_coverage.coverage_target_pct' ({coverage_target_pct}) — "
             f"enumerate further down the ranking (grouping related kernels is "
             f"fine) until the target is covered"

@@ -1,22 +1,23 @@
+from agent_flow.workflows.perf_analyze.prompts._common import build_server_lifecycle
+
 from ._common import (
     CASEBOOK_APPLY,
     EVIDENCE_DISCIPLINE,
     GIT_DISCIPLINE,
     KERNEL_REUSE,
-    ROADMAP_SPEC,
+    ROADMAP_READER,
     SERVE_FLAGS_REFERENCE,
-    SERVER_LIFECYCLE,
     TUNING_CONFIG_NOTE,
 )
 
 SYSTEM_PROMPT = (
     """\
 You are the **Optimizer**. Each turn you implement **exactly one**
-roadmap item — the one named in your instructions (always the current
-top-1 pending item; never pick a different one, never batch several) —
-then smoke-check it and hand it to the Evaluator. You are the only role
-that changes the system under test: the live tuning config and, for
-`approach: code` items, the TRT-LLM source on the optimization branch.
+roadmap item — the one named in your instructions (never pick a different
+one, never batch several) —
+then smoke-check it and hand it to the Evaluator. Edit only your item's
+active tuning config and, for `approach: code` items, source in the active
+runtime checkout. The Integrator later combines approved candidates.
 
 Your session is scoped to **one roadmap item**: you keep memory across
 that item's retry attempts, but each new item starts a fresh session.
@@ -48,7 +49,7 @@ the item is failed and the loop moves on.)
   against `trtllm-serve --help` / the LLM API reference in
   `trtllm_repo_path` — a typo'd key can be silently ignored or crash the
   server.
-- `approach: code` — edit the TRT-LLM source in `trtllm_repo_path` under
+- `approach: code` — edit the TRT-LLM source in the active runtime checkout under
   the git discipline below (installed-package check first, minimal scoped
   diff). Use shell `grep -rn`/`rg` via `Bash` to locate the code paths —
   and read the surrounding code before editing. If the item involves
@@ -119,7 +120,7 @@ blockers hit (installed-package mismatch, missing knob), rollback notes.>
 ```
 
 """
-    + ROADMAP_SPEC
+    + ROADMAP_READER
     + "\n"
     + GIT_DISCIPLINE
     + "\n"
@@ -127,7 +128,7 @@ blockers hit (installed-package mismatch, missing knob), rollback notes.>
     + "\n"
     + CASEBOOK_APPLY
     + "\n"
-    + SERVER_LIFECYCLE
+    + build_server_lifecycle(active_tuning_config=True, allow_config_changes=True)
     + "\n"
     + SERVE_FLAGS_REFERENCE
     + "\n"

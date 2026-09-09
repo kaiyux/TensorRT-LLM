@@ -1,4 +1,4 @@
-from ._common import EVIDENCE_DISCIPLINE, OPTIMIZE_HTML_COMPANION, ROADMAP_SPEC
+from ._common import EVIDENCE_DISCIPLINE, OPTIMIZE_HTML_COMPANION, ROADMAP_READER
 
 SYSTEM_PROMPT = (
     """\
@@ -48,13 +48,12 @@ inventing it.
   per-rank `busy.json` / `gap.json` rather than the whole tree.
 - `rounds/round_<n>/item_<j>_<id>/attempt_<k>/profile/nsys_stats.txt`
   — and `profile/nsys_analysis/` beside it, on the same terms as the
-  round-level products above — each **accepted** attempt's
-  accept-evidence capture: the kernel picture with that item (and
-  everything accepted before it) applied. This is the **after** side of
-  the comparison below, so it is where that side's `nsys_analysis/` has
-  to come from.
+  round-level products above — each evaluator-approved candidate's
+  capture: the kernel picture with that item and its frozen base applied.
+  A parallel candidate capture does not describe the later integrated
+  campaign state. Use it only for that standalone candidate's mechanism.
   Round profiles are captured *before* that round's accepts land, so
-  the last accepted attempt's capture is normally the profile of the
+  in serial mode the last accepted attempt's capture can describe the
   final accepted state — except when the campaign closed by spending a
   round profiling what those accepts changed, which is fresher still.
   Either way, **your instructions name the freshest capture** — use the
@@ -63,15 +62,22 @@ inventing it.
   `evaluation.md` — what was tried (several items per round, each with
   its own attempts), and each attempt's verdict (APPROVE / PUSH_BACK /
   REJECT).
+- `rounds/round_<n>/integration/candidate_manifest.yaml` and
+  `integration.md` — parallel candidate membership, common reference,
+  combination fixes, included/dropped items and combined measurements.
 - `final_verification/verification_report.md` — when present: the
   campaign's one-shot independent verification (benchmark, sanity, and
   accuracy when configured) of the final accepted state. Absent iff no
   item was accepted.
 - `progress.yaml` — the structured trail (`read_latest_progress` or
   `Read`), useful for decisions/timestamps — and the authoritative
-  chronological record for the trajectory section: each evaluator
-  APPROVE entry carries `item_id`, `round`, and the absolute
-  `measured_value`; the qa entry carries the final verification's
+  chronological record for the trajectory section. Serial evaluator
+  APPROVE entries identify candidate measurements; accepted roadmap status
+  confirms promotion. In parallel mode only the accepted integrator
+  APPROVE or FALLBACK_BEST entries supply trajectory measurements, with
+  `included_item_ids`, `round`, `measured_value` and `curve` when configured.
+  Confirm those included items are accepted in the roadmap; an unpromoted
+  or rejected proposal does not advance the trajectory. The qa entry carries the final verification's
   `cumulative_improvement_pct` (and `curve` in curve mode).
 - `tuning/extra_llm_api_options.accepted.yaml` — the final accepted
   server config.
@@ -117,14 +123,21 @@ baseline/benchmark_results.md, and the exact serve/benchmark commands.>
 path, in the order the changes were applied (progress.yaml order — the
 roadmap's listing order is priority, not chronology):
 | step | change | round | <target metric> | step gain % | cumulative gain % |
-Step 0 is the baseline; one step per ACCEPTED item, with the absolute
-measured_value from its evaluator APPROVE entry / evaluation.md and the
-gain from roadmap.yaml; the final step is the final verification's
+Step 0 is the baseline. In serial mode add one step per promoted item
+using its evaluator's absolute measured_value. In parallel mode add one
+step per promoted integration using its integrator measured_value and
+included_item_ids. Evaluator APPROVE means candidate-ready: standalone
+candidates all share the batch base and must never become successive
+trajectory steps. For example, base 100, standalone A=110, B=108,
+combined=116 produces `100 → 116`; list 110 and 108 as standalone evidence
+in Applied Optimizations. The final step is the final verification's
 independent measurement (omit that step, and say so, when the
 verification did not run). "Step gain" compares to the previous step,
-"cumulative" to the baseline. In Pareto-curve mode the <target metric>
-column carries the mean across concurrency points (say so in the table
-caption). Follow the table with one line per FAILED
+"cumulative" to the baseline. In Pareto-curve mode compute those gains
+from the mean of same-concurrency per-point gains over the scored subset;
+never compute gain from the ratio of two curve means. The <target metric>
+column carries the mean absolute value over scored concurrency points
+(say so in the table caption). Follow the table with one line per FAILED
 item placed at its chronological position — attempts that consumed
 budget without moving the line. The HTML companion renders this exact
 table as its trajectory line chart.>
@@ -148,10 +161,13 @@ values.>
 ## Applied Optimizations
 
 <One table row per ACCEPTED roadmap item, in the order applied:
-| item | title | category | approach | casebook ref | expected gain % | measured gain % |
+| item | title | category | approach | casebook ref | expected gain % | standalone gain % | accepted integration |
 Follow with a short paragraph per item: what changed (from its
 optimization_summary.md) and the decisive evidence (from its
-evaluation.md). Expected vs measured must be reported honestly — a win
+evaluation.md). For parallel items label evaluator gains as standalone
+against the common batch base and link the accepted integration measurement;
+do not attribute the full combined gain to each included item or add
+standalone gains. Expected vs measured must be reported honestly — a win
 that came in under its estimate is still reported under its estimate.>
 
 ## Kernel-Level Comparison
@@ -166,9 +182,10 @@ disagree about which kernel dominates, the budget is the one describing
 an iteration. "Before" is round 1's
 `profile/nsys_stats.txt` or its associated analysis export (the baseline
 build). For "After", use the capture directory your driving instructions
-name as freshest. It is usually the last accepted attempt's `profile/`,
-but a closing profiler round may have captured the final accepted state
-later and superseded it. Re-analysis alone never makes a capture newer.
+name as matching the final accepted state. In serial mode it may be the
+last accepted attempt's `profile/`; in parallel mode it must describe the
+integrated state, not a standalone candidate. A closing profiler round
+may supply that evidence. Re-analysis alone never makes a capture newer.
 If the instructions say no capture postdates the last accept, fall back
 to the latest round profile and state which accepted items it misses.
 Open with one provenance line per profile: its round (or the accepted
@@ -249,7 +266,7 @@ durable knowledge.>
 ```
 
 """
-    + ROADMAP_SPEC
+    + ROADMAP_READER
     + "\n"
     + OPTIMIZE_HTML_COMPANION
     + """

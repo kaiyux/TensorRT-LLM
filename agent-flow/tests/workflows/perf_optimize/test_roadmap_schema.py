@@ -115,6 +115,27 @@ def test_expected_gain_must_be_positive_number(tmp_path):
     )
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["expected_gain_pct", "measured_gain_pct"])
+def test_nonfinite_item_gains_rejected(tmp_path, field, bad):
+    assert field in _invalid_errors(tmp_path, lambda data: data["items"][0].__setitem__(field, bad))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("metric_ref", ["baseline", "current_best"])
+@pytest.mark.parametrize("field", ["scalar", "value", "tok_s_user", "tok_s_gpu"])
+def test_nonfinite_metric_references_rejected(tmp_path, metric_ref, field, bad):
+    data = copy.deepcopy(VALID)
+    if field == "scalar":
+        data[metric_ref]["value"] = bad
+    else:
+        point = {"concurrency": 1, "value": 100.0, "tok_s_user": 10.0, "tok_s_gpu": 100.0}
+        point[field] = bad
+        data[metric_ref]["curve"] = [point]
+    with pytest.raises(roadmap_schema.RoadmapError, match=metric_ref):
+        roadmap_schema.load_roadmap(_write(tmp_path, data))
+
+
 def test_empty_casebook_ref_normalized_to_absent(tmp_path):
     # Analyzers write `casebook_ref: ""` for items with no casebook row
     # (e.g. prior-campaign carry-overs); that must not fail the roadmap.

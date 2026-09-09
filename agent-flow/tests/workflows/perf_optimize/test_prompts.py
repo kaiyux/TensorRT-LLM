@@ -14,11 +14,13 @@ import re
 from agent_flow.workflows.perf_analyze.prompts._common import (
     SOL_METHODOLOGY_FALLBACK as _ANALYZE_METHODOLOGY_FALLBACK,
 )
+from agent_flow.workflows.perf_analyze.prompts._common import build_server_lifecycle
 from agent_flow.workflows.perf_optimize.prompts import (
     ANALYZER_SYSTEM_PROMPT,
     BENCHMARKER_SYSTEM_PROMPT,
     DEFAULT_PROMPTS,
     EVALUATOR_SYSTEM_PROMPT,
+    INTEGRATOR_SYSTEM_PROMPT,
     OPTIMIZER_SYSTEM_PROMPT,
     PROFILER_SYSTEM_PROMPT,
     PROJECTOR_SYSTEM_PROMPT,
@@ -40,6 +42,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     OPTIMIZE_HTML_COMPANION,
     PROFILE_FINDINGS_CONTRACT,
     ROADMAP_SPEC,
+    RUNTIME_CHECKOUT,
     SOL_ANALYZER_CONTEXT,
     SOL_METHODOLOGY_FALLBACK,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
@@ -57,12 +60,13 @@ _ALL_PROMPTS = {
     "analyzer": ANALYZER_SYSTEM_PROMPT,
     "optimizer": OPTIMIZER_SYSTEM_PROMPT,
     "evaluator": EVALUATOR_SYSTEM_PROMPT,
+    "integrator": INTEGRATOR_SYSTEM_PROMPT,
     "qa": QA_SYSTEM_PROMPT,
     "reporter": REPORTER_SYSTEM_PROMPT,
 }
 
 # Roles that run the canonical benchmark_serving.py command themselves.
-_MEASURING = ("benchmarker", "profiler", "evaluator", "qa")
+_MEASURING = ("benchmarker", "profiler", "evaluator", "integrator", "qa")
 
 
 def _norm(text: str) -> str:
@@ -109,24 +113,24 @@ def test_profiler_carries_canonical_nsys_flags():
     assert "Verify the profiling knobs first" in PROFILER_SYSTEM_PROMPT
 
 
-def test_run_a2_flags_reach_every_role_that_captures_nsys():
-    # The profiler captures each round and the evaluator captures the
-    # accept-evidence trace; both inherit PROFILING_RUNS_REFERENCE, so both
-    # must carry the utilization and call-stack passes or one of the two
-    # keeps producing traces with no bounding resource and no call sites.
-    for prompt, role in (
-        (PROFILER_SYSTEM_PROMPT, "profiler"),
-        (EVALUATOR_SYSTEM_PROMPT, "evaluator"),
+def test_additional_profiling_passes_belong_to_the_profiler():
+    # Approval-time evidence has a bounded purpose: compare this candidate's
+    # timing to the reference. Round-level capture owns utilization/stacks.
+    for flag in (
+        "--gpu-metrics-devices=all",
+        "--gpu-metrics-frequency=100000",
+        "--python-backtrace",
+        "--python-sampling=true",
+        "--cudabacktrace=kernel:5000,sync:10000",
     ):
-        for flag in (
-            "--gpu-metrics-devices=all",
-            "--gpu-metrics-frequency=100000",
-            "--python-backtrace",
-            "--python-sampling=true",
-            "--cudabacktrace=kernel:5000,sync:10000",
-        ):
-            assert flag in prompt, (role, flag)
-        assert "## Run A2" in prompt, role
+        assert flag in PROFILER_SYSTEM_PROMPT, flag
+        assert flag not in EVALUATOR_SYSTEM_PROMPT, flag
+    assert "## Run A2" in PROFILER_SYSTEM_PROMPT
+    assert "## Run A2" not in EVALUATOR_SYSTEM_PROMPT
+    assert "## Run B" not in EVALUATOR_SYSTEM_PROMPT
+    assert "ncu --import" not in EVALUATOR_SYSTEM_PROMPT
+    assert "Author `<workspace>/nsys_analysis/items.json`" not in EVALUATOR_SYSTEM_PROMPT
+    assert "refine taxonomy" in EVALUATOR_SYSTEM_PROMPT  # explicitly prohibited
 
 
 def test_run_a2_is_a_separate_capture_and_degrades_gracefully():
@@ -362,6 +366,15 @@ def test_roadmap_contract_pins_ownership():
         assert "The **orchestrator** owns every lifecycle field" in prompt, role
 
 
+def test_roadmap_readers_do_not_receive_analyzer_authoring_duties():
+    assert "Initialization and ids" in ANALYZER_SYSTEM_PROMPT
+    for role in ("optimizer", "evaluator", "integrator", "qa", "reporter"):
+        prompt = _ALL_PROMPTS[role]
+        assert "Initialization and ids" not in prompt, role
+        assert "Do not initialize, reorder" in prompt, role
+        assert "candidate-ready" in prompt, role
+
+
 # ------------------------------------------------------------ acceptance gate
 
 
@@ -419,8 +432,10 @@ def test_expectation_gate_carries_the_pareto_rule():
     # The bar defaults to the noise floor when no budget is declared.
     assert "else noise_floor_pct" in gate
     assert "current_best.curve" in gate
-    # Degraded fallback when an earlier accept carried no curve.
+    # Missing evidence blocks acceptance instead of bypassing regression checks.
     assert "carries no `curve`" in gate
+    assert "the performance gate cannot pass" in gate
+    assert "never skip the per-point no-regress check" in gate
 
 
 def test_expectation_gate_carries_focus_scoring():
@@ -485,13 +500,13 @@ def test_measuring_roles_carry_the_measurement_protocol():
     assert "concurrency_<c>" in protocol
     assert "Curve worked example" in protocol
     assert "mean = +3.24%" in protocol
-    for role in ("benchmarker", "evaluator", "qa"):
+    for role in ("benchmarker", "evaluator", "integrator", "qa"):
         assert "Measurement protocol" in _ALL_PROMPTS[role], role
         assert "one run per `benchmark.concurrency` point" in _norm(_ALL_PROMPTS[role]), role
 
 
 def test_measuring_roles_carry_the_derived_metrics_reference():
-    for role in ("benchmarker", "evaluator", "qa"):
+    for role in ("benchmarker", "evaluator", "integrator", "qa"):
         prompt = _norm(_ALL_PROMPTS[role])
         assert "1000 / mean_tpot_ms" in prompt, role
         assert "output_throughput / num_gpus" in prompt, role
@@ -508,12 +523,101 @@ def test_server_roles_carry_the_tuning_config_supersede_note():
     assert "turn instructions name the exact **active tuning config**" in note
     assert "supersedes shorthand references" in note
     assert "<workspace>/tuning/extra_llm_api_options.yaml" not in note
-    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "integrator", "qa"):
         assert "The active tuning config" in _ALL_PROMPTS[role], role
-    # Only the optimizer may edit the live file; the snapshot is
-    # orchestrator-managed.
+    # Item and integration changes have separate writable configs; the
+    # accepted snapshot is always orchestrator-managed.
+    assert "isolated integration config" in note
     assert "accepted config snapshot" in note
     assert "Never edit" in note
+
+
+def test_measurement_roles_cannot_repair_startup_by_changing_tuning():
+    for role in ("benchmarker", "profiler", "evaluator", "qa"):
+        prompt = _norm(_ALL_PROMPTS[role])
+        assert "Do not change the read-only tuning config" in prompt, role
+        assert "OOM: lower" not in prompt, role
+        assert "Pass `--extra_llm_api_options <path>` **only when**" not in prompt, role
+    for role in ("optimizer", "integrator"):
+        prompt = _norm(_ALL_PROMPTS[role])
+        assert (
+            "Correct only defects within your assigned item or candidate-combination scope"
+            in prompt
+        )
+        assert "Do not change the read-only tuning config" not in prompt, role
+        assert "never change unrelated performance knobs" in prompt, role
+
+
+def test_lifecycle_builder_preserves_default_and_exposes_scoped_edit_policy():
+    default = _norm(build_server_lifecycle())
+    measurement = _norm(build_server_lifecycle(active_tuning_config=True))
+    mutation = _norm(build_server_lifecycle(active_tuning_config=True, allow_config_changes=True))
+    assert "top-level `extra_llm_api_options` key; omit the flag otherwise" in default
+    assert "OOM: lower" in default
+    for lifecycle in (measurement, mutation):
+        assert "--extra_llm_api_options <active tuning config>" in lifecycle
+        assert "owns_port" in lifecycle
+        assert "OOM: lower" not in lifecycle
+    assert "read-only tuning config" in measurement
+    assert "candidate-combination scope" in mutation
+
+
+def test_all_launchers_verify_checkout_in_the_actual_runtime_environment():
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "integrator", "qa"):
+        prompt = _ALL_PROMPTS[role]
+        assert prompt.count(RUNTIME_CHECKOUT) == 1, role
+        assert "tensorrt_llm.__file__" in prompt, role
+        assert "do not benchmark" in prompt, role
+        assert "allocated container using its staged checkout path" in _norm(prompt), role
+
+
+def test_integrator_has_a_complete_measured_acceptance_contract():
+    prompt = _norm(INTEGRATOR_SYSTEM_PROMPT)
+    for contract in (
+        "(new − reference) / reference × 100",
+        "(reference − new) / reference × 100",
+        "finite positive numbers",
+        "missing, duplicate or extra points",
+        "optimize.focus_concurrencies",
+        "including unscored points",
+        "gain_i >= -regression_bar",
+        "optimize.max_regression_pct",
+        "output_throughput / num_gpus",
+        "full-metric diff",
+        "isolated integration config",
+        "candidate config changes relative to the common base",
+        "never edit the accepted config snapshot",
+    ):
+        assert contract in prompt, contract
+
+
+def test_parallel_candidate_approval_is_distinct_from_campaign_acceptance():
+    evaluator = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "parallel mode waits for integration before accepting the item" in evaluator
+    assert "it does not describe the later combined accepted state" in evaluator
+    reporter = _norm(REPORTER_SYSTEM_PROMPT)
+    assert "only the accepted integrator APPROVE or FALLBACK_BEST" in reporter
+    assert "must never become successive trajectory steps" in reporter
+    assert "`100 → 116`" in reporter
+    assert "never compute gain from the ratio of two curve means" in reporter
+    html = _norm(OPTIMIZE_HTML_COMPANION)
+    assert "accepted parallel integrations" in html
+    assert "scored concurrency points" in html
+
+
+def test_parallel_slurm_and_disagg_prompts_require_distinct_node_allocations():
+    slurm = build_perf_optimize_prompts(include_slurm_environment=True)
+    disagg = build_perf_optimize_prompts(include_disagg=True)
+    for role in ("optimizer", "evaluator", "integrator"):
+        prompt = _norm(getattr(slurm, role))
+        assert "exclusive Slurm node allocation" in prompt
+        assert "--exclusive" in prompt
+        assert "never attach to or reuse a sibling item's allocation" in prompt
+        prompt = _norm(getattr(disagg, role))
+        assert "`--exclusive`" in prompt
+        assert "run-local copy's `slurm.extra_args`" in prompt
+        assert "keep the original harness config read-only" in prompt
+        assert "integrator combines candidates only in its isolated integration config" in prompt
 
 
 # ------------------------------------------------------------------------- qa
@@ -582,8 +686,11 @@ def test_reporter_carries_the_kernel_comparison():
     # ...with honest provenance: what each profile covers, and no
     # fabricated "after" data when only round 1 was profiled.
     assert "which accepted items were in effect" in prompt
-    assert "closing profiler round may have captured the final accepted state" in prompt
-    assert "capture directory your driving instructions name as freshest" in prompt
+    assert "closing profiler round may supply that evidence" in prompt
+    assert (
+        "capture directory your driving instructions name as matching the final accepted state"
+        in prompt
+    )
     assert "no post-optimization profile exists" in prompt
 
 
@@ -596,7 +703,7 @@ def test_reporter_lists_both_sides_of_the_iteration_budget():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
     assert "rounds/round_<n>/analysis/nsys_analysis/" in prompt
     assert "`profile/nsys_analysis/` beside it" in prompt
-    assert "This is the **after** side of" in prompt
+    assert "parallel candidate capture does not describe the later integrated" in prompt
     # And the budget leads the section, ahead of the kernel table.
     assert "open the section with the iteration budget before the kernel table" in prompt
     # Degrades rather than fabricating a one-sided budget.
@@ -979,7 +1086,7 @@ def test_html_companion_overlays_the_sol_projected_curve():
 def test_slurm_bundle_augments_all_server_roles_but_not_reporter():
     base = build_perf_optimize_prompts(include_slurm_environment=False)
     slurm = build_perf_optimize_prompts(include_slurm_environment=True)
-    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "profiler", "optimizer", "evaluator", "integrator", "qa"):
         assert "slurm-environment" in getattr(slurm, role), role
         assert "slurm-environment" not in getattr(base, role), role
     # The reporter never launches a server, so it is unchanged — and so
@@ -1022,6 +1129,7 @@ def test_remote_execution_prompt_is_short_and_task_specific():
         "profiler",
         "optimizer",
         "evaluator",
+        "integrator",
         "qa",
     ):
         prompt = getattr(bundle, role)
@@ -1218,7 +1326,11 @@ def test_kernel_coverage_note_fixes_the_materiality_unit():
     assert "coverage.gpu_busy_pct" in block
     assert "percentages (0–100)" in block
     assert "wall_clock_share_pct = share_pct x gpu_busy_pct / 100" in block
-    assert "best_case_gain_pct = wall_clock_share_pct x recovery_fraction" in block
+    assert "time_saved_pct = wall_clock_share_pct x recovery_fraction" in block
+    assert "latency_gain_pct = time_saved_pct" in block
+    assert "throughput_gain_pct = 100 x time_saved_pct / (100 - time_saved_pct)" in block
+    assert "50% less elapsed time implies 100% more throughput" in block
+    assert "0 <= time_saved_pct < 100" in block
     assert "expected_gain_rationale" in block
     assert "optimize.noise_floor_pct" in block
     assert "Whole affected chain x best-case saving fraction" in block
@@ -1411,6 +1523,7 @@ def test_measuring_roles_inherit_the_server_identity_checks():
         ("benchmarker", BENCHMARKER_SYSTEM_PROMPT),
         ("optimizer", OPTIMIZER_SYSTEM_PROMPT),
         ("evaluator", EVALUATOR_SYSTEM_PROMPT),
+        ("integrator", INTEGRATOR_SYSTEM_PROMPT),
         ("qa", QA_SYSTEM_PROMPT),
     ):
         text = _norm(prompt)

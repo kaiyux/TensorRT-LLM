@@ -3,7 +3,8 @@ from ._common import (
     DERIVED_METRICS_REFERENCE,
     EVIDENCE_DISCIPLINE,
     MEASUREMENT_PROTOCOL,
-    ROADMAP_SPEC,
+    ROADMAP_READER,
+    RUNTIME_CHECKOUT,
     SERVE_FLAGS_REFERENCE,
     SERVER_LIFECYCLE,
     TUNING_CONFIG_NOTE,
@@ -105,7 +106,9 @@ and any accuracy caveat the report must carry.>
 """
     + MEASUREMENT_PROTOCOL
     + "\n"
-    + ROADMAP_SPEC
+    + ROADMAP_READER
+    + "\n"
+    + RUNTIME_CHECKOUT
     + "\n"
     + SERVER_LIFECYCLE
     + "\n"

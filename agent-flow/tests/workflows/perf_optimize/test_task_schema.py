@@ -147,6 +147,30 @@ def test_invalid_optimize_values_batched(tmp_path):
         assert fragment in message, fragment
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "section,field",
+    [
+        ("optimize", "accept_fraction"),
+        ("optimize", "noise_floor_pct"),
+        ("optimize", "target_improvement_pct"),
+        ("optimize", "max_regression_pct"),
+        ("accuracy", "baseline_score"),
+        ("accuracy", "max_drop_pct"),
+        ("kernel_coverage", "min_share_pct"),
+        ("kernel_coverage", "coverage_target_pct"),
+    ],
+)
+def test_nonfinite_task_numbers_rejected(tmp_path, section, field, bad):
+    extra = {"benchmark": {"concurrency": [1, 2]}, "accuracy": {"command": "check"}}
+    if section == "kernel_coverage":
+        extra["profile"] = {"kernel_coverage": {field: bad}}
+    else:
+        extra.setdefault(section, {})[field] = bad
+    with pytest.raises(task_schema.TaskSchemaError, match=field):
+        task_schema.load_and_validate_task_yaml(_write_task(tmp_path, extra))
+
+
 def test_accept_fraction_boundaries(tmp_path):
     with pytest.raises(task_schema.TaskSchemaError, match="accept_fraction"):
         task_schema.load_and_validate_task_yaml(

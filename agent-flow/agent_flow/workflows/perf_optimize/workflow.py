@@ -31,7 +31,7 @@ from agent_flow.workflows.perf_analyze.sol_methodology import (
 )
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
-from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
+from . import gitops, kernel_ledger, measurements, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
 from .profile import PROFILE_MANIFEST_NAME, ProfileError, validate_profile_manifest
 from .progress import (
@@ -71,6 +71,7 @@ from .task_schema import (
     concurrency_points,
     dump_task_yaml,
     focus_concurrencies,
+    has_slurm_environment,
     is_curve_mode,
     kernel_coverage,
     load_and_validate_task_yaml,
@@ -760,8 +761,17 @@ class PerfOptimizeWorkflow:
         )
         state.reuse_analysis_dir = str(source)
         if imported.baseline_report:
-            state.benchmarker_done = True
-            state.stage = STAGE_PROJECTOR
+            try:
+                self._require_baseline_measurement()
+            except RuntimeError as exc:
+                print_message(
+                    f"[yellow]imported baseline cannot be used; measuring it again: "
+                    f"{escape(str(exc))}[/yellow]",
+                    log,
+                )
+            else:
+                state.benchmarker_done = True
+                state.stage = STAGE_PROJECTOR
         if imported.sol_projection:
             # Only meaningful when the task enables the stage at all; the
             # flag is what makes the projector gate skip it, and a task
@@ -797,9 +807,8 @@ class PerfOptimizeWorkflow:
     def _ensure_optimization_branch(self, state: WorkflowState, log) -> None:
         """Create (fresh run) or check out (resume) the optimization branch.
 
-        The checkpoint records the branch name *before* the branch is
-        created, so a crash between the two resumes into ``checkout`` of
-        the recorded name rather than a second ``checkout -b``.
+        Persist branch creation intent first, then reconcile it with git.
+        A resumed creation uses the recorded base even if HEAD has moved.
         """
         repo = self._trtllm_repo_path()
         if not repo:
@@ -807,15 +816,31 @@ class PerfOptimizeWorkflow:
                 f"trtllm_repo_path missing from {self.task_path}; cannot manage the "
                 f"optimization branch."
             )
-        if state.campaign_git_branch:
-            gitops.checkout(repo, state.campaign_git_branch)
-            return
         if not gitops.is_git_repo(repo):
             raise RuntimeError(
                 f"trtllm_repo_path ({repo}) is not a git repository. perf-optimize "
                 f"needs git to commit accepted optimizations and revert rejected "
                 f"ones — clone the checkout with git and retry."
             )
+        if not gitops.worktree_clean(repo):
+            raise RuntimeError(
+                f"trtllm_repo_path ({repo}) has uncommitted changes. Commit or stash "
+                "them before starting or resuming perf-optimize so the measured "
+                "campaign and candidate worktrees share a committed source snapshot."
+            )
+        if state.campaign_git_branch:
+            if gitops.branch_exists(repo, state.campaign_git_branch):
+                gitops.checkout(repo, state.campaign_git_branch)
+            elif state.campaign_git_base_commit:
+                gitops.create_branch(
+                    repo, state.campaign_git_branch, state.campaign_git_base_commit
+                )
+            else:
+                raise RuntimeError(
+                    f"Campaign branch {state.campaign_git_branch!r} is missing and "
+                    "the checkpoint records no base commit to recover it from."
+                )
+            return
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         state.campaign_git_branch = f"perf-optimize/{self.workspace.name}-{timestamp}"
         state.campaign_git_base_commit = gitops.rev_parse_head(repo)
@@ -905,6 +930,14 @@ class PerfOptimizeWorkflow:
 
     def _ensure_item_runtime(self, state: WorkflowState, entry: dict[str, Any]) -> None:
         """Create any missing worktree/config/progress parts for a batch row."""
+        if "reference_measurement" not in entry:
+            self._update_batch_item(
+                state,
+                str(entry["current_item_id"]),
+                reference_measurement=roadmap_schema.load_roadmap(self.roadmap_path)[
+                    "current_best"
+                ],
+            )
         worktree = Path(str(entry["item_worktree_path"]))
         if not worktree.exists():
             gitops.create_worktree(
@@ -958,9 +991,21 @@ class PerfOptimizeWorkflow:
             state.batch_started = True
             self._checkpoint(state)
 
+        # A worktree isolates files, not GPUs or the fixed serving port.
+        # Local items still share a frozen base and go through integration,
+        # but their optimizer smoke tests and evaluator runs must not overlap.
+        task = self._task_data()
+        isolated_jobs = has_slurm_environment(task) or has_disagg(task)
+        workers = max(1, len(state.item_batch)) if isolated_jobs else 1
+        if workers == 1 and len(state.item_batch) > 1:
+            print_message(
+                "[dim]local runtime shared — running frozen-base candidates one at a time "
+                "before integration[/dim]",
+                log,
+            )
         errors: list[BaseException] = []
         with ThreadPoolExecutor(
-            max_workers=max(1, len(state.item_batch)),
+            max_workers=workers,
             thread_name_prefix="perf-opt-item",
         ) as executor:
             futures = {
@@ -1039,6 +1084,9 @@ class PerfOptimizeWorkflow:
         gain = entry.get("measured_gain_pct")
         repo = self._trtllm_repo_path()
         if status == "candidate_ready":
+            self._validate_evaluator_approval(
+                entry, item_id, reference=entry.get("reference_measurement")
+            )
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
             state.profile_required = True
@@ -1070,7 +1118,9 @@ class PerfOptimizeWorkflow:
                     ),
                     curve=curve,
                 )
-            self._record_nsys_capture(state, self._attempt_dir(local_state) / "profile")
+            self._record_nsys_capture(
+                state, self._attempt_dir(local_state) / "profile", invalidate=True
+            )
             final_status = "accepted"
             print_message(
                 f"[bold green]✔ serial evaluator APPROVE — {item_id} accepted[/bold green]",
@@ -1187,9 +1237,29 @@ class PerfOptimizeWorkflow:
                     cached_verdict.get("attempt") if cached_verdict is not None else None
                 )
                 evaluation_path = self._attempt_dir(item_state) / "evaluation.md"
-                if not (self._is_nonempty(evaluation_path) and cached_attempt == attempt_no):
-                    clear_stale_benchmark_results(self._attempt_dir(item_state))
-                    self._run_evaluator(item_state, agent=evaluator, progress_ctx=progress_ctx)
+                reuse_verdict = self._is_nonempty(evaluation_path) and cached_attempt == attempt_no
+                validation_feedback = ""
+                if reuse_verdict and cached_verdict.get("decision") == "APPROVE":
+                    try:
+                        self._validate_evaluator_approval(
+                            cached_verdict,
+                            item_id,
+                            reference=entry.get("reference_measurement"),
+                        )
+                    except RuntimeError as exc:
+                        reuse_verdict = False
+                        validation_feedback = str(exc)
+                if not reuse_verdict:
+                    feedback = {}
+                    if validation_feedback:
+                        # Correct a cached verdict against the existing evidence;
+                        # preserve both the candidate and the measured results.
+                        feedback["validation_feedback"] = validation_feedback
+                    else:
+                        clear_stale_benchmark_results(self._attempt_dir(item_state))
+                    self._run_evaluator(
+                        item_state, agent=evaluator, progress_ctx=progress_ctx, **feedback
+                    )
                     self._require_stage_outputs(
                         STAGE_EVALUATOR,
                         [evaluation_path],
@@ -1210,18 +1280,30 @@ class PerfOptimizeWorkflow:
                     else evaluation_path
                 )
                 if decision == "APPROVE":
-                    commit = ""
+                    self._validate_evaluator_approval(
+                        latest_entry(progress_path, "evaluator"),
+                        item_id,
+                        reference=entry.get("reference_measurement"),
+                    )
                     if not gitops.worktree_clean(repo):
                         commit = gitops.commit_all(
                             repo,
                             f"perf-optimize: {item_id} candidate-ready "
                             f"[round {item_state.round_index + 1}]",
                         )
+                    else:
+                        # A crash can occur after git commit but before the
+                        # candidate-ready checkpoint. Recover the same commit
+                        # from git when reusing that attempt's cached approval.
+                        commit = gitops.rev_parse_head(repo)
+                    if commit == item_state.item_base_commit:
+                        commit = ""  # A config-only candidate has no source commit.
                     self._update_batch_item(
                         state,
                         item_id,
                         status="candidate_ready",
                         phase="complete",
+                        last_error="",
                         attempts=attempt_no,
                         candidate_commit=commit,
                         candidate_config_path=str(live_config),
@@ -1283,6 +1365,102 @@ class PerfOptimizeWorkflow:
             )
         self._finish_item_batch(state, log)
 
+    def _validate_evaluator_approval(
+        self,
+        verdict: dict[str, Any],
+        item_id: str,
+        *,
+        reference: dict[str, Any] | None = None,
+    ) -> None:
+        """Check every candidate before a commit or campaign promotion."""
+        roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
+        item = roadmap_schema.find_item(roadmap, item_id)
+        optimize = self._optimize_block()
+        required = max(
+            float(optimize["noise_floor_pct"]),
+            float(optimize["accept_fraction"]) * float(item["expected_gain_pct"]),
+        )
+        self._validate_acceptance_measurement(
+            verdict,
+            reference if reference is not None else roadmap["current_best"],
+            required,
+            f"evaluator {item_id} APPROVE",
+        )
+
+    def _validate_acceptance_measurement(
+        self,
+        verdict: dict[str, Any],
+        reference: dict[str, Any],
+        required_gain: float,
+        role: str,
+    ) -> None:
+        optimize = self._optimize_block()
+        regression_budget = self._regression_budget()
+        try:
+            measurements.validate_acceptance(
+                verdict,
+                reference,
+                metric=str(optimize["target_metric"]),
+                required_gain=required_gain,
+                points=self._curve_points() if self._curve_mode() else None,
+                focus=self._focus_points(),
+                allowed_regression=(
+                    float(optimize["noise_floor_pct"])
+                    if regression_budget is None
+                    else regression_budget
+                ),
+            )
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"{role}: {exc}") from exc
+
+    def _validate_integrator_verdict(
+        self,
+        verdict: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        reference: dict[str, Any],
+    ) -> None:
+        decision = verdict.get("decision")
+        if decision not in INTEGRATOR_DECISIONS:
+            raise RuntimeError("integrator finished without a structured verdict")
+        candidate_ids = {str(entry["current_item_id"]) for entry in candidates}
+        included = {str(item_id) for item_id in verdict.get("included_item_ids", [])}
+        unknown = included - candidate_ids
+        if unknown:
+            raise RuntimeError(
+                "integrator included non-candidate item(s): " + ", ".join(sorted(unknown))
+            )
+        if decision == "REJECT":
+            if included:
+                raise RuntimeError("integrator REJECT verdict must include no candidates")
+            return
+        if not included:
+            raise RuntimeError(f"integrator {decision} verdict included no candidates")
+        noise_floor = float(self._optimize_block()["noise_floor_pct"])
+        best = max(candidates, key=lambda entry: float(entry["measured_gain_pct"]))
+        expected_required_gain = max(noise_floor, float(best["measured_gain_pct"]) - noise_floor)
+        try:
+            reported_required_gain = measurements.finite_number(
+                verdict.get("required_gain_pct"), "required_gain_pct"
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"integrator: {exc}") from exc
+        if abs(reported_required_gain - expected_required_gain) > 1e-6:
+            raise RuntimeError(
+                "integrator required_gain_pct mismatch: "
+                f"reported {reported_required_gain}, expected {expected_required_gain}"
+            )
+        self._validate_acceptance_measurement(
+            verdict, reference, expected_required_gain, f"integrator {decision}"
+        )
+        if decision == "FALLBACK_BEST" and (
+            verdict.get("best_candidate_id") != best["current_item_id"]
+            or included != {str(best["current_item_id"])}
+        ):
+            raise RuntimeError(
+                "integrator FALLBACK_BEST must include exactly the highest-gain candidate "
+                "as its best_candidate_id (manifest order breaks ties)"
+            )
+
     def _integrate_batch(self, state: WorkflowState, log) -> None:
         """Combine candidate-ready items and validate the Integrator's verdict."""
         candidates = [
@@ -1314,18 +1492,31 @@ class PerfOptimizeWorkflow:
         if not integration_config.exists():
             shutil.copyfile(self.tuning_accepted_path, integration_config)
         manifest_path = integration_dir / "candidate_manifest.yaml"
-        manifest_path.write_text(
-            yaml.safe_dump(
-                {
-                    "round": round_no,
-                    "campaign_base_commit": gitops.rev_parse_head(repo),
-                    "candidates": candidates,
-                },
-                sort_keys=False,
-                allow_unicode=True,
-            ),
-            encoding="utf-8",
-        )
+        if not manifest_path.exists():
+            manifest_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "round": round_no,
+                        "campaign_base_commit": gitops.rev_parse_head(repo),
+                        "candidates": candidates,
+                    },
+                    sort_keys=False,
+                    allow_unicode=True,
+                ),
+                encoding="utf-8",
+            )
+        reference_path = integration_dir / "reference_measurement.yaml"
+        if not reference_path.exists():
+            reference_path.write_text(
+                yaml.safe_dump(roadmap_schema.load_roadmap(self.roadmap_path)["current_best"]),
+                encoding="utf-8",
+            )
+        reference = yaml.safe_load(reference_path.read_text(encoding="utf-8"))
+        reference_results = Path(
+            str(reference.get("source", "baseline/benchmark_results.md"))
+        ).parent
+        if not reference_results.is_absolute():
+            reference_results = self.workspace / reference_results
         report_path = integration_dir / "integration.md"
         verdict = latest_entry(self.progress_path, "integrator")
         cached_verdict = (
@@ -1333,11 +1524,22 @@ class PerfOptimizeWorkflow:
             and verdict is not None
             and verdict.get("round") == round_no
         )
+        validation_feedback = ""
+        if cached_verdict:
+            try:
+                self._validate_integrator_verdict(verdict, candidates, reference)
+            except RuntimeError as exc:
+                cached_verdict = False
+                validation_feedback = (
+                    f"Your previous verdict failed deterministic validation: {exc}. "
+                    "Correct the evidence/verdict and append a new final progress entry. "
+                    "Inspect the existing integration state before applying commits again.\n\n"
+                )
         if not cached_verdict:
             clear_stale_benchmark_results(integration_dir)
             self._stamp_progress(state, round_no=round_no)
             self.integrator(
-                self._disagg_directive() + f"Workspace: {self.workspace}\n"
+                self._disagg_directive() + validation_feedback + f"Workspace: {self.workspace}\n"
                 f"Round: {round_no}\n"
                 f"Integration worktree: {state.integration_worktree_path}\n"
                 f"Integration branch: {state.integration_branch}\n"
@@ -1346,8 +1548,9 @@ class PerfOptimizeWorkflow:
                 f"Live integration config: {integration_config}\n"
                 f"Campaign accepted config (base): {self.tuning_accepted_path}\n"
                 f"Task: {self.task_path}\n"
-                f"Roadmap/current_best: {self.roadmap_path}\n"
-                f"Reference benchmark results: {self._reference_result_dir()}\n"
+                f"Roadmap: {self.roadmap_path}\n"
+                f"Frozen reference measurement: {reference_path}\n"
+                f"Reference benchmark results: {reference_results}\n"
                 f"Write the integration report to: {report_path}\n\n"
                 f"Inside the Slurm job script, before any Python command or "
                 f"`trtllm-serve` launch:\n\n"
@@ -1384,76 +1587,9 @@ class PerfOptimizeWorkflow:
         ):
             raise RuntimeError("integrator finished without a structured verdict")
 
+        self._validate_integrator_verdict(verdict, candidates, reference)
         decision = str(verdict["decision"])
-        candidate_ids = {str(entry["current_item_id"]) for entry in candidates}
         included = {str(item_id) for item_id in verdict.get("included_item_ids", [])}
-        unknown = included - candidate_ids
-        if unknown:
-            raise RuntimeError(
-                "integrator included non-candidate item(s): " + ", ".join(sorted(unknown))
-            )
-        if decision == "REJECT":
-            if included:
-                raise RuntimeError("integrator REJECT verdict must include no candidates")
-        else:
-            if not included:
-                raise RuntimeError(f"integrator {decision} verdict included no candidates")
-            noise_floor = float(self._optimize_block()["noise_floor_pct"])
-            best_standalone_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
-            expected_required_gain = max(
-                noise_floor,
-                best_standalone_gain - noise_floor,
-            )
-            reported_required_gain = float(verdict["required_gain_pct"])
-            if abs(reported_required_gain - expected_required_gain) > 1e-6:
-                raise RuntimeError(
-                    "integrator required_gain_pct mismatch: "
-                    f"reported {reported_required_gain}, expected {expected_required_gain}"
-                )
-            measured_gain = float(verdict["measured_gain_pct"])
-            if measured_gain < reported_required_gain:
-                raise RuntimeError(
-                    f"integrator {decision} gain {measured_gain} is below required "
-                    f"{reported_required_gain}"
-                )
-            if self._curve_mode():
-                roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-                reference_curve = roadmap["current_best"].get("curve")
-                measured_curve = verdict.get("curve")
-                if not isinstance(reference_curve, list) or not isinstance(measured_curve, list):
-                    raise RuntimeError("integrator curve verdict is missing a curve")
-                reference_by_point = {
-                    int(point["concurrency"]): float(point["value"]) for point in reference_curve
-                }
-                measured_by_point = {
-                    int(point["concurrency"]): float(point["value"]) for point in measured_curve
-                }
-                expected_points = set(self._curve_points())
-                if (
-                    set(reference_by_point) != expected_points
-                    or set(measured_by_point) != expected_points
-                ):
-                    raise RuntimeError(
-                        "integrator curve verdict does not cover the configured concurrency points"
-                    )
-                metric = str(self._optimize_block()["target_metric"])
-                regression_budget = self._regression_budget()
-                allowed_regression = noise_floor if regression_budget is None else regression_budget
-                for point in sorted(expected_points):
-                    gain = self._normalized_gain_pct(
-                        reference_by_point[point], measured_by_point[point], metric
-                    )
-                    if gain is None or gain < -allowed_regression:
-                        raise RuntimeError(
-                            f"integrator curve regresses concurrency {point} beyond "
-                            f"the {allowed_regression}% budget"
-                        )
-            if decision == "FALLBACK_BEST":
-                best_id = str(verdict["best_candidate_id"])
-                if best_id not in candidate_ids or included != {best_id}:
-                    raise RuntimeError(
-                        "integrator FALLBACK_BEST must include exactly its best_candidate_id"
-                    )
         if decision != "REJECT":
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
@@ -1487,7 +1623,7 @@ class PerfOptimizeWorkflow:
                 str(report_path.relative_to(self.workspace)),
                 curve=curve,
             )
-            self._record_nsys_capture(state, integration_dir / "profile")
+            self._record_nsys_capture(state, integration_dir / "profile", invalidate=True)
         print_message(
             f"[bold green]Integrator verdict: {decision}; included "
             f"{', '.join(sorted(included)) or 'none'}[/bold green]",
@@ -1496,20 +1632,11 @@ class PerfOptimizeWorkflow:
         self._finish_item_batch(state, log)
 
     def _finish_item_batch(self, state: WorkflowState, log) -> None:
-        """Clean batch worktrees and deterministically close the round."""
+        """Durably close the round before removing its recoverable worktrees."""
         repo = self._trtllm_repo_path()
         paths = [str(entry.get("item_worktree_path", "")) for entry in state.item_batch]
         if state.integration_worktree_path:
             paths.append(state.integration_worktree_path)
-        for path in paths:
-            if path and Path(path).exists():
-                self._remove_worktree_best_effort(repo, path, log)
-
-        # Book the round's verdicts before the batch rows are cleared
-        # below — this is the one choke point every path converges on
-        # (serial, all-failed parallel, and post-integration), and after
-        # it the structured payload each verdict carried is gone.
-
         state.round_index += 1
         state.item_index = 0
         state.attempt_index = 0
@@ -1528,15 +1655,21 @@ class PerfOptimizeWorkflow:
                 f"target_improvement_pct reached (cumulative {cumulative:+.2f}%)",
                 log,
             )
-            return
-        if state.round_index >= state.max_rounds:
+        elif state.round_index >= state.max_rounds:
             reason = "round budget exhausted"
             if state.profile_required:
                 reason += " before the accepted runtime could be re-profiled"
             self._conclude_round_loop(state, reason, log)
-            return
-        state.stage = STAGE_PROFILER
-        self._checkpoint(state)
+        else:
+            state.stage = STAGE_PROFILER
+            self._checkpoint(state)
+
+        # Every branch above checkpoints the completed batch. An interruption
+        # during cleanup can leave an unused worktree, never a checkpoint that
+        # still needs a deleted integration or candidate runtime.
+        for path in paths:
+            if path and Path(path).exists():
+                self._remove_worktree_best_effort(repo, path, log)
 
     # ------------------------------------------------------------ approach guard
 
@@ -1641,37 +1774,47 @@ class PerfOptimizeWorkflow:
         )
 
     def _require_baseline_measurement(self) -> None:
-        """Fail loudly when the baseline stage produced no measurement.
-
-        ``_require_stage_outputs`` only proves the report exists. A report
-        can exist and still carry no numbers: the benchmarker is required
-        to write one saying so when the server never served a request,
-        which is the honest outcome and exactly what happened on a
-        checkpoint the engine could not load.
-
-        Advancing past that is pure waste — every later stage replays the
-        same operating point against the same broken config, so a
-        campaign that cannot measure its baseline burns a full allocation
-        per stage to rediscover it. The signal has to be the artifact, not
-        the prose: at least one result JSON under ``baseline/`` must carry
-        the target metric.
-        """
+        """Require successful numeric measurements at every configured curve point."""
         metric = str(self._optimize_block()["target_metric"])
+        required_points = set(self._curve_points()) if self._curve_mode() else None
+        measured_points: set[int] = set()
         for path in sorted(self.baseline_dir.rglob("*.json")):
             try:
                 data = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except (OSError, yaml.YAMLError):
+                if not isinstance(data, dict):
+                    continue
+                measurements.finite_number(data.get(metric), metric, positive=True)
+                measurements.finite_number(data.get("completed"), "completed", positive=True)
+            except (OSError, ValueError, yaml.YAMLError):
                 continue
-            if isinstance(data, dict) and metric in data:
+            if required_points is None:
                 return
+            # The benchmark contract saves each run under concurrency_<c>.
+            # A raw result can also identify its point through max_concurrency.
+            point = data.get("max_concurrency")
+            if isinstance(point, bool) or not isinstance(point, int):
+                point = next(
+                    (
+                        int(match.group(1))
+                        for part in path.relative_to(self.baseline_dir).parts[:-1]
+                        if (match := re.fullmatch(r"concurrency_(\d+)", part))
+                    ),
+                    None,
+                )
+            if point in required_points:
+                measured_points.add(point)
+        if required_points is not None and measured_points == required_points:
+            return
+        missing = (
+            f" Missing concurrency points: {sorted(required_points - measured_points)}."
+            if required_points is not None
+            else ""
+        )
         raise RuntimeError(
-            f"the baseline stage produced no measurement: no JSON under "
-            f"{self.baseline_dir} carries '{metric}'. Read "
-            f"{self.baseline_results_path} — the benchmarker records the blocker "
-            f"there. Every later stage replays this same operating point, so the "
-            f"campaign is stopped rather than spending an allocation per stage on "
-            f"a configuration that cannot serve a request. Fix the blocker and "
-            f"re-run to retry the baseline, or pass --clean to start over."
+            f"the baseline stage produced no measurement: require a positive finite "
+            f"'{metric}' and a positive completed request count in result JSON under "
+            f"{self.baseline_dir}.{missing} Read {self.baseline_results_path} for the "
+            f"blocker. Fix it and re-run to retry the baseline, or pass --clean to start over."
         )
 
     def _require_stage_outputs(self, stage: str, paths: list[Path]) -> None:
@@ -1985,19 +2128,37 @@ class PerfOptimizeWorkflow:
             return tuple(str(entry) for entry in methods)
         return ("nsys",)
 
-    def _record_nsys_capture(self, state: WorkflowState, directory: Path) -> None:
+    def _record_nsys_capture(
+        self, state: WorkflowState, directory: Path, *, invalidate: bool = False
+    ) -> None:
         """Point ``last_nsys_dir`` at ``directory`` when it holds a capture.
 
         Called after the stages that may produce an nsys profile — the
         profiler's round profile, and an accepted attempt's
         accept-evidence capture — so the next evaluator's kernel
         comparison always names the freshest trace of the accepted state.
-        A stage that captured nothing leaves the pointer unchanged. The
-        caller checkpoints.
+        An accepted runtime change invalidates the previous pointer even
+        when its diagnostic capture failed. Refreshing an unchanged runtime
+        may retain its earlier capture. The caller checkpoints.
         """
+        if invalidate:
+            state.last_nsys_dir = ""
         manifest_path = directory / PROFILE_MANIFEST_NAME
         if manifest_path.is_file():
-            manifest = validate_profile_manifest(directory)
+            try:
+                manifest = validate_profile_manifest(directory)
+            except ProfileError as exc:
+                if not invalidate:
+                    raise
+                # Candidate/integration captures are diagnostic. A broken
+                # optional capture cannot invalidate an accepted measurement
+                # or trap promotion retries on the same malformed manifest.
+                print_message(
+                    f"[yellow]accepted runtime has no usable nsys capture: "
+                    f"{escape(str(exc))}[/yellow]",
+                    get_logger().console,
+                )
+                return
             if manifest["methods"].get("nsys", {}).get("status") == "captured":
                 state.last_nsys_dir = str(directory)
         elif any(directory.rglob("*.nsys-rep")) or (directory / "nsys_stats.txt").is_file():
@@ -2275,10 +2436,28 @@ class PerfOptimizeWorkflow:
         progress_ctx.current_attempt = state.attempt_index + 1 if with_attempt else None
         progress_ctx.current_item_id = state.current_item_id if with_attempt else ""
 
+    def _runtime_checkout_instruction(self, state: WorkflowState) -> str:
+        """Bind measurements to the source whose changes the campaign owns."""
+        return (
+            f"Active runtime checkout: `{self._state_repo_path(state)}`. "
+            "Before launching the server, prepend this checkout to `PYTHONPATH` "
+            "in the same execution shell/container and verify "
+            '`python -c "import tensorrt_llm, os; '
+            'print(os.path.realpath(tensorrt_llm.__file__))"`. '
+            "The import must resolve under that checkout. For remote execution, "
+            "use and verify its isolated staged copy. Record the resolved import "
+            "path; a different installed package is a blocker.\n\n"
+        )
+
     def _run_benchmarker(self, state: WorkflowState) -> None:
         self._stamp_progress(state, round_no=0)
         if self._curve_mode():
             points = self._curve_points()
+            mean_scope = (
+                f"mean over scored concurrency points {self._focus_points()}"
+                if self._focus_points()
+                else "mean over all configured concurrency points"
+            )
             load_instruction = (
                 f"then run `benchmark_serving.py` **once per concurrency "
                 f"point {points}**, sequentially ascending, against the same "
@@ -2292,8 +2471,8 @@ class PerfOptimizeWorkflow:
                 f"`baseline/`"
             )
             baseline_note = (
-                "naming the target metric's per-point values and their "
-                "**mean** explicitly — the mean becomes the roadmap's "
+                f"naming the target metric's per-point values and their "
+                f"**{mean_scope}** explicitly — this mean becomes the roadmap's "
                 "`baseline.value` and the per-point rows become "
                 "`baseline.curve`. "
             )
@@ -2312,8 +2491,10 @@ class PerfOptimizeWorkflow:
                 "the roadmap's `baseline.value`. "
             )
         self.benchmarker(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
-            f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
+            self._disagg_directive()
+            + f"Workspace: {self.workspace}\n\n"
+            + self._runtime_checkout_instruction(state)
+            + f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
             f"Then **load the `perf-optimization-casebook` skill** (via the "
             f"`Skill` tool) as read-only reference, as your system prompt "
@@ -2452,8 +2633,8 @@ class PerfOptimizeWorkflow:
             f"where), `{findings_path}` **in full** plus the traces and "
             f"summaries in `{analysis_dir}` plus preserved captures in "
             f"`{profile_dir}` (read-only), and "
-            f"`{self.baseline_results_path}` (the imported baseline "
-            f"measurement — the anchor for the roadmap's `baseline` "
+            f"`{self.baseline_results_path}` (the validated baseline "
+            f"measurement, imported or measured by this campaign — the anchor for the roadmap's `baseline` "
             f"block).\n\n"
             + projection_context
             + prior_roadmap_context
@@ -2982,7 +3163,7 @@ class PerfOptimizeWorkflow:
         return (
             f"**Accept-evidence duty — only if your verdict is APPROVE.** "
             f"After your clean measurement and gate arithmetic, capture the "
-            f"accepted state per the accept-evidence procedure in your "
+            f"candidate state per the accept-evidence procedure in your "
             f"system prompt: tear down the measurement server, relaunch "
             f"under the canonical `nsys profile` wrap, replay the canonical "
             f"load once{curve_note}, tear down, and save the `.nsys-rep`, "
@@ -3006,6 +3187,7 @@ class PerfOptimizeWorkflow:
         *,
         agent: AgentLayer | None = None,
         progress_ctx: ProgressContext | None = None,
+        validation_feedback: str = "",
     ) -> None:
         round_no = state.round_index + 1
         attempt_no = state.attempt_index + 1
@@ -3097,8 +3279,19 @@ class PerfOptimizeWorkflow:
             )
         else:
             attempt_note = ""
+        correction = ""
+        if validation_feedback:
+            correction = (
+                "**Correct the previous evaluator submission.** The orchestrator "
+                f"rejected its structured approval: {validation_feedback}\n"
+                "The candidate source, tuning config, and measurement artifacts "
+                "have been preserved. For this corrective turn, reuse valid "
+                "existing evidence and fix the report/arithmetic; repeat only "
+                "checks or measurements whose evidence is missing or invalid. "
+                "Keep the candidate unchanged and append a corrected verdict.\n\n"
+            )
         (agent or self.evaluator)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            correction + self._disagg_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -3209,8 +3402,10 @@ class PerfOptimizeWorkflow:
                 "`cumulative_improvement_pct` — from your own measurement"
             )
         self.qa(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
-            f"Campaign: the optimization loop is over ({state.round_index} "
+            self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
+            + self._runtime_checkout_instruction(state)
+            + f"Campaign: the optimization loop is over ({state.round_index} "
             f"round(s) ran); the system under test is the final accepted "
             f"state.\n"
             f"Verification directory (write your artifacts here): "
@@ -3325,13 +3520,17 @@ class PerfOptimizeWorkflow:
             coverage_section = "Kernel Coverage / "
         reuse_read = ""
         if state.reuse_analysis_dir:
+            baseline_origin = (
+                "The baseline was measured by this campaign; the benchmarker progress "
+                "entry records that run. "
+                if latest_entry(self.progress_path, "benchmarker") is not None
+                else "The baseline was measured by that run, not this one. "
+            )
             reuse_read = (
                 f" `{self.reuse_manifest_path}` (this campaign was launched "
-                f"with `--reuse-analysis {state.reuse_analysis_dir}` — the "
-                f"baseline and the round-1 profile were **measured by that "
-                f"run, not this one**; say so in Configuration and name what "
-                f"was imported, so no reader mistakes an inherited "
-                f"measurement for one this campaign made),"
+                f"with `--reuse-analysis {state.reuse_analysis_dir}`. {baseline_origin}"
+                f"Name which profiles and analyses were imported using their manifests, "
+                f"and distinguish them from new captures in Configuration),"
             )
         self.reporter(
             f"Workspace: {self.workspace}\n"
@@ -3343,6 +3542,8 @@ class PerfOptimizeWorkflow:
             f"{reuse_read}{projection_read}{coverage_read} "
             f"`{self.roadmap_path}` (final "
             f"statuses, expected vs measured gains, baseline/current_best), "
+            f"every round's `integration/integration.md` and "
+            f"`integration/candidate_manifest.yaml` when present, "
             f"every `optimization_summary.md` / `evaluation.md` under "
             f"`{self.rounds_dir}`, every round's "
             f"`analysis/profile_findings.md` + `profile/{PROFILE_MANIFEST_NAME}` "
@@ -3353,7 +3554,10 @@ class PerfOptimizeWorkflow:
             f"`{self.verification_report_path}` when it exists (the final "
             f"verification's independent benchmark + accuracy), "
             f"`{self.progress_path}` (the chronological trail the "
-            f"trajectory is reconstructed from), "
+            f"trajectory is reconstructed from: serial mode advances on accepted "
+            f"evaluator results; parallel mode advances once per accepted integrator "
+            f"result, whose combined measurement is authoritative. Standalone "
+            f"candidate measurements share a base and are not sequential gains), "
             f"`{self.tuning_accepted_path}` (the final accepted config), and "
             f"— read-only — `git -C <trtllm_repo_path> log --oneline` and "
             f"`git diff --stat` over `{state.campaign_git_base_commit[:12]}..HEAD` for "

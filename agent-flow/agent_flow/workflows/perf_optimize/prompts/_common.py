@@ -35,12 +35,11 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     PROFILING_KNOB_VERIFICATION,
     PROFILING_RUNS_REFERENCE,
     REMOTE_SLURM_EXECUTION,
-    SERVE_FLAGS_REFERENCE,
-    SERVER_LIFECYCLE,
     SOL_CORRELATION_METHOD,
     SOL_METHODOLOGY_FALLBACK,
     SOL_PROJECTOR_INTERNAL_KNOWLEDGE,
     SOL_PROJECTOR_METHODOLOGY,
+    build_server_lifecycle,
 )
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 
@@ -61,14 +60,17 @@ __all__ = [
     "KERNEL_REUSE_ANALYZER",
     "MEASUREMENT_PROTOCOL",
     "MEASUREMENT_METRICS",
+    "MEASUREMENT_VALIDITY",
     "OPTIMIZE_HTML_COMPANION",
     "PROFILE_FINDINGS_CONTRACT",
     "PROFILING_KNOB_VERIFICATION",
     "PROFILING_RUNS_REFERENCE",
     "ROADMAP_SPEC",
+    "ROADMAP_READER",
     "REMOTE_SLURM_EXECUTION",
     "SERVE_FLAGS_REFERENCE",
     "SERVER_LIFECYCLE",
+    "RUNTIME_CHECKOUT",
     "SOL_ANALYZER_CONTEXT",
     "SOL_CORRELATION_METHOD",
     "SOL_METHODOLOGY_FALLBACK",
@@ -83,6 +85,42 @@ __all__ = [
     "kernel_coverage_analyzer_note",
     "kernel_coverage_ncu_targeting",
 ]
+
+
+# Render the active-config policy directly; the perf-analyze default allows
+# startup recovery to alter config, which invalidates independent measurements.
+SERVER_LIFECYCLE = build_server_lifecycle(active_tuning_config=True)
+
+SERVE_FLAGS_REFERENCE = """\
+### Server configuration
+
+Serve `checkpoint_path` with `--backend pytorch` at `127.0.0.1:8000`.
+Always pass `--extra_llm_api_options <active tuning config>` using the exact
+path in the turn instructions. Parallel sizes and all other server tuning
+come from that YAML. Verify supported fields against `trtllm-serve --help`
+and the LLM API reference in the active runtime checkout.
+"""
+
+RUNTIME_CHECKOUT = """\
+## Verify the runtime checkout
+
+Before any source edit or server launch, identify the active runtime
+checkout from the turn instructions. Inside the same execution environment
+and shell that will launch `trtllm-serve`, prepend that exact checkout to
+`PYTHONPATH`, then verify:
+```bash
+python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"
+```
+The printed path must resolve under the active runtime checkout. If it does
+not, stop and record a blocker; do not benchmark or claim that the change
+was exercised. Record the resolved import path and source/build identity
+beside the exact serve command. `task.yaml`'s `trtllm_repo_path` names the
+campaign checkout; it may differ from the active runtime checkout for an
+item, integration worktree, or staged remote copy. For remote execution,
+verify inside the allocated container using its staged checkout path. For
+disaggregated serving, propagate that path and `PYTHONPATH` into every
+worker role and verify imports in the worker launch environment.
+"""
 
 
 def build_offline_analysis_reference() -> str:
@@ -253,7 +291,8 @@ Rules that keep the loop deterministic:
   point, ascending, from the baseline report's curve summary table — and
   seeds `current_best` equal to it (curve included). `value` is the mean
   of the per-point `value`s. The orchestrator advances `current_best`
-  (including its curve) from the evaluator's structured progress entry;
+  (including its curve) from validated serial evaluator promotions or
+  the accepted parallel integration's structured progress entry;
   per-item `measured_gain_pct` is the **mean of per-point gains**. Scalar
   runs omit `curve` entirely.
 - **Focus scoring** (`optimize.focus_concurrencies` in `task.yaml`, curve
@@ -266,12 +305,40 @@ Rules that keep the loop deterministic:
   benefit lives outside it are mis-planned.
 """
 
+ROADMAP_READER = """\
+## The roadmap contract (`roadmap.yaml`)
+
+Read the target metric, frozen `baseline`, `current_best`, and the item
+named in the turn instructions. Each item supplies its stable id, title,
+category, approach (`config` or `code`), evidence, `expected_gain_pct`,
+`expected_gain_rationale`, `how_to_apply`, status, attempts and measured gain.
+**List order is priority order**, not execution chronology.
+
+The **orchestrator** owns every lifecycle field: status, attempts,
+measured_gain_pct and current_best. Treat the roadmap as read-only; only
+the Analyzer authors or replans item content. Do not initialize, reorder,
+renumber or update roadmap entries.
+
+`current_best` is the accepted campaign measurement. A parallel batch's
+candidates all use its frozen reference: evaluator APPROVE makes an item
+candidate-ready. Only promotion after integration makes it accepted, and
+only the integrator's measured combined state advances current_best.
+Standalone candidate gains are not successive campaign improvements.
+
+In curve mode, every `curve` contains all configured concurrency points as
+`{concurrency, value, tok_s_user, tok_s_gpu}` rows. Absolute scalar values
+are means over `optimize.focus_concurrencies` when set, else all points;
+gain is the mean of direction-normalized per-point gains over the same
+scored subset. All points remain subject to the regression check.
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Git discipline (optimizer / evaluator)
 # --------------------------------------------------------------------------- #
 
-GIT_DISCIPLINE = """\
+GIT_DISCIPLINE = (
+    """\
 ## Git discipline (the TRT-LLM checkout)
 
 This run works on a **dedicated optimization branch** in
@@ -297,23 +364,13 @@ reverts rejected attempts with `git reset --hard` + `git clean -fd`:
   say itself — the non-obvious constraint, the why of a chosen value —
   in the repo's own terms; the provenance story belongs in
   `optimization_summary.md`, not in the source.
-- **Before any source edit or server launch, identify the active runtime
-  checkout from the turn instructions.** Inside the same Slurm container
-  and shell that will launch `trtllm-serve`, prepend that exact checkout
-  to `PYTHONPATH`, then verify:
-  ```bash
-  python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"
-  ```
-  The printed path must resolve under the active runtime checkout. If it
-  does not, stop and record a blocker; do not benchmark or claim that the
-  change was exercised. `task.yaml`'s `trtllm_repo_path` is the campaign
-  checkout. It may differ from the active runtime checkout when an item
-  or integration worktree is in use.
 - The review basis for an attempt is
-  `git -C <trtllm_repo_path> diff` (plus `--stat`) — uncommitted changes
+  `git -C <active runtime checkout> diff` (plus `--stat`) — uncommitted changes
   on the optimization branch. New files the attempt added show up with
   `git status --porcelain`; list them explicitly in your output.
 """
+    + RUNTIME_CHECKOUT
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -451,8 +508,9 @@ axes:
    output, or a failed targeted test always fails this axis.
 3. **Perf expectation** (`reason_category: perf_shortfall`) — measure the
    target metric with the canonical benchmark and compute the gain
-   **against `current_best` in `roadmap.yaml`** (the last ACCEPTED
-   measurement — never the original baseline; gains accumulate), with
+   **against the frozen reference named in your turn instructions**
+   (`current_best` at the item's base; the last ACCEPTED measurement —
+   never the original baseline unless it is still current best), with
    `accept_fraction` / `noise_floor_pct` from the `optimize` block in
    `task.yaml` and `expected_gain_pct` from the roadmap item.
 
@@ -508,10 +566,9 @@ axes:
    **scored** mean), `measured_value` = the mean of the per-point
    absolute values **over the scored points**, and the `curve` field =
    the per-point `{concurrency, value, tok_s_user, tok_s_gpu}` rows for
-   **all** points. If `current_best` carries no `curve` (a degraded
-   earlier accept), compare your scored mean against `current_best.value`
-   for the two mean thresholds, skip the per-point no-regress check, and
-   say so in your report.
+   **all** points. If the reference carries no `curve`, or either curve
+   is incomplete or invalid, the performance gate cannot pass. Report
+   the missing evidence; never skip the per-point no-regress check.
 
    In both modes, show the arithmetic in your evaluation report — the
    thresholds, the measured value(s), and the reference value(s).
@@ -519,8 +576,9 @@ axes:
 On APPROVE, `reason_category` is `"none"`. Report `measured_gain_pct` and
 `measured_value` in your progress entry **exactly as measured** (signed;
 a regression is negative) — the orchestrator records them into
-`roadmap.yaml` and advances `current_best` from them, so fabricated or
-rounded-up numbers poison every later round.
+`roadmap.yaml` on promotion. In parallel mode APPROVE makes a candidate
+ready for integration; it does not advance `current_best` or accept the
+item. Fabricated or rounded-up numbers poison every later round.
 """
 
 
@@ -549,6 +607,31 @@ MEASUREMENT_METRICS = """\
   provide a scored curve measurement.
 """
 
+MEASUREMENT_VALIDITY = """\
+## Valid measurement evidence
+
+Use completed benchmark result JSON from an unprofiled run. The target
+metric and reference must be finite positive numbers; null, strings,
+NaN, infinity, zero and failed/empty runs cannot establish a passing gate.
+In curve mode measure every configured concurrency exactly once, with no
+missing, duplicate or extra points. Both the measured and reference curves
+must be complete. Never replace a missing curve with a scalar comparison.
+
+For each concurrency, use the direction rule above to compute `gain_i`.
+The scored points are `optimize.focus_concurrencies` when set, else all
+configured points. `measured_gain_pct` is the arithmetic mean of `gain_i`
+over the scored points; `measured_value` is the mean absolute value over
+those same points. Keep every point in the structured `curve`. Show both
+scored and all-points means when focus scoring applies.
+
+For an acceptance verdict, the scored gain must reach the turn's required
+gain threshold and `optimize.noise_floor_pct`. In curve mode every point,
+including unscored points, must satisfy `gain_i >= -regression_bar`, where
+`regression_bar = optimize.max_regression_pct` when configured, else
+`optimize.noise_floor_pct`. Report any point that spends this explicit
+regression budget. An invalid or missing measurement never passes.
+"""
+
 
 MEASUREMENT_PROTOCOL = (
     """\
@@ -575,6 +658,8 @@ the same recipe:
 """
     + "\n"
     + MEASUREMENT_METRICS
+    + "\n"
+    + MEASUREMENT_VALIDITY
     + """
 
 Curve worked example (target `output_throughput`, `expected_gain_pct`
@@ -592,7 +677,7 @@ worst point −0.40% ≥ −1.0% ✓ → the perf axis passes.
 # --------------------------------------------------------------------------- #
 
 TUNING_CONFIG_NOTE = """\
-## The active tuning config (supersedes the `extra_llm_api_options` guidance above)
+## The active tuning config
 
 In this workflow the server tuning is **owned by the workspace**, not by
 `task.yaml`. The turn instructions name the exact **active tuning config**;
@@ -600,12 +685,10 @@ that path supersedes shorthand references to
 `tuning/extra_llm_api_options.yaml` elsewhere in the prompt.
 `trtllm-serve` **always** passes `--extra_llm_api_options` with that exact
 path (whose content is `{}` when no tuning applies, which is valid).
-Ignore the earlier instruction to pass the flag only when `task.yaml`
-sets the key: here the flag is always present, so config optimizations
-take effect by editing the active tuning config and relaunching.
-
-- Only the **optimizer** edits the active tuning config; every other role
-  treats it as read-only and serves with it as-is.
+- The **optimizer** may edit its item's active tuning config. The
+  **integrator** may combine candidate configs and make minimal combination
+  fixes only in its isolated integration config. Every other role treats
+  the active tuning config as read-only and serves with it as-is.
 - The turn instructions also name the orchestrator-managed accepted
   config snapshot when the role needs it. Never edit that snapshot; the
   orchestrator restores the active tuning config from it when an attempt
@@ -653,13 +736,19 @@ runs it for you, with the same flags.
   environment, measurement conditions. Read-only.
 - **`task.yaml`** — the campaign knobs (`optimize`). Read-only.
 - **active tuning config named in the turn instructions** — the harness
-  config's `worker_config`, i.e. `{ctx: {...}, gen: {...}}`. Only the
-  **optimizer** edits it, under the rules above.
+  config's `worker_config`, i.e. `{ctx: {...}, gen: {...}}`. The optimizer
+  edits its item's config; the integrator combines candidates only in its
+  isolated integration config. Other roles keep it read-only.
 
 ### Per launch
 
 1. Synthesize: harness config with its `worker_config` replaced by the
    live tuning file, written to `<your artifact dir>/disagg_config.yaml`.
+   For parallel items add `--exclusive` to this run-local copy's
+   `slurm.extra_args`, preserving existing arguments. Each item needs its
+   own allocation, exclusive node set and job directory; never reuse a
+   sibling's allocation. This is execution isolation, not worker tuning:
+   keep the original harness config read-only and the worker topology frozen.
 2. Submit and poll in the foreground until the job leaves the queue:
    ```bash
    cd <trtllm_repo_path>/examples/disaggregated/slurm/benchmark
@@ -788,11 +877,12 @@ color schemes stay readable, and never plot a value that differs from
 the section's table — the table is the source of truth.
 
 - **Trajectory line chart** — at the top of *Optimization Trajectory*:
-  x = the steps in applied order (baseline → each accepted item → the
-  final verification, when it ran), y = the target metric (curve mode:
-  the **mean across concurrency points** — label the y-axis
+  x = the accepted campaign states in applied order (baseline → serial
+  promotions or accepted parallel integrations → final verification,
+  when it ran), y = the target metric (curve mode:
+  the **mean across scored concurrency points** — label the y-axis
   accordingly). Mark every point and label
-  it with its item id, draw a dashed horizontal reference at the
+  it with its item id or integration's included item ids, draw a dashed horizontal reference at the
   baseline value, pad the y-domain around the data (do not force zero),
   and put the metric name + units on the y-axis. Each point gets a hover
   tooltip (an SVG `<title>` is enough) showing the absolute value and
@@ -1130,12 +1220,23 @@ measurement citations. Start local revision history from this initial model.
 
 ```
 wall_clock_share_pct = share_pct x gpu_busy_pct / 100
-best_case_gain_pct   = wall_clock_share_pct x recovery_fraction
+time_saved_pct      = wall_clock_share_pct x recovery_fraction
+latency_gain_pct    = time_saved_pct
+throughput_gain_pct = 100 x time_saved_pct / (100 - time_saved_pct)
 ```
 
-Use this wall-clock estimate in `expected_gain_rationale` and compare it
-with `optimize.noise_floor_pct` for every `below-materiality` dismissal.
-For example, 8% GPU share at 60% busy with half recoverable yields 2.4%.
+For fixed work, select `best_case_gain_pct` in the target metric's
+direction: latency uses `latency_gain_pct`, throughput uses
+`throughput_gain_pct`. Require `0 <= time_saved_pct < 100`; recovering
+all elapsed time does not justify a finite throughput estimate. This
+conversion assumes the recovered wall-clock time affects the target
+metric proportionally; state and bound that assumption for TTFT, TPOT,
+percentiles or capacity changes rather than equating unrelated times.
+Use the target-metric estimate in `expected_gain_rationale` and compare
+it with `optimize.noise_floor_pct` for every `below-materiality` dismissal.
+For example, 8% GPU share at 60% busy with half recoverable saves 2.4%
+elapsed time, implying about 2.46% throughput gain; 50% less elapsed
+time implies 100% more throughput for the same work.
 Choose the affected time and recovery bound for the question:
 
 | Question | Maximum recoverable time |
@@ -1305,12 +1406,17 @@ requirement or a permanently frozen answer. Keep it intact as provenance.
 
 ### The kernel ledger contract (`kernel_ledger.yaml`)
 
+This schema example enumerates two rows totaling 27.6%; it illustrates the
+row/model structure, not completed coverage. A submitted ledger must add
+the remaining measured rows until the task's coverage target is reached,
+then recompute both coverage shares from the actual inventory.
+
 ```yaml
 version: 2
 source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
-  enumerated_share_pct: 96.8    # sum of kernels[].share_pct
-  other_share_pct: 3.2          # the explicit below-bar tail (they must total ~100)
+  enumerated_share_pct: 27.6    # sum of the two example kernels[].share_pct
+  other_share_pct: 72.4         # unenumerated share; shrink by adding measured rows
   min_share_pct: {min_share_pct}
   gpu_busy_pct: 82.4            # GPU busy %; wall-clock share = share_pct x gpu_busy_pct / 100
 kernels:                        # descending share_pct; one row per kernel/group

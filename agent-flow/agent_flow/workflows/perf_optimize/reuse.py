@@ -73,6 +73,7 @@ _ANALYSIS_FILE_GLOBS = (
     "*ncu*.md",
     "regions.json",
     "sol.json",
+    "taxonomy.json",
 )
 _ANALYSIS_DIR_GLOBS = ("nsys_analysis*",)
 
@@ -145,9 +146,15 @@ def _profile_for_findings(source: Path, findings: Path) -> Path | None:
             return candidate
         except (OSError, UnicodeError, yaml.YAMLError, ProfileError):
             return None
+    # Split-layout analyses get their identity only after the analyzer gate
+    # succeeds. A completed sibling capture does not complete partial findings.
     candidate = findings.parent.parent / "profile"
-    if candidate.resolve().is_relative_to(source.resolve()) and _valid_profile(candidate):
-        return candidate
+    if (
+        candidate != findings.parent
+        and candidate.resolve().is_relative_to(source.resolve())
+        and candidate.exists()
+    ):
+        return None
     if _valid_profile(findings.parent):
         return findings.parent
     if not (findings.parent / PROFILE_MANIFEST_NAME).exists() and _has_trace(findings.parent):
@@ -208,8 +215,8 @@ def latest_round_findings(source: Path) -> Path | None:
     new run with a pointer to a directory it does not have and no traces
     at all, when the earlier profiling round holds the real evidence.
 
-    Falls back to the numerically newest findings when no round carries a
-    trace — an import of prose beats importing nothing.
+    Legacy campaigns without split capture directories or analysis manifests
+    retain their prose-only fallback. Modern analyses require completion identity.
     """
     candidates = _round_findings(source)
     if not candidates:
@@ -219,7 +226,12 @@ def latest_round_findings(source: Path) -> Path | None:
         for number, path in candidates
         if _profile_for_findings(source, path) is not None
     ]
-    return max(profiled or candidates)[1]
+    if profiled:
+        return max(profiled)[1]
+    split_layout = any(source.glob("rounds/round_*/profile")) or any(
+        source.glob("rounds/round_*/analysis/analysis_manifest.yaml")
+    )
+    return None if split_layout else max(candidates)[1]
 
 
 def _profile_for_ledger(source: Path, ledger: Path) -> Path | None:
@@ -496,9 +508,10 @@ def _render_manifest(imported: ImportedAnalysis, workspace: Path) -> str:
         "without launching a server or profiler. Prior analysis is reference",
         "only; reanalysis writes fresh derivations in this workspace. No",
         "capture is taken by the analyzer. Every",
-        "measurement they contain describes the source run's system — the",
-        "baseline numbers this campaign's gains are computed against were",
-        "measured there, not here.",
+        "measurement they contain describes the source run's system.",
+        "A usable imported baseline is retained; a missing or unusable baseline",
+        "is measured by this campaign. The benchmarker progress entry records",
+        "any new baseline, whose report replaces the imported report.",
         "",
         "The imported kernel ledger and its model revision history are prior",
         "art only. Resolve its evidence relative to its original source",

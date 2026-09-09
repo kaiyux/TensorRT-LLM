@@ -134,15 +134,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    resuming = not args.clean and (args.workspace / STATE_FILENAME).is_file()
+    task_path = args.workspace / "task.yaml" if resuming else args.task
     try:
         task_data = load_and_validate_task_yaml(
-            args.task,
-            max_rounds_override=args.max_rounds,
+            task_path,
+            max_rounds_override=None if resuming else args.max_rounds,
         )
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
-    if args.reuse_analysis is not None and not Path(args.reuse_analysis).expanduser().is_dir():
+    if (
+        not resuming
+        and args.reuse_analysis is not None
+        and not Path(args.reuse_analysis).expanduser().is_dir()
+    ):
         print(
             f"error: --reuse-analysis source is not a directory: {args.reuse_analysis}",
             file=sys.stderr,

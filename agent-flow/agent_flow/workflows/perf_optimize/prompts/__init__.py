@@ -213,13 +213,27 @@ def build_perf_optimize_prompts(
             evaluator=restriction,
         )
     if include_slurm_environment:
+        runtime_bootstrap = (
+            EXECUTION_SLURM_BOOTSTRAP
+            + """
+## Parallel campaign allocation isolation
+
+Each concurrent item must submit its own exclusive Slurm node allocation
+(use `--exclusive`) and stage files in its own job directory. The fixed
+port 8000 and GPU measurements require node isolation: never attach to or
+reuse a sibling item's allocation. Reuse your own allocation for your
+related smoke check, benchmark and capture work where possible. The
+integration stage receives a separate allocation after candidate workers
+finish. Honor the configured SSH boundary for every allocation.
+"""
+        )
         bundle = bundle.with_extensions(
-            benchmarker=EXECUTION_SLURM_BOOTSTRAP,
-            profiler=EXECUTION_SLURM_BOOTSTRAP,
-            optimizer=EXECUTION_SLURM_BOOTSTRAP,
-            evaluator=EXECUTION_SLURM_BOOTSTRAP,
-            integrator=EXECUTION_SLURM_BOOTSTRAP,
-            qa=EXECUTION_SLURM_BOOTSTRAP,
+            benchmarker=runtime_bootstrap,
+            profiler=runtime_bootstrap,
+            optimizer=runtime_bootstrap,
+            evaluator=runtime_bootstrap,
+            integrator=runtime_bootstrap,
+            qa=runtime_bootstrap,
         )
     if include_sol:
         bundle = bundle.with_extensions(
@@ -254,6 +268,7 @@ def build_perf_optimize_prompts(
             profiler=context,
             optimizer=context,
             evaluator=context,
+            integrator=context,
             qa=context,
         )
     return bundle

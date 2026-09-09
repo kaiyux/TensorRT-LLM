@@ -61,6 +61,7 @@ rather than all at once.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -170,7 +171,7 @@ KERNEL_COVERAGE_DEFAULTS: dict[str, Any] = {
 
 def _is_number(value: Any) -> bool:
     # bool is an int subclass — reject it explicitly.
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _mapping_block(data: Mapping[str, Any], key: str, errors: list[str]) -> dict[str, Any]:

@@ -413,6 +413,25 @@ def test_coverage_sum_tolerates_rounding(tmp_path):
     load_ledger(_write(tmp_path, ledger))
 
 
+@pytest.mark.parametrize("declared,shares", [(96.0, [1.0]), (94.0, [60.0, 36.0])])
+def test_coverage_total_must_match_enumerated_rows(tmp_path, declared, shares):
+    ledger = _ledger()
+    ledger["coverage"].update(enumerated_share_pct=declared, other_share_pct=100 - declared)
+    ledger["kernels"] = [_row(f"kernel-{index}", share) for index, share in enumerate(shares)]
+    with pytest.raises(LedgerError, match="must match the sum"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_coverage_gate_uses_rows_even_with_rounding_in_declared_total(tmp_path):
+    ledger = _ledger()
+    ledger["coverage"].update(enumerated_share_pct=94.6, other_share_pct=5.4)
+    ledger["kernels"][1]["share_pct"] = 34.2
+    loaded = load_ledger(_write(tmp_path, ledger))
+    problems = cross_validate(loaded, _roadmap("opt-001"), coverage_target_pct=95.0)
+    assert len(problems) == 1
+    assert "coverage_target_pct" in problems[0]
+
+
 def test_empty_kernels_list_rejected(tmp_path):
     with pytest.raises(LedgerError, match="'kernels' must be a non-empty list"):
         load_ledger(_write(tmp_path, _ledger(kernels=[])))
@@ -493,6 +512,7 @@ def test_coverage_below_target_is_a_problem(tmp_path):
     ledger = _ledger()
     ledger["coverage"]["enumerated_share_pct"] = 90.0
     ledger["coverage"]["other_share_pct"] = 10.0
+    ledger["kernels"][1]["share_pct"] = 30.0
     loaded = load_ledger(_write(tmp_path, ledger))
     problems = cross_validate(loaded, _roadmap("opt-001"), coverage_target_pct=95.0)
     assert len(problems) == 1
@@ -503,6 +523,7 @@ def test_coverage_target_tolerates_rounding(tmp_path):
     ledger = _ledger()
     ledger["coverage"]["enumerated_share_pct"] = 94.7
     ledger["coverage"]["other_share_pct"] = 5.3
+    ledger["kernels"][1]["share_pct"] = 34.7
     loaded = load_ledger(_write(tmp_path, ledger))
     assert cross_validate(loaded, _roadmap("opt-001"), coverage_target_pct=95.0) == []
 

@@ -71,8 +71,7 @@ round loop:
   occupancy, warp stalls → bound class). With `--reuse-analysis` it
   plans from imported findings; with `--reuse-analysis --reanalyze` it
   first recomputes the analysis from imported captures. After a round
-  that neither accepted anything nor made a potentially build-changing
-  code attempt, it runs **replan-only** from the standing findings and
+  that accepted nothing, it runs **replan-only** from the standing findings and
   evaluator verdicts — see *What a round costs*. It writes/updates
   `roadmap.yaml` — items ordered by `expected_gain_pct` (bottleneck share
   removed, casebook-grounded), never by fix ease, each item's evidence
@@ -108,8 +107,12 @@ round loop:
   workload, hardware and actual implementation.
 - **optimizer** — one independent persistent optimizer is created for each
   dispatched item. With `item_execution: parallel`, up to
-  `max_items_per_round` pairs run concurrently from the same frozen round
-  base. With `serial`, each worktree starts from the latest accepted
+  `max_items_per_round` pairs start from the same frozen round base.
+  They run concurrently in separate exclusive Slurm allocations. On a
+  shared local runtime they run one at a time, including smoke tests,
+  so candidates cannot compete for GPUs or port 8000. Both schedules
+  retain the frozen base and integration stage. With `serial`, each
+  worktree starts from the latest accepted
   campaign state. In both modes, approved and rejected terminal items
   consume the shared `max_items_per_round` budget. Retries for one item
   are always sequential:
@@ -156,7 +159,9 @@ round loop:
   The capture is diagnostic, never a measurement (fresh relaunch; the
   verdict comes from the un-profiled run); no capture is made when
   `nsys` is not in `profile.methods`, and a failed capture never flips
-  a verdict.
+  a verdict. An accepted runtime change without a successful matching
+  capture invalidates the current-evidence pointer; older traces remain
+  historical evidence and are not presented as the final accepted state.
 - **qa** — the campaign's **final verification**, run once after the
   round loop (and skipped when no item was accepted): stateless
   fresh-eyes benchmark + sanity completions (+ an accuracy eval iff
@@ -165,7 +170,7 @@ round loop:
   loop decision — the loop is already over.
 - **reporter** — synthesizes `optimization_report.md` + a 1:1
   `optimization_report.html`: verified cumulative improvement, the
-  optimization trajectory (baseline → each accepted item → final
+  optimization trajectory (baseline → each accepted serial item or parallel integration → final
   verification, rendered as a line chart in the HTML),
   expected-vs-measured per applied item, a kernel-level before/after
   comparison from the round profiles and accept-evidence captures,
@@ -236,6 +241,18 @@ An attempt is **APPROVEd** only when all three hold:
    `optimize.target_metric` against the **last accepted** measurement
    (`current_best` in `roadmap.yaml`), so gains accumulate.
 
+The orchestrator checks every APPROVE before committing a candidate,
+in either execution mode. It recomputes the gain against the item's
+frozen reference measurement, checks the reported arithmetic, requires
+finite positive measurements and complete curves, and enforces the
+threshold and regression budget. Integration uses the same measurement
+validation with its combined-candidate threshold. Frozen reference
+measurements also make promotion retries independent of later ledger updates.
+
+Fresh and imported baselines must contain successful benchmark results
+with a finite positive target metric at every configured concurrency
+point. An unusable imported baseline is measured again.
+
 When any axis fails, the evaluator chooses between two negative
 verdicts: **PUSH_BACK** (a concrete, actionable fix exists — the
 optimizer retries with the feedback, bounded by
@@ -287,13 +304,10 @@ Either way the campaign proceeds to the one-shot final verification
 ## What a round costs: profile, re-analyze, or replan
 
 Every round reaches an analyzer turn; the orchestrator invokes the
-profiler first only when fresh captures are needed. Rejected config
-attempts are hard-reverted (`git reset --hard`
-plus the last accepted tuning config), so they leave the runtime the
-standing analysis describes. Code attempts are different: `clean -x` is
-deliberately omitted, so a rebuilt gitignored `.so` or JIT/AOT cache may
-survive the source revert. The orchestrator records that uncertainty and
-profiles rather than pretending the old traces are current.
+profiler first only when fresh captures are needed. Rejected attempts run
+in isolated worktrees and restore their item configuration, leaving the
+campaign source and accepted configuration unchanged. Their worktrees are
+removed after their outcome is durably recorded.
 
 A round selects up to `optimize.max_items_per_round` pending roadmap
 items. Their optimizer/evaluator loops run serially or concurrently
@@ -302,9 +316,7 @@ and measured by the Integrator, while serial candidates are accepted
 directly.
 
 - **Profile and analyze** — round 1 unless evidence is imported; any round
-  opening after an accept; and any round whose reverted code attempt may
-  have changed ignored build
-  output. The profiler captures the current runtime (nsys + ncu per
+  opening after an accept. The profiler captures the current runtime (nsys + ncu per
   `profile.methods`), then the analyzer interprets those captures and
   re-ranks the roadmap. An older checkpoint with no profile-currency
   marker also buys one
@@ -317,8 +329,7 @@ directly.
   follow the normal profiling rules; the option does not make the
   entire optimization campaign offline.
 - **Replan-only round** — opens when the standing profile is known to be
-  current: the predecessor accepted nothing and made no code attempt
-  capable of leaving rebuilt output behind. The analyzer launches no
+  current: the predecessor accepted nothing. The analyzer launches no
   server and runs no profiler; it plans from the standing analysis plus
   the round's evaluator verdicts, marking
   disproven items obsolete, bounding the gains the measurements cap, and
@@ -418,6 +429,12 @@ checkpoint. To resume a campaign already started in re-analysis mode,
 rerun without `--reanalyze`: the checkpoint preserves the choice. Plain
 `--reuse-analysis` on resume is ignored with a warning.
 
+Resumed roles are composed from the saved `workspace/task.yaml`, matching
+the orchestrator's task rather than a changed command-line input file.
+Split-layout analysis imports require a matching completion manifest;
+an interrupted analyzer's partial findings cannot replace an earlier
+completed analysis. Capture-only imports remain available with `--reanalyze`.
+
 A run with `profile.kernel_coverage` validates this round's kernel/model
 ledger after every analyzer turn, including plan-only reuse and replan-only
 rounds. These rounds preserve source measurement provenance while updating
@@ -463,7 +480,7 @@ exactly as in perf-analyze):
 | --- | --- | --- | --- |
 | `optimize.max_rounds` | no | `5` | The number of rounds the loop **runs** (not just a cap — only the two deterministic breaks above end it earlier); each round is an optional profiler turn, one analyzer turn, and up to `max_items_per_round` items, so `max_rounds × max_items_per_round` bounds total items attempted. Only rounds with a stale or unproven runtime profile pay to refresh it (see *What a round costs*), so this bounds items far more tightly than GPU hours. |
 | `optimize.max_items_per_round` | no | `3` | Maximum optimizer/evaluator pairs selected per round. Every pair owns an isolated worktree, tuning copy, progress file, and bounded attempt loop. |
-| `optimize.item_execution` | no | `parallel` | `parallel` fans out all selected pairs from one frozen round base and runs the Integrator. `serial` runs them one at a time from the latest accepted campaign state, accepts each approved candidate directly, and emits no batch lifecycle or Integrator progress events. |
+| `optimize.item_execution` | no | `parallel` | `parallel` evaluates selected pairs from one frozen round base and runs the Integrator; pairs overlap only with isolated Slurm allocations and run one at a time on a shared local runtime. `serial` starts each pair from the latest accepted state and promotes it directly, without an Integrator. |
 | `optimize.max_attempts_per_item` | no | `3` | Total optimizer attempts per item: PUSH_BACK verdicts retry until this bound, then the item is marked `failed` and reverted (an explicit REJECT fails it immediately). |
 | `optimize.approaches` | no | `[config, code]` | Which optimization approaches the run may plan/apply: `config` edits the live tuning YAML, `code` edits the TRT-LLM source. Restrict to `[code]` for a code-only campaign (no knob tuning) or `[config]` to leave the checkout untouched. Enforced in three layers: the analyzer only plans allowed items, the orchestrator never dispatches a disallowed pending item, and any attempt that edits through a disallowed approach (tuning file differs from the accepted snapshot / dirty worktree) is auto-rejected before the evaluator benchmarks it. |
 | `optimize.accept_fraction` | no | `0.5` | Fraction of an item's `expected_gain_pct` the measured gain must reach. |
@@ -502,23 +519,21 @@ running the CLI.
 
 `perf-optimize` **mutates the TRT-LLM checkout** at `trtllm_repo_path`:
 
-- The checkout must be a git repo. Rejected attempts are reverted with
-  `git reset --hard` + `git clean -fd` (without `-x`, so gitignored
-  build artifacts survive) — anything uncommitted and unignored when
-  the run starts is destroyed along with them, so commit or stash
-  changes you care about before running.
+- The checkout must be a clean git repository on startup and resume.
+  Commit or stash uncommitted changes first; the workflow refuses to
+  compare a dirty campaign checkout with candidates created from HEAD.
+  Rejected attempts are reverted in their isolated worktrees with
+  `git reset --hard` + `git clean -fd`.
 - Work happens on a dedicated branch `perf-optimize/<workspace>-<ts>`
-  created from the current HEAD; each accepted item becomes **one
-  commit**; pushed-back and rejected attempts are reverted before the
+  created from the current HEAD. Candidate code is committed before
+  promotion; parallel integration combines those commits. Pushed-back
+  and rejected attempts are reverted before the
   next attempt/item starts. `--clean` never touches the checkout —
   abandoned branches are left for inspection.
-- `approach: code` items only take effect when the checkout is the
-  installed package (editable install). The analyzer/optimizer verify
-  `python -c "import tensorrt_llm; ..."` resolves into the checkout and
-  fall back to config-only optimization when it does not. Note the
-  interaction with `optimize.approaches: [code]`: a non-editable install
-  then leaves the run nothing to do — use an editable install for
-  code-only campaigns.
+- Every serving role, including baseline measurement and final QA,
+  binds the active checkout (or its remote staged copy) to `PYTHONPATH`
+  and verifies the resolved package path inside the execution container.
+  A mismatched installed package is a blocker, not a valid measurement.
 - `optimize.approaches` only restricts what the *loop* may change; the
   task's `extra_llm_api_options` seed still applies as the baseline
   config in every mode.
@@ -755,8 +770,7 @@ running the CLI.
   `internal-glean-search` skill / `internal-glean-specialist` subagent
   as read-only reference, used only if it is installed in the
   session.
-- **Cost.** The profiler runs every round that follows an accept
-  or a potentially build-changing reverted code attempt (nsys plus
+- **Cost.** The profiler runs every round that follows an accept (nsys plus
   the bounded ncu deep dive by default); set `profile.methods: [nsys]`
   to trim it. When the standing runtime profile is still current, the
   next round opens replan-only and pays no GPU time at all — see *What a

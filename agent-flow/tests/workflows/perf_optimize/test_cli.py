@@ -126,3 +126,44 @@ def test_cli_forwards_the_selected_reuse_mode(
     dump_prompts.assert_called_once_with(options["prompts"], workspace / cli.PROMPTS_DIRNAME)
     workflow = constructor.return_value.__enter__.return_value
     workflow.run.assert_called_once_with(str(task))
+
+
+def test_resume_composes_prompts_from_saved_task(tmp_path, monkeypatch):
+    """New CLI arguments cannot change the resumed roles' execution contract."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / STATE_FILENAME).write_text("{}\n", encoding="utf-8")
+    checkpoint = tmp_path / "model"
+    repo = tmp_path / "repo"
+    checkpoint.mkdir()
+    repo.mkdir()
+    saved = {
+        "checkpoint_path": str(checkpoint),
+        "trtllm_repo_path": str(repo),
+        "sol": {"enabled": False},
+        "optimize": {"approaches": ["config"], "max_rounds": 2},
+    }
+    (workspace / "task.yaml").write_text(yaml.safe_dump(saved), encoding="utf-8")
+    constructor = MagicMock()
+    compose = Mock(wraps=cli.build_perf_optimize_prompts)
+    monkeypatch.setattr(cli, "PerfOptimizeWorkflow", constructor)
+    monkeypatch.setattr(cli, "build_perf_optimize_prompts", compose)
+    monkeypatch.setattr(cli, "dump_prompt_bundle", Mock())
+
+    cli.main(
+        [
+            "--task",
+            str(tmp_path / "removed-original.yaml"),
+            "--workspace",
+            str(workspace),
+            "--max-rounds",
+            "99",
+            "--reuse-analysis",
+            str(tmp_path / "removed-source"),
+        ]
+    )
+
+    options = compose.call_args.kwargs
+    assert options["approaches"] == ["config"]
+    assert options["include_sol"] is False
+    assert options["remote_execution"]["optimize"]["max_rounds"] == 2

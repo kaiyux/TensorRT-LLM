@@ -70,6 +70,54 @@ def test_branch_and_head_helpers(repo):
     gitops.checkout(repo, "perf-optimize/test")  # no-op checkout is fine
 
 
+def test_branch_exists_matches_exact_local_branch(repo):
+    assert not gitops.branch_exists(repo, "perf-optimize/campaign")
+    gitops.create_branch(repo, "perf-optimize/campaign/item")
+    assert gitops.branch_exists(repo, "perf-optimize/campaign/item")
+    assert not gitops.branch_exists(repo, "perf-optimize/campaign")
+
+
+def test_create_branch_uses_checkpointed_base(repo):
+    base = gitops.rev_parse_head(repo)
+    (repo / "src.py").write_text("x = 2\n", encoding="utf-8")
+    gitops.commit_all(repo, "later unrelated work")
+
+    gitops.create_branch(repo, "perf-optimize/recovered", base)
+
+    assert gitops.rev_parse_head(repo) == base
+    assert (repo / "src.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_create_worktree_reattaches_surviving_candidate_branch(repo, tmp_path):
+    base = gitops.rev_parse_head(repo)
+    worktree = tmp_path / "candidate"
+    branch = "perf-optimize/candidate"
+    gitops.create_worktree(repo, worktree, branch, base)
+    (worktree / "src.py").write_text("x = 2\n", encoding="utf-8")
+    candidate = gitops.commit_all(worktree, "approved candidate")
+    gitops.remove_worktree(repo, worktree)
+
+    gitops.create_worktree(repo, worktree, branch, base)
+
+    assert gitops.current_branch(worktree) == branch
+    assert gitops.rev_parse_head(worktree) == candidate
+    assert (worktree / "src.py").read_text(encoding="utf-8") == "x = 2\n"
+
+
+def test_create_worktree_does_not_steal_an_existing_dirty_checkout(repo, tmp_path):
+    base = gitops.rev_parse_head(repo)
+    original = tmp_path / "original"
+    branch = "perf-optimize/candidate"
+    gitops.create_worktree(repo, original, branch, base)
+    (original / "src.py").write_text("uncommitted user work\n", encoding="utf-8")
+
+    with pytest.raises(gitops.GitOpsError, match="already checked out"):
+        gitops.create_worktree(repo, tmp_path / "different", branch, base)
+
+    assert (original / "src.py").read_text(encoding="utf-8") == "uncommitted user work\n"
+    assert not (tmp_path / "different").exists()
+
+
 def test_commit_all_stages_everything_but_respects_gitignore(repo):
     base = gitops.rev_parse_head(repo)
     (repo / "src.py").write_text("x = 2\n", encoding="utf-8")

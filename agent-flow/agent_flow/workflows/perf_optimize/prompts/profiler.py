@@ -7,6 +7,8 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     build_server_lifecycle,
 )
 
+from ._common import RUNTIME_CHECKOUT
+
 _PROFILER_WORKFLOW = """\
 You are the **Profiler**: collect trustworthy, reusable evidence for the
 Analyzer. Own server lifecycle, workload replay, nsys/ncu capture,
@@ -158,6 +160,7 @@ def build_profiler_prompt(*, ncu_targeting: str | None = None) -> str:
     return "\n\n".join(
         (
             _PROFILER_WORKFLOW,
+            RUNTIME_CHECKOUT,
             build_server_lifecycle(active_tuning_config=True),
             build_benchmark_flags_reference(_PROFILE_POINT_POLICY),
             knobs,

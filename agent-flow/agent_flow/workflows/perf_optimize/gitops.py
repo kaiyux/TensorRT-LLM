@@ -72,9 +72,18 @@ def rev_parse_head(repo: str | Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def create_branch(repo: str | Path, name: str) -> None:
+def branch_exists(repo: str | Path, name: str) -> bool:
+    """Return whether the exact local branch exists without hiding git failures."""
+    ref = f"refs/heads/{name}"
+    return ref in _git(repo, "for-each-ref", "--format=%(refname)", ref).splitlines()
+
+
+def create_branch(repo: str | Path, name: str, base_commit: str | None = None) -> None:
     """Create and check out ``name`` (fails if it already exists)."""
-    _git(repo, "checkout", "-b", name)
+    args = ["checkout", "-b", name]
+    if base_commit is not None:
+        args.append(base_commit)
+    _git(repo, *args)
 
 
 def checkout(repo: str | Path, name: str) -> None:
@@ -87,10 +96,18 @@ def create_worktree(
     branch: str,
     base_commit: str,
 ) -> None:
-    """Create ``branch`` at ``base_commit`` in a new linked worktree."""
+    """Create a linked worktree, reattaching a surviving branch on resume.
+
+    A process may stop after creating the branch or after removing its
+    worktree. Reusing that branch preserves any candidate/integration commits
+    already made; resetting it to ``base_commit`` would lose accepted work.
+    """
     worktree = Path(path)
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    _git(repo, "worktree", "add", "-b", branch, str(worktree), base_commit)
+    if branch_exists(repo, branch):
+        _git(repo, "worktree", "add", str(worktree), branch)
+    else:
+        _git(repo, "worktree", "add", "-b", branch, str(worktree), base_commit)
 
 
 def remove_worktree(repo: str | Path, path: str | Path) -> None:

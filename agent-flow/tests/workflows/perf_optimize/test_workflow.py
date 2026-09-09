@@ -71,13 +71,13 @@ def _sol_off_extra() -> dict:
 class FakeGitOps:
     """Records git calls; pretends the checkout is a git repo.
 
-    ``worktree_clean`` always returns ``False`` (the accept path sees
-    the optimizer's edits and commits them).
+    The campaign checkout is clean; candidate worktrees contain optimizer edits.
     """
 
     def __init__(self, is_repo: bool = True):
         self.calls: list[tuple] = []
         self.is_repo_flag = is_repo
+        self.branches: set[str] = {"main"}
 
     def is_git_repo(self, repo):
         self.calls.append(("is_git_repo", str(repo)))
@@ -85,7 +85,7 @@ class FakeGitOps:
 
     def worktree_clean(self, repo):
         self.calls.append(("worktree_clean", str(repo)))
-        return str(repo).split("/")[-1] == "integration"
+        return Path(repo).name in ("repo", "integration")
 
     def current_branch(self, repo):
         return "main"
@@ -94,8 +94,12 @@ class FakeGitOps:
         self.calls.append(("rev_parse_head", str(repo)))
         return "b" * 40
 
-    def create_branch(self, repo, name):
+    def branch_exists(self, repo, name):
+        return name in self.branches
+
+    def create_branch(self, repo, name, base_commit=None):
         self.calls.append(("create_branch", name))
+        self.branches.add(name)
 
     def checkout(self, repo, name):
         self.calls.append(("checkout", name))
@@ -242,7 +246,11 @@ def _stub_agents(
         # A real benchmarker always leaves the result JSON its numbers came
         # from; the orchestrator gates on it, because a report can exist and
         # still carry no measurement.
-        _write_baseline_result_json(workflow.baseline_dir)
+        if workflow._curve_mode():
+            for point in workflow._curve_points():
+                _write_baseline_result_json(workflow.baseline_dir / f"concurrency_{point}")
+        else:
+            _write_baseline_result_json(workflow.baseline_dir)
         _append({"step": 1, "agent": "benchmarker", "summary": "b"})
 
     def projector(state):
@@ -550,7 +558,7 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
 @pytest.mark.parametrize(
     ("verdict_overrides", "error"),
     [
-        ({"measured_gain_pct": 0.1}, "below required"),
+        ({"measured_gain_pct": 0.1, "measured_value": 100.1}, "below required"),
         ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
         ({"included_item_ids": []}, "included no candidates"),
         ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
@@ -658,7 +666,7 @@ def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
     trace = _stub_agents(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
-        evaluator_verdicts=[("APPROVE", "none", 8.4, 108.4), ("APPROVE", "none", 4.0, 112.7)],
+        evaluator_verdicts=[("APPROVE", "none", 8.4, 108.4), ("APPROVE", "none", 4.0, 112.736)],
     )
     try:
         workflow.run(str(task))
@@ -1014,7 +1022,7 @@ def test_fixed_rounds_run_until_roadmap_exhausted(tmp_path, fake_git):
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
         evaluator_verdicts=[
             ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 111.6),
+            ("APPROVE", "none", 3.0, 111.652),
         ],
     )
     try:
@@ -1047,7 +1055,7 @@ def test_fixed_rounds_run_until_roadmap_exhausted(tmp_path, fake_git):
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
     assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
-    assert roadmap["current_best"]["value"] == pytest.approx(111.6)
+    assert roadmap["current_best"]["value"] == pytest.approx(111.652)
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.round_index == 3
     assert state.done is True
@@ -1319,7 +1327,7 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
         evaluator_verdicts=[
             ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 111.6),
+            ("APPROVE", "none", 3.0, 103.0),
         ],
     )
     try:
@@ -1341,7 +1349,7 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
     assert sorted([one["measured_gain_pct"], two["measured_gain_pct"]]) == [3.0, 8.4]
     assert two["status"] == "accepted"
     # The Integrator reports the combined state once for the whole batch.
-    assert roadmap["current_best"]["value"] in (108.4, 111.6)
+    assert roadmap["current_best"]["value"] in (108.4, 103.0)
     assert roadmap["current_best"]["source"] == "rounds/round_1/integration/integration.md"
     # Per-item artifact dirs and one accept commit per item, in order.
     round_dir = ws / "rounds" / "round_1"
@@ -1378,7 +1386,7 @@ def test_serial_items_reuse_worker_and_accept_directly(tmp_path, fake_git):
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
         evaluator_verdicts=[
             ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 111.6),
+            ("APPROVE", "none", 3.0, 111.652),
         ],
     )
     try:
@@ -1405,7 +1413,7 @@ def test_serial_items_reuse_worker_and_accept_directly(tmp_path, fake_git):
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
     assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
-    assert roadmap["current_best"]["value"] == pytest.approx(111.6)
+    assert roadmap["current_best"]["value"] == pytest.approx(111.652)
     assert roadmap["current_best"]["source"] == (
         "rounds/round_1/item_2_opt-002/attempt_1/evaluation.md"
     )
@@ -1635,7 +1643,7 @@ def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
         evaluator_verdicts=[
             ("PUSH_BACK", "perf_shortfall", 0.2, 100.2),  # opt-001 attempt 1
             ("APPROVE", "none", 8.4, 108.4),  # opt-001 attempt 2
-            ("APPROVE", "none", 3.0, 111.6),  # opt-002 attempt 1
+            ("APPROVE", "none", 3.0, 103.0),  # opt-002 attempt 1
         ],
     )
     resets: list[int] = []
@@ -1994,7 +2002,7 @@ def test_curve_mode_accept_records_current_best_curve(tmp_path, fake_git):
     ]
     _stub_agents(
         workflow,
-        evaluator_verdicts=[("APPROVE", "none", 5.5, 105.15)],
+        evaluator_verdicts=[("APPROVE", "none", 5.09595959595959, 105.15)],
         baseline_curve=_WF_CURVE,
         evaluator_curve=measured,
     )
@@ -2083,7 +2091,7 @@ def test_target_improvement_scores_focus_subset_only(tmp_path, fake_git):
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(
         workflow,
-        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        analyzer_items=[[_item("opt-001", gain=4.0), _item("opt-002", gain=3.0)]],
         evaluator_verdicts=[
             ("APPROVE", "none", 2.0, 112.2),
             ("APPROVE", "none", 2.0, 112.2),
@@ -2204,6 +2212,7 @@ def test_latest_evaluator_curve_returns_none_on_malformed_entries(tmp_path, fake
 
 def test_resume_mid_round_starts_at_evaluator(tmp_path, monkeypatch):
     fake = FakeGitOps()  # accept path commits
+    fake.branches.add("perf-optimize/seeded")
     monkeypatch.setattr(workflow_module, "gitops", fake)
 
     ws = tmp_path / "ws"
@@ -2283,7 +2292,7 @@ def test_resume_mid_round_starts_at_evaluator(tmp_path, monkeypatch):
         # The resumed roadmap already carries opt-001, and the closing
         # re-profile of the build the accept changed plans nothing new.
         analyzer_items=[[]],
-        evaluator_verdicts=[("APPROVE", "none", 4.0, 112.7)],
+        evaluator_verdicts=[("APPROVE", "none", 4.0, 112.736)],
     )
     try:
         workflow.run("ignored-on-resume")
@@ -2302,7 +2311,7 @@ def test_resume_mid_round_starts_at_evaluator(tmp_path, monkeypatch):
     item = roadmap_schema.find_item(roadmap, "opt-002")
     assert item["status"] == "accepted"
     assert item["attempts"] == 2
-    assert roadmap["current_best"]["value"] == pytest.approx(112.7)
+    assert roadmap["current_best"]["value"] == pytest.approx(112.736)
 
 
 def test_resume_redispatch_purges_stale_attempt_benchmark_results(tmp_path, monkeypatch):
@@ -2313,6 +2322,7 @@ def test_resume_redispatch_purges_stale_attempt_benchmark_results(tmp_path, monk
     as fresh measurements.
     """
     fake = FakeGitOps()
+    fake.branches.add("perf-optimize/seeded")
     monkeypatch.setattr(workflow_module, "gitops", fake)
 
     ws = tmp_path / "ws"
@@ -2400,7 +2410,7 @@ def test_resume_redispatch_purges_stale_attempt_benchmark_results(tmp_path, monk
         # The resumed roadmap already carries opt-001, and the closing
         # re-profile of the build the accept changed plans nothing new.
         analyzer_items=[[]],
-        evaluator_verdicts=[("APPROVE", "none", 4.0, 112.7)],
+        evaluator_verdicts=[("APPROVE", "none", 4.0, 112.736)],
     )
     try:
         workflow.run("ignored-on-resume")
@@ -2667,10 +2677,9 @@ def test_accept_records_last_nsys_dir_from_captures(tmp_path, fake_git):
     assert trace[-1] == "reporter"
     # The evaluator judged with the profiler's round capture as reference…
     assert seen_at_evaluation_time == [str(ws / "rounds" / "round_1" / "profile")]
-    # Item-local captures are candidates only. The closing profiler sees the
-    # last accepted campaign capture, then records round 2 as the freshest.
-    round_1_profile = ws / "rounds" / "round_1" / "profile"
-    assert seen_at_capture_time == ["", str(round_1_profile)]
+    # Item-local captures describe candidates. With no integrated capture,
+    # acceptance clears the old runtime's pointer until round 2 captures it.
+    assert seen_at_capture_time == ["", ""]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     expected = ws / "rounds" / "round_2" / "profile"
     assert state.last_nsys_dir == str(expected)
@@ -3825,6 +3834,7 @@ def test_kernel_coverage_below_target_blocks_advance(tmp_path, fake_git):
         data = yaml.safe_load(_ledger_yaml())
         data["coverage"]["enumerated_share_pct"] = 80.0
         data["coverage"]["other_share_pct"] = 20.0
+        data["kernels"][0]["share_pct"] = 80.0
         (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
             yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
         )
@@ -4012,7 +4022,7 @@ def test_item_budget_reprofiles_remaining_items(tmp_path, fake_git):
             ("REJECT", "perf_shortfall", -0.4, 99.6),
             ("REJECT", "perf_shortfall", -0.2, 99.8),
             ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 111.6),
+            ("APPROVE", "none", 3.0, 111.652),
         ],
     )
     try:
@@ -4056,7 +4066,7 @@ def test_max_items_per_round_one_reprofiles_each_item(tmp_path, fake_git):
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
         evaluator_verdicts=[
             ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 111.6),
+            ("APPROVE", "none", 3.0, 111.652),
         ],
     )
     try:
@@ -4095,7 +4105,9 @@ def _analyze_workspace(root: Path, *, baseline: bool = True, findings: bool = Tr
     root.mkdir(parents=True, exist_ok=True)
     if baseline:
         (root / "benchmark_results.md").write_text("# baseline\n", encoding="utf-8")
-        (root / "bench_result.json").write_text("{}\n", encoding="utf-8")
+        (root / "bench_result.json").write_text(
+            json.dumps({"output_throughput": 100.0, "completed": 1}), encoding="utf-8"
+        )
     if findings:
         (root / "profile_findings.md").write_text("# findings\n", encoding="utf-8")
         (root / "nsys_stats.txt").write_text("kern_sum\n", encoding="utf-8")
@@ -4732,6 +4744,7 @@ def _workflow_with_baseline(tmp_path, results: dict | None, *, metric="output_th
     wf.baseline_dir = baseline
     wf.baseline_results_path = baseline / "benchmark_results.md"
     wf._optimize_block = lambda: {"target_metric": metric}
+    wf._curve_mode = lambda: False
     return wf
 
 
@@ -4754,7 +4767,7 @@ def test_baseline_gate_rejects_a_result_json_without_the_target_metric(tmp_path)
 
 
 def test_baseline_gate_ignores_unreadable_json(tmp_path):
-    wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0})
+    wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0, "completed": 1})
     (wf.baseline_dir / "junk.json").write_text("\x00not json\x00", encoding="utf-8")
     wf._require_baseline_measurement()  # the good one still counts
 
@@ -5143,3 +5156,148 @@ def test_default_driving_prompts_omit_the_performance_model_contract(tmp_path):
     prompts = _capture_driving_prompts(tmp_path)
     assert "kernel_ledger.yaml" not in prompts["analyzer"]
     assert "Theoretical model vs silicon" not in prompts["reporter"]
+
+
+@pytest.mark.parametrize("mode", ["serial", "parallel"])
+@pytest.mark.parametrize(
+    ("gain", "value", "error"),
+    [
+        (-10.0, 90.0, "below required"),
+        (4.0, 104.0, "below required"),
+        (20.0, 106.0, "measured_gain_pct mismatch"),
+        (float("nan"), 108.4, "finite"),
+        (8.4, float("inf"), "finite"),
+    ],
+)
+def test_evaluator_cannot_approve_invalid_measurement(tmp_path, fake_git, mode, gain, value, error):
+    task = _write_task(tmp_path, {"optimize": {"item_execution": mode}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    _stub_agents(workflow, evaluator_verdicts=[("APPROVE", "none", gain, value)])
+    try:
+        with pytest.raises(RuntimeError, match=error):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert fake_git.count("commit_all") == 0
+    assert fake_git.count("fast_forward") == 0
+    assert roadmap_schema.load_roadmap(workflow.roadmap_path)["current_best"]["value"] == 100.0
+
+
+def test_invalid_cached_integrator_verdict_is_correctable_on_resume(tmp_path, fake_git):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    workspace = tmp_path / "ws"
+    workflow = Workflow(workspace=workspace)
+    _stub_agents(workflow)
+    valid_integrator = workflow.integrator
+
+    def invalid_integrator(prompt):
+        valid_integrator(prompt)
+        progress = progress_module.read_progress(workflow.progress_path)
+        progress["optimization"][-1]["required_gain_pct"] = 0.0
+        progress_module.write_progress(workflow.progress_path, progress)
+
+    workflow.integrator = invalid_integrator
+    try:
+        with pytest.raises(RuntimeError, match="required_gain_pct mismatch"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert fake_git.count("fast_forward") == 0
+
+    resumed = Workflow(workspace=workspace)
+    _stub_agents(resumed, analyzer_items=[[]])
+    integrator = resumed.integrator
+    prompts = []
+
+    def corrected_integrator(prompt):
+        prompts.append(prompt)
+        integrator(prompt)
+
+    resumed.integrator = corrected_integrator
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert len(prompts) == 1
+    assert "previous verdict failed deterministic validation" in prompts[0]
+    assert "Frozen reference measurement:" in prompts[0]
+    assert fake_git.count("fast_forward") == 1
+    assert roadmap_schema.load_roadmap(resumed.roadmap_path)["current_best"]["value"] == 108.4
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        {"output_throughput": None, "completed": 1},
+        {"output_throughput": "not measured", "completed": 1},
+        {"output_throughput": float("nan"), "completed": 1},
+        {"output_throughput": float("inf"), "completed": 1},
+        {"output_throughput": 0.0, "completed": 0},
+        {"output_throughput": 100.0, "completed": 0},
+        {"output_throughput": 100.0},
+    ],
+)
+def test_baseline_gate_rejects_invalid_or_unsuccessful_results(tmp_path, results):
+    workflow = _workflow_with_baseline(tmp_path, results)
+    with pytest.raises(RuntimeError, match="no measurement"):
+        workflow._require_baseline_measurement()
+
+
+def test_baseline_curve_requires_successful_result_for_every_point(tmp_path):
+    workflow = _workflow_with_baseline(tmp_path, {"output_throughput": 100.0, "completed": 1})
+    workflow._curve_mode = lambda: True
+    workflow._curve_points = lambda: [8, 32]
+    with pytest.raises(RuntimeError, match=r"Missing concurrency points: \[8\]"):
+        workflow._require_baseline_measurement()
+    _write_baseline_result_json(workflow.baseline_dir / "bench" / "concurrency_8")
+    workflow._require_baseline_measurement()
+
+
+def test_reuse_invalid_baseline_measures_fresh_baseline(tmp_path, fake_git):
+    source = _analyze_workspace(tmp_path / "prior")
+    (source / "bench_result.json").write_text(
+        json.dumps({"output_throughput": None, "completed": 0}), encoding="utf-8"
+    )
+    task = _write_task(tmp_path)
+    workflow = Workflow(workspace=tmp_path / "ws", reuse_analysis=source)
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[0] == "benchmarker"
+    workflow._require_baseline_measurement()
+
+
+@pytest.mark.parametrize("role", ["evaluator", "integrator"])
+def test_unsorted_accepted_curve_cannot_reach_promotion(tmp_path, fake_git, role):
+    task = _write_task(tmp_path, {"benchmark": {"concurrency": [8, 32]}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    measured = [
+        {"concurrency": 8, "value": 99.0, "tok_s_user": 22.0, "tok_s_gpu": 99.0},
+        {"concurrency": 32, "value": 121.0, "tok_s_user": 13.2, "tok_s_gpu": 121.0},
+    ]
+    _stub_agents(
+        workflow,
+        baseline_curve=_WF_CURVE,
+        evaluator_curve=list(reversed(measured)) if role == "evaluator" else measured,
+        evaluator_verdicts=[("APPROVE", "none", 10.0, 110.0)],
+    )
+    if role == "integrator":
+        integrator = workflow.integrator
+
+        def unsorted_integrator(prompt):
+            integrator(prompt)
+            data = progress_module.read_progress(workflow.progress_path)
+            data["optimization"][-1]["curve"].reverse()
+            progress_module.write_progress(workflow.progress_path, data)
+
+        workflow.integrator = unsorted_integrator
+    try:
+        with pytest.raises(RuntimeError, match="ascending"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert fake_git.count("fast_forward") == 0
+    assert fake_git.count("commit_all") == (1 if role == "integrator" else 0)
+    assert roadmap_schema.load_roadmap(workflow.roadmap_path)["current_best"]["value"] == 100.0
