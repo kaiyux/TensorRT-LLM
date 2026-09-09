@@ -988,7 +988,7 @@ class TestClaudeBackend:
 
 
 class TestClaudeBackendCreateClient:
-    async def _capture_options(self, monkeypatch, **kwargs):
+    async def _capture_options(self, monkeypatch, system_prompt="hi", **kwargs):
         # Stand-in for ``ClaudeSDKClient`` that just records the options
         # ``create_client`` would have launched the real SDK with.
 
@@ -997,6 +997,14 @@ class TestClaudeBackendCreateClient:
         class FakeSdkClient:
             def __init__(self, options):
                 captured["options"] = options
+                # The real CLI reads --append-system-prompt-file while it
+                # starts up, so read it here too: that is the moment the
+                # file has to exist, and capturing the body now is what
+                # lets a test assert on it after the temp dir is gone.
+                path = options.extra_args.get("append-system-prompt-file")
+                if path is not None:
+                    captured["append_file"] = path
+                    captured["append_file_body"] = Path(path).read_text(encoding="utf-8")
 
             async def __aenter__(self):
                 return self
@@ -1010,8 +1018,11 @@ class TestClaudeBackendCreateClient:
         monkeypatch.setattr(cc_mod, "create_sdk_mcp_server", lambda **_: object())
 
         backend = ClaudeCodeBackend()
-        async with backend.create_client(system_prompt="hi", model="claude-test", **kwargs):
+        async with backend.create_client(
+            system_prompt=system_prompt, model="claude-test", **kwargs
+        ):
             pass
+        self._captured = captured
         return captured["options"]
 
     async def test_create_client_disables_bash_sandbox(self, monkeypatch):
@@ -1089,6 +1100,158 @@ class TestClaudeBackendCreateClient:
                 extra_mcp_servers={"agent-tools": {"type": "http", "url": "x"}},
             ):
                 pass
+
+
+class TestClaudeBackendSystemPromptTransport:
+    """How a stage system prompt reaches the CLI as it grows.
+
+    A single argv entry is capped at MAX_ARG_STRLEN (131072 bytes
+    including the NUL) -- a much smaller and separate limit from
+    ARG_MAX. The SDK's typed ``append`` field rides one such entry, so
+    past the cap execve fails with E2BIG and the SDK reports only
+    ``OSError: [Errno 7] Argument list too long``. Oversized prompts
+    therefore travel by file instead.
+    """
+
+    async def _capture(self, monkeypatch, system_prompt, **kwargs):
+        helper = TestClaudeBackendCreateClient()
+        options = await helper._capture_options(monkeypatch, system_prompt=system_prompt, **kwargs)
+        return options, helper._captured
+
+    def _allow_file_flag(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_cli_supports_append_system_prompt_file", lambda: True)
+
+    async def test_ordinary_prompt_rides_the_typed_append_field(self, monkeypatch):
+        # The common case must keep using the option the SDK actually
+        # models, not the escape hatch.
+        options, captured = await self._capture(monkeypatch, "stage instructions")
+        assert options.system_prompt["append"] == "stage instructions"
+        assert options.system_prompt["preset"] == "claude_code"
+        assert "append-system-prompt-file" not in options.extra_args
+        assert "append_file" not in captured
+
+    async def test_prompt_exactly_at_the_threshold_stays_inline(self, monkeypatch):
+        # Guards the boundary in both directions: the last inline size...
+        options, _ = await self._capture(monkeypatch, "P" * cc_mod._APPEND_ARGV_LIMIT)
+        assert "append" in options.system_prompt
+        assert "append-system-prompt-file" not in options.extra_args
+
+    async def test_prompt_one_byte_over_the_threshold_diverts(self, monkeypatch):
+        # ...and the first size that must not be.
+        self._allow_file_flag(monkeypatch)
+        options, _ = await self._capture(monkeypatch, "P" * (cc_mod._APPEND_ARGV_LIMIT + 1))
+        assert "append-system-prompt-file" in options.extra_args
+
+    async def test_inline_threshold_stays_under_the_kernel_cap(self):
+        # The inline path is only safe while the threshold leaves room
+        # under MAX_ARG_STRLEN, whose usable payload is one byte less
+        # than the constant (the terminating NUL takes the last byte).
+        assert cc_mod._APPEND_ARGV_LIMIT < cc_mod._MAX_ARG_STRLEN - 1
+
+    async def test_oversized_prompt_travels_by_file_not_argv(self, monkeypatch):
+        self._allow_file_flag(monkeypatch)
+        prompt = "P" * (cc_mod._MAX_ARG_STRLEN * 2)
+        options, captured = await self._capture(monkeypatch, prompt)
+
+        # Nothing is left on the argv path: omitting ``append`` is what
+        # makes the SDK emit no system-prompt flag at all, which leaves
+        # the CLI on its default preset -- the base the file appends to.
+        assert "append" not in options.system_prompt
+        assert options.system_prompt["preset"] == "claude_code"
+        # The file carries the prompt verbatim, and it is readable at
+        # the moment the client starts.
+        assert options.extra_args["append-system-prompt-file"] == captured["append_file"]
+        assert captured["append_file_body"] == prompt
+
+    async def test_oversize_is_measured_in_bytes_not_characters(self, monkeypatch):
+        # execve counts bytes. A prompt of multi-byte characters can sit
+        # well under the cap by ``len()`` and still overrun it, so the
+        # check must encode first.
+        self._allow_file_flag(monkeypatch)
+        prompt = "\u4e00" * (cc_mod._APPEND_ARGV_LIMIT // 2)  # 3 bytes each
+        assert len(prompt) < cc_mod._APPEND_ARGV_LIMIT < len(prompt.encode("utf-8"))
+        options, _ = await self._capture(monkeypatch, prompt)
+        assert "append-system-prompt-file" in options.extra_args
+
+    async def test_prompt_file_is_cleaned_up_when_the_client_closes(self, monkeypatch):
+        self._allow_file_flag(monkeypatch)
+        _, captured = await self._capture(monkeypatch, "P" * (cc_mod._MAX_ARG_STRLEN * 2))
+        # The body was readable during the session (asserted above); the
+        # file must not outlive it.
+        assert not Path(captured["append_file"]).exists()
+        assert not Path(captured["append_file"]).parent.exists()
+
+    async def test_oversized_prompt_fails_loudly_when_the_cli_lacks_the_flag(self, monkeypatch):
+        # There is no fallback at this size -- argv cannot carry the
+        # prompt -- so this must be an explicit error naming the size and
+        # the cap, never a silent truncation.
+        monkeypatch.setattr(cc_mod, "_cli_supports_append_system_prompt_file", lambda: False)
+        backend = ClaudeCodeBackend()
+        prompt = "P" * (cc_mod._MAX_ARG_STRLEN * 2)
+        with pytest.raises(RuntimeError, match="append-system-prompt-file"):
+            async with backend.create_client(system_prompt=prompt, model="claude-test"):
+                pass
+
+
+class TestClaudeAppendFileProbe:
+    """Support for the hidden ``--append-system-prompt-file`` flag.
+
+    The CLI registers it with ``hideHelp()``, so it never appears in
+    ``--help`` and support has to be probed by running the binary.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_APPEND_FILE_SUPPORT_CACHE", None)
+
+    def _fake_cli(self, monkeypatch, stdout="", stderr="", returncode=1):
+        monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/fake/claude")
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        monkeypatch.setattr(cc_mod.subprocess, "run", fake_run)
+        return calls
+
+    def test_unknown_option_means_unsupported(self, monkeypatch):
+        self._fake_cli(monkeypatch, stderr="error: unknown option '--append-system-prompt-file'")
+        assert cc_mod._cli_supports_append_system_prompt_file() is False
+
+    def test_missing_file_complaint_means_supported(self, monkeypatch):
+        # The CLI got far enough to look for the file, so it parsed the
+        # flag -- which is the only thing the probe needs to learn.
+        self._fake_cli(monkeypatch, stderr="Error: Append system prompt file not found: /tmp/x")
+        assert cc_mod._cli_supports_append_system_prompt_file() is True
+
+    def test_probe_points_the_flag_at_a_path_that_does_not_exist(self, monkeypatch):
+        # Probing must not contact the API. Naming a nonexistent file is
+        # what makes the CLI bail during option parsing.
+        calls = self._fake_cli(monkeypatch, stderr="not found")
+        cc_mod._cli_supports_append_system_prompt_file()
+        cmd = calls[0]
+        assert "--append-system-prompt-file" in cmd
+        assert not Path(cmd[cmd.index("--append-system-prompt-file") + 1]).exists()
+
+    def test_missing_cli_is_unsupported(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: None)
+        assert cc_mod._cli_supports_append_system_prompt_file() is False
+
+    def test_probe_failure_is_unsupported(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/fake/claude")
+
+        def boom(cmd, **kwargs):
+            raise OSError("no such binary")
+
+        monkeypatch.setattr(cc_mod.subprocess, "run", boom)
+        assert cc_mod._cli_supports_append_system_prompt_file() is False
+
+    def test_answer_is_cached_across_calls(self, monkeypatch):
+        calls = self._fake_cli(monkeypatch, stderr="not found")
+        assert cc_mod._cli_supports_append_system_prompt_file() is True
+        assert cc_mod._cli_supports_append_system_prompt_file() is True
+        assert len(calls) == 1
 
 
 class TestCodexBackend:

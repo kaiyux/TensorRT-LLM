@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from contextlib import asynccontextmanager
+import tempfile
+from contextlib import ExitStack, asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -417,6 +418,72 @@ def _claude_backend_version() -> str:
     return _VERSION_CACHE
 
 
+# A single argv entry is capped at MAX_ARG_STRLEN -- 32 pages, 131072
+# bytes including the terminating NUL. That is a much smaller and
+# entirely separate limit from ARG_MAX (the ~2 MB ceiling on the whole
+# argument vector), and nothing guards it: the SDK hands a preset's
+# ``append`` text to the CLI as one such entry
+# (``--append-system-prompt <text>``), so a system prompt past the cap
+# makes execve fail with E2BIG. It surfaces as a ``CLIConnectionError``
+# wrapping ``OSError: [Errno 7] Argument list too long``, which names
+# neither the prompt nor its size, and it fires at connect time -- for a
+# long-running workflow, potentially hours into a run.
+_MAX_ARG_STRLEN = 131072
+
+# Switch to the file transport a page short of the cap rather than on
+# it. The usable payload is MAX_ARG_STRLEN - 1, and sitting on the
+# boundary would make the difference between a working stage and a dead
+# one a single character of prompt wording.
+_APPEND_ARGV_LIMIT = _MAX_ARG_STRLEN - 4096
+
+_APPEND_FILE_SUPPORT_CACHE: bool | None = None
+
+
+def _cli_supports_append_system_prompt_file() -> bool:
+    """Whether the installed CLI accepts ``--append-system-prompt-file``.
+
+    That flag takes the same text as ``--append-system-prompt`` and has
+    the same append-onto-the-preset semantics, but reads it from a file
+    instead of an argv entry, which is what lifts the MAX_ARG_STRLEN
+    cap. The CLI registers it with ``hideHelp()``, so it is absent from
+    ``--help`` and support has to be probed.
+
+    Pointing the flag at a path that does not exist is enough to tell:
+    a CLI that knows the flag rejects the missing file, one that does
+    not rejects the flag itself. Both exit non-zero during option
+    parsing, before any request is made, so the probe is offline and
+    fast. The answer is cached for the life of the process.
+    """
+    global _APPEND_FILE_SUPPORT_CACHE
+    if _APPEND_FILE_SUPPORT_CACHE is not None:
+        return _APPEND_FILE_SUPPORT_CACHE
+
+    supported = False
+    cli_path = _find_claude_cli()
+    if cli_path is not None:
+        with tempfile.TemporaryDirectory(prefix="agent-flow-cli-probe-") as probe_dir:
+            missing = str(Path(probe_dir) / "absent.txt")
+            try:
+                out = subprocess.run(
+                    [cli_path, "--append-system-prompt-file", missing, "-p", "probe"],
+                    capture_output=True,
+                    text=True,
+                    timeout=_CLI_VERSION_TIMEOUT_S,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError):
+                out = None
+            if out is not None:
+                # Commander's rejection of an option it has never heard
+                # of is the only negative answer; anything else (the
+                # expected missing-file complaint, or an unrelated
+                # startup failure) means the flag itself parsed.
+                supported = "unknown option" not in (out.stderr + out.stdout)
+
+    _APPEND_FILE_SUPPORT_CACHE = supported
+    return supported
+
+
 _REASONING_EFFORT = "max"
 
 
@@ -459,23 +526,56 @@ class ClaudeCodeBackend(Backend):
         async def _approve_tool(tool_name, tool_input, context):
             return PermissionResultAllow()
 
-        options = ClaudeAgentOptions(
-            tools=ToolsPreset(type="preset", preset="claude_code"),
-            system_prompt=SystemPromptPreset(
-                type="preset",
-                preset="claude_code",
-                append=system_prompt,
-            ),
-            mcp_servers=mcp_servers,
-            model=model,
-            effort=_REASONING_EFFORT,
-            cwd=cwd or Path.cwd(),
-            sandbox={"enabled": False},
-            permission_mode="bypassPermissions",
-            can_use_tool=_approve_tool,
-            hooks=hooks,
-            disallowed_tools=list(disallowed_tools or []),
-        )
+        # The typed ``append`` field is the path every ordinary prompt
+        # takes. Only a prompt too large to survive execve is diverted
+        # to the file transport, so the common case keeps using the
+        # option the SDK actually models -- and the divert is a hard
+        # error rather than a silent truncation when the CLI is too old
+        # to have the flag, because at that size there is no other way
+        # to deliver the prompt.
+        prompt_preset: SystemPromptPreset = {
+            "type": "preset",
+            "preset": "claude_code",
+        }
+        extra_args: dict[str, str | None] = {}
 
-        async with ClaudeSDKClient(options=options) as sdk_client:
-            yield ClaudeCodeClient(sdk_client)
+        with ExitStack() as cleanup:
+            prompt_bytes = len(system_prompt.encode("utf-8"))
+            if prompt_bytes <= _APPEND_ARGV_LIMIT:
+                prompt_preset["append"] = system_prompt
+            elif not _cli_supports_append_system_prompt_file():
+                raise RuntimeError(
+                    f"system prompt is {prompt_bytes} bytes, over the "
+                    f"{_MAX_ARG_STRLEN}-byte MAX_ARG_STRLEN cap on a single "
+                    "argv entry, and the installed claude CLI does not accept "
+                    "--append-system-prompt-file. Upgrade the CLI, or shorten "
+                    "the prompt to fit."
+                )
+            else:
+                prompt_dir = cleanup.enter_context(
+                    tempfile.TemporaryDirectory(prefix="agent-flow-system-prompt-")
+                )
+                prompt_file = Path(prompt_dir) / "append_system_prompt.txt"
+                prompt_file.write_text(system_prompt, encoding="utf-8")
+                # Omitting ``append`` makes the SDK emit no system-prompt
+                # flag at all, which leaves the CLI on its default preset
+                # -- exactly the base this file is then appended to.
+                extra_args["append-system-prompt-file"] = str(prompt_file)
+
+            options = ClaudeAgentOptions(
+                tools=ToolsPreset(type="preset", preset="claude_code"),
+                system_prompt=prompt_preset,
+                extra_args=extra_args,
+                mcp_servers=mcp_servers,
+                model=model,
+                effort=_REASONING_EFFORT,
+                cwd=cwd or Path.cwd(),
+                sandbox={"enabled": False},
+                permission_mode="bypassPermissions",
+                can_use_tool=_approve_tool,
+                hooks=hooks,
+                disallowed_tools=list(disallowed_tools or []),
+            )
+
+            async with ClaudeSDKClient(options=options) as sdk_client:
+                yield ClaudeCodeClient(sdk_client)
