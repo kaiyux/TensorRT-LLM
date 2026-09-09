@@ -39,7 +39,7 @@ alone, since a reverted code attempt may leave rebuilt ignored output.
    artifacts. Write a short replan note naming the source analysis, failed
    items and verdicts, and resulting roadmap changes; the full findings
    structure applies only to full analysis, including re-analysis.
-3. Write findings and the applicable ledgers, then author the roadmap in
+3. Write findings and the applicable kernel/model ledger, then author the roadmap in
    round 1 or update it in place in later rounds under the roadmap
    contract. Evidence may justify new items, revised pending items, or
    marking pending items obsolete. Never pad the roadmap: no actionable
@@ -74,7 +74,7 @@ alone, since a reverted code attempt may leave rebuilt ignored output.
   for ledger validation. Identify every point and source report from the
   manifest; do not infer a new capture policy from the current task.
 - `sol_work/peaks.json` is campaign-level; the SOL correlation contract
-  defines permitted updates. Optional ledgers have their own contracts.
+  defines permitted updates. The unified kernel/model ledger has its own contract.
 - Record `progress.yaml` only through `append_analyzer_progress`.
 
 ## Evidence and expected gains

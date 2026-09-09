@@ -127,21 +127,8 @@ _PROFILE_POINT_POLICY = """\
   refers to the same steady-state load.
 """
 
-_HEADROOM_POINT_POLICY = """\
-- **Effective profiling point policy:** with `profile.headroom_ledger`,
-  profile the **lowest and highest scored concurrency points**: use
-  `optimize.focus_concurrencies` when set, otherwise `benchmark.concurrency`.
-  Deduplicate identical endpoints; scalar mode has one point. These are
-  profiling replays, not a full scored curve sweep. Capture each point
-  separately with a fresh server and its paired `num_prompts`, isolating
-  artifacts under `concurrency_<c>`. Name every point's artifacts in the
-  manifest; the Analyzer derives the highest point's root-level outputs.
-"""
 
-
-def build_profiler_prompt(
-    *, ncu_targeting: str | None = None, headroom_ledger: bool = False
-) -> str:
+def build_profiler_prompt(*, ncu_targeting: str | None = None) -> str:
     """Compose shared capture recipes with one effective targeting policy."""
     capture = build_profiling_runs_reference(
         ncu_targeting,
@@ -168,12 +155,11 @@ def build_profiler_prompt(
     ).replace("findings contract", "capture manifest contract")
     capture = capture.replace("nsys_analysis", "capture_preprocessing")
     knobs = PROFILING_KNOB_VERIFICATION.replace("profile_findings.md", "profile_manifest.json")
-    point_policy = _HEADROOM_POINT_POLICY if headroom_ledger else _PROFILE_POINT_POLICY
     return "\n\n".join(
         (
             _PROFILER_WORKFLOW,
             build_server_lifecycle(active_tuning_config=True),
-            build_benchmark_flags_reference(point_policy),
+            build_benchmark_flags_reference(_PROFILE_POINT_POLICY),
             knobs,
             capture,
         )

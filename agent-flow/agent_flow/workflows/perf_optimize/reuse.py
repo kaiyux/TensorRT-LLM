@@ -19,8 +19,9 @@ Both workflow layouts and legacy combined analysis directories are supported::
     (none)                  roadmap.yaml
 
 The baseline and SOL projection retain their independent import behavior.
-A source roadmap is reference material in ``reused_analysis/``; its campaign
-state is never imported as the new campaign's live roadmap.
+A source roadmap and kernel ledger are reference material in
+``reused_analysis/``. The analyzer authors the new campaign's live roadmap,
+kernel ledger, and model revision history.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ KERNEL_LEDGER_NAME = "kernel_ledger.yaml"
 REUSE_DIRNAME = "reused_analysis"
 MANIFEST_NAME = "manifest.md"
 PRIOR_ROADMAP_NAME = "prior_roadmap.yaml"
+PRIOR_KERNEL_LEDGER_NAME = "kernel_ledger.yaml"
 PRIOR_ANALYSIS_DIRNAME = "prior_analysis"
 
 # Sibling artifacts copied alongside the baseline report: the result
@@ -69,7 +71,6 @@ _ANALYSIS_FILE_GLOBS = (
     "*ncu*.txt",
     "*ncu*.csv",
     "*ncu*.md",
-    KERNEL_LEDGER_NAME,
     "regions.json",
     "sol.json",
 )
@@ -221,6 +222,61 @@ def latest_round_findings(source: Path) -> Path | None:
     return max(profiled or candidates)[1]
 
 
+def _profile_for_ledger(source: Path, ledger: Path) -> Path | None:
+    """Resolve a ledger's capture without inferring it from round order.
+
+    An analysis manifest is authoritative. Replan ledgers without one can
+    name the standing profile's analysis artifacts in ``source``; follow
+    that existing path within the source workspace to its capture. A
+    source that is prose or unavailable cannot establish that relationship.
+    """
+    if (ledger.parent / "analysis_manifest.yaml").exists():
+        return _profile_for_findings(source, ledger)
+    try:
+        data = yaml.safe_load(ledger.read_text(encoding="utf-8"))
+        reference = data.get("source") if isinstance(data, dict) else None
+        if isinstance(reference, str) and reference.strip():
+            artifact = (source / reference).resolve()
+            root = source.resolve()
+            if artifact.exists() and artifact.is_relative_to(root):
+                directory = artifact if artifact.is_dir() else artifact.parent
+                for candidate in (directory, *directory.parents):
+                    if not candidate.is_relative_to(root):
+                        break
+                    profile = _profile_for_findings(source, candidate / FINDINGS_NAME)
+                    if profile is not None:
+                        return profile
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    return _profile_for_findings(source, ledger)
+
+
+def _latest_kernel_ledger(
+    source: Path, findings: Path | None, profile_dir: Path | None
+) -> Path | None:
+    """Newest ledger for the selected capture, with findings-sibling fallback.
+
+    A newer replan may update the model without producing full findings.
+    Import that knowledge only when its provenance identifies the selected
+    capture; unrelated or unresolvable newer ledgers cannot supersede the
+    selected findings' own ledger.
+    """
+    sibling = _first_existing(findings.parent / KERNEL_LEDGER_NAME) if findings else None
+    if profile_dir is None:
+        return sibling
+    candidates: list[tuple[int, Path]] = []
+    for ledger in source.glob(f"rounds/round_*/analysis/{KERNEL_LEDGER_NAME}"):
+        match = _ROUND_DIR_RE.fullmatch(ledger.parent.parent.name)
+        if not match or not _nonempty_file(ledger):
+            continue
+        profile = _profile_for_ledger(source, ledger)
+        if ledger == sibling or (
+            profile is not None and profile.resolve() == profile_dir.resolve()
+        ):
+            candidates.append((int(match.group(1)), ledger))
+    return max(candidates)[1] if candidates else sibling
+
+
 @dataclass(frozen=True)
 class DiscoveredAnalysis:
     """What a ``--reuse-analysis`` source actually offers.
@@ -239,11 +295,8 @@ class DiscoveredAnalysis:
 
     @property
     def kernel_ledger(self) -> Path | None:
-        """The findings' sibling ``kernel_ledger.yaml``, when present."""
-        if self.findings is None:
-            return None
-        ledger = self.findings.parent / KERNEL_LEDGER_NAME
-        return ledger if _nonempty_file(ledger) else None
+        """Latest kernel/model knowledge attributable to the selected capture."""
+        return _latest_kernel_ledger(self.source, self.findings, self.profile_dir)
 
     @property
     def is_empty(self) -> bool:
@@ -321,7 +374,7 @@ class ImportedAnalysis:
                 ("profile findings", self.findings),
                 ("profile captures", self.profile),
                 ("SOL projection", self.sol_projection),
-                ("kernel ledger", self.kernel_ledger),
+                ("kernel ledger (as reference)", self.kernel_ledger),
                 ("prior roadmap (as reference)", self.prior_roadmap),
             )
             if present
@@ -447,6 +500,11 @@ def _render_manifest(imported: ImportedAnalysis, workspace: Path) -> str:
         "baseline numbers this campaign's gains are computed against were",
         "measured there, not here.",
         "",
+        "The imported kernel ledger and its model revision history are prior",
+        "art only. Resolve its evidence relative to its original source",
+        "directory below. The analyzer writes a fresh kernel ledger with",
+        "this campaign's roadmap references and model revision history.",
+        "",
         "| artifact | source | destination |",
         "| --- | --- | --- |",
     ]
@@ -481,8 +539,9 @@ def import_analysis(
     produced ones: the baseline report and its result JSONs land in
     ``baseline/``, the findings in round 1's ``analysis/`` and captures in
     ``profile_dir`` when supplied, the projection at ``sol_projection.md`` (with
-    ``sol_work/`` beside it). The source roadmap is parked in
-    ``reused_analysis/`` as prior art — never as the live ledger.
+    ``sol_work/`` beside it). The source roadmap and kernel ledger are parked
+    in ``reused_analysis/`` as prior art, including their original history.
+    The analyzer authors this campaign's live ledger in either reuse mode.
 
     ``reanalyze`` requires raw evidence and leaves any previous derivations
     in ``reused_analysis/prior_analysis/`` for reference. Legacy callers that
@@ -539,7 +598,11 @@ def import_analysis(
             imported,
         )
         imported.findings = not reanalyze
-        imported.kernel_ledger = not reanalyze and discovered.kernel_ledger is not None
+
+    prior_ledger = discovered.kernel_ledger
+    if prior_ledger is not None:
+        _copy_file(prior_ledger, reuse_dir / PRIOR_KERNEL_LEDGER_NAME, imported)
+        imported.kernel_ledger = True
 
     if discovered.profile_dir is not None:
         target = profile_dir or analysis_dir
@@ -593,6 +656,7 @@ __all__ = [
     "KERNEL_LEDGER_NAME",
     "MANIFEST_NAME",
     "PRIOR_ROADMAP_NAME",
+    "PRIOR_KERNEL_LEDGER_NAME",
     "PRIOR_ANALYSIS_DIRNAME",
     "REUSE_DIRNAME",
     "DiscoveredAnalysis",

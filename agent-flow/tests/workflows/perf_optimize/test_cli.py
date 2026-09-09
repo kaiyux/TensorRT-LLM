@@ -1,4 +1,4 @@
-"""CLI validation and dispatch for offline reanalysis."""
+"""CLI help, task validation, and dispatch."""
 
 from __future__ import annotations
 
@@ -10,6 +10,21 @@ import yaml
 
 from agent_flow.workflows.perf_optimize import cli
 from agent_flow.workflows.perf_optimize.state import STATE_FILENAME
+
+
+def test_help_describes_one_evidence_driven_kernel_ledger(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli._parse_args(["--help"])
+
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "kernel_ledger.yaml each round" in help_text
+    assert "eliminable?/faster?/fusible?/overlappable? per kernel" in help_text
+    assert "best current theoretical performance model" in help_text
+    assert "model revisions based on evidence, and unexplained gaps" in help_text
+    assert "headroom_ledger" not in help_text
 
 
 def test_reanalyze_requires_a_reuse_source(capsys: pytest.CaptureFixture[str]) -> None:

@@ -12,7 +12,6 @@ from ._common import (
     DISAGG_ANALYSIS_CONTEXT,
     DISAGG_CAMPAIGN,
     EXECUTION_SLURM_BOOTSTRAP,
-    HEADROOM_LEDGER_REPORTER_GUIDANCE,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
     REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
@@ -20,7 +19,6 @@ from ._common import (
     SOL_OPTIMIZER_CONTEXT,
     SOL_PROFILER_CONTEXT,
     approach_restriction_note,
-    headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
     kernel_coverage_ncu_targeting,
 )
@@ -115,7 +113,6 @@ def build_perf_optimize_prompts(
     approaches: Sequence[str] | None = None,
     include_sol: bool = False,
     kernel_coverage: Mapping[str, Any] | None = None,
-    headroom_ledger: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
 ) -> PromptBundle:
@@ -172,20 +169,12 @@ def build_perf_optimize_prompts(
     contract), the profiler gets coverage-driven ncu targeting and the
     analyzer gets the four per-kernel questions (eliminable? faster? fusible?
     overlappable?), and the
-    ``kernel_ledger.yaml`` contract with the task's bars interpolated;
+    ``kernel_ledger.yaml`` contract with the task's bars interpolated and a
+    best theoretical performance model updated from evidence every turn;
     the reporter gets the "Kernel Coverage" accountability section. The
     other roles are unchanged — the ledger is authored by the analyzer
     and consumed by the reporter, with the orchestrator's deterministic
     validation in between.
-
-    When ``headroom_ledger`` is set (the validated
-    ``profile.headroom_ledger`` block), the analyzer gets the campaign's
-    per-part gap-accounting contract — the three ``sol <= target <=
-    measured`` tiers, the rules that stop a round talking itself out of
-    real headroom, and the ``## Target implementation`` walk — and the
-    reporter gets the "Headroom Accounting" section that renders it. The
-    evaluator and QA get nothing: their gates stay measured-vs-measured,
-    and the target layer is a *plan*, which must never anchor a verdict.
 
     When ``include_disagg`` is True (the task spec carries a ``disagg``
     block), the disaggregated-serving section is appended to every role
@@ -204,19 +193,14 @@ def build_perf_optimize_prompts(
     wrong.
     """
     bundle = DEFAULT_PROMPTS
-    if kernel_coverage is not None or headroom_ledger is not None:
-        ncu_targeting = (
-            kernel_coverage_ncu_targeting(
-                float(kernel_coverage["min_share_pct"]),
-                float(kernel_coverage["coverage_target_pct"]),
-            )
-            if kernel_coverage is not None
-            else None
-        )
+    if kernel_coverage is not None:
         bundle = dataclasses.replace(
             bundle,
             profiler=build_profiler_prompt(
-                ncu_targeting=ncu_targeting, headroom_ledger=headroom_ledger is not None
+                ncu_targeting=kernel_coverage_ncu_targeting(
+                    float(kernel_coverage["min_share_pct"]),
+                    float(kernel_coverage["coverage_target_pct"]),
+                )
             ),
         )
     if sol_methodology != "full":
@@ -251,15 +235,6 @@ def build_perf_optimize_prompts(
                 float(kernel_coverage["coverage_target_pct"]),
             ),
             reporter=KERNEL_COVERAGE_REPORTER_GUIDANCE,
-        )
-    if headroom_ledger is not None:
-        bundle = bundle.with_extensions(
-            analyzer=headroom_ledger_analyzer_note(
-                str(headroom_ledger["target_layer"]),
-                str(headroom_ledger["enforcement"]),
-                float(headroom_ledger["min_share_pct"]),
-            ),
-            reporter=HEADROOM_LEDGER_REPORTER_GUIDANCE,
         )
     if include_disagg:
         bundle = bundle.with_extensions(

@@ -13,9 +13,11 @@ optimization — the **speed-of-light (SOL) ceiling** it cannot exceed on
 this hardware — using the **`internal-perf-sol-analysis` skill** (from
 the `trtllm-agent-toolkit` plugin) as your methodology. You run **once
 per campaign**, after the baseline benchmark and before the first
-optimization round: the ceiling is a property of the hardware + model +
-operating point, not of the optimizations later rounds apply. The
-projection plus a baseline-vs-SOL gap analysis is optimization guidance
+optimization round. State the hardware, workload, operating conditions and
+assumptions behind this initial model. Later facts may expose a faulty
+assumption or omitted cost; the Analyzer then revises its current model
+while preserving this projection as provenance. The projection plus a
+baseline-vs-SOL gap analysis is optimization guidance
 for the **Analyzer** (it sizes the headroom, names which ceiling binds
 — compute, memory, or launch — and bounds every roadmap item's
 plausible `expected_gain_pct`) and for the **Reporter** (how much of
@@ -147,8 +149,9 @@ Use this structure. Section headers must match.
 | MBU (measured, vs raw peak DRAM) | ...% | — | — |
 
 The measured column is the **baseline** snapshot — the campaign's
-rounds measure their gains from it, and the ceiling stays valid for
-every later round.
+rounds measure their gains from it. Keep this initial projection intact;
+the Analyzer maintains the best current model as new evidence establishes
+corrections, without rewriting the baseline snapshot.
 
 In Pareto-curve mode both tables gain a leading **concurrency** column
 and carry one row-group per configured point (ascending, matching the

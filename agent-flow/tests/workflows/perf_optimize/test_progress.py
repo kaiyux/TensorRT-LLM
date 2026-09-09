@@ -399,10 +399,10 @@ def test_read_latest_progress_tool_filters_by_agent(tmp_path):
     assert "No optimization entries yet" in out["content"][0]["text"]
 
 
-# ---------------------------------------------- headroom-ledger evaluator fields
+# ---------------------------------------------------- optional evaluator facts
 
 
-def _evaluator_tool(path, **ctx_kwargs):
+def _evaluator_tool(path):
     progress_module.init_progress_file(path)
     ctx = progress_module.ProgressContext(
         path=path,
@@ -410,7 +410,6 @@ def _evaluator_tool(path, **ctx_kwargs):
         current_round=1,
         current_attempt=1,
         current_item_id="opt-004",
-        **ctx_kwargs,
     )
     return _tool(
         progress_module.build_progress_tools(ctx), "evaluator", "append_evaluator_progress"
@@ -426,15 +425,12 @@ _REJECT = {
 }
 
 
-def test_headroom_fields_are_optional_in_the_schema(tmp_path):
-    # A required field would break every campaign that does not run the
-    # ledger, so the contract is enforced by the context flag instead.
+def test_evaluator_facts_are_optional_in_the_schema(tmp_path):
     append = _evaluator_tool(tmp_path / "progress.yaml")
     schema = append.input_schema
     for field in (
         "gap_implication",
         "gap_implication_note",
-        "parts",
         "lever",
         "target_blocker",
         "measured_gain_pooled_pct",
@@ -460,7 +456,6 @@ def test_evaluator_records_the_structured_gap_implication(tmp_path):
             **_REJECT,
             "gap_implication": "mechanism-inapplicable",
             "gap_implication_note": "gated on T == 4; this deployment runs T == 3",
-            "parts": ["gdn_state:linear_attn:bf16", "conv_state_update:bf16:b512"],
             "lever": "launch-geometry-tuning",
             "measured_gain_pooled_pct": 0.57,
             "measurement_confidence": "not-reproducible",
@@ -469,7 +464,6 @@ def test_evaluator_records_the_structured_gap_implication(tmp_path):
     (entry,) = progress_module.read_progress(path)["optimization"]
     assert entry["gap_implication"] == "mechanism-inapplicable"
     assert entry["lever"] == "launch-geometry-tuning"
-    assert entry["parts"] == ["gdn_state:linear_attn:bf16", "conv_state_update:bf16:b512"]
     # The scored number stays exactly as measured; the pooled estimate is
     # recorded beside it rather than overwriting it.
     assert entry["measured_gain_pct"] == pytest.approx(0.0)
@@ -503,26 +497,22 @@ def test_scalar_runs_never_grow_the_new_keys(tmp_path):
     append = _evaluator_tool(path)
     _call(append.handler, {**_REJECT, "decision": "APPROVE", "reason_category": "none"})
     (entry,) = progress_module.read_progress(path)["optimization"]
-    for field in ("gap_implication", "lever", "parts", "target_blocker"):
+    for field in ("gap_implication", "lever", "target_blocker"):
         assert field not in entry
 
 
-def test_ledger_campaign_requires_a_gap_implication_on_a_negative_verdict(tmp_path):
-    # The whole point of the artifact is that a failed attempt leaves a
-    # fact behind; a verdict that skips it discards what the benchmark
-    # was spent to learn.
+@pytest.mark.parametrize("decision", ["APPROVE", "PUSH_BACK", "REJECT"])
+def test_evaluator_accepts_verdicts_without_optional_facts(tmp_path, decision):
     path = tmp_path / "progress.yaml"
-    append = _evaluator_tool(path, headroom_ledger=True)
-    with pytest.raises(ValueError, match="gap_implication"):
-        _call(append.handler, dict(_REJECT))
-    assert progress_module.read_progress(path)["optimization"] == []
-
-
-def test_ledger_campaign_leaves_approvals_alone(tmp_path):
-    # An APPROVE has no gap implication by contract: the mechanism ran
-    # and the part got faster.
-    path = tmp_path / "progress.yaml"
-    append = _evaluator_tool(path, headroom_ledger=True)
-    _call(append.handler, {**_REJECT, "decision": "APPROVE", "reason_category": "none"})
+    append = _evaluator_tool(path)
+    _call(
+        append.handler,
+        {
+            **_REJECT,
+            "decision": decision,
+            "reason_category": "none" if decision == "APPROVE" else "perf_shortfall",
+        },
+    )
     (entry,) = progress_module.read_progress(path)["optimization"]
-    assert entry["decision"] == "APPROVE"
+    assert entry["decision"] == decision
+    assert "gap_implication" not in entry

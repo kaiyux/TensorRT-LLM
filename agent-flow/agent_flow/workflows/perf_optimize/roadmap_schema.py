@@ -34,7 +34,6 @@ Shape (see the workflow README for field semantics)::
         expected_gain_pct: 12.0
         expected_gain_rationale: "idle share x casebook-typical recovery"
         how_to_apply: "add cuda_graph_config to tuning/extra_llm_api_options.yaml"
-        parts: []                     # headroom-ledger part ids this item attacks
         status: pending
         attempts: 0
         measured_gain_pct: null
@@ -233,21 +232,6 @@ def _validate_item(item: Any, index: int, seen_ids: set[str], errors: list[str])
     if measured is not None and not _is_number(measured):
         errors.append(f"'{where}.measured_gain_pct' must be a number or null, got {measured!r}")
 
-    # Which parts of the model this item attacks — the join to
-    # ``headroom_ledger.yaml``. Optional at the schema level so campaigns
-    # without the ledger are untouched; :func:`items_missing_parts` is
-    # what holds a ledger-enabled campaign to it. ``parts: []`` is the
-    # explicit "this is a whole-deployment change" declaration, which is
-    # a different statement from omitting the key.
-    parts = item.get("parts")
-    if parts is not None and (
-        not isinstance(parts, list) or not all(isinstance(p, str) and p.strip() for p in parts)
-    ):
-        errors.append(
-            f"'{where}.parts' must be a list of non-empty headroom-ledger part "
-            f"ids (empty for a whole-deployment change), got {parts!r}"
-        )
-
     implication = item.get("gap_implication")
     if implication is not None and not (isinstance(implication, str) and implication.strip()):
         errors.append(
@@ -434,25 +418,6 @@ def apply_evaluation(
     if gap_implication and status in ("accepted", "failed"):
         updates["gap_implication"] = gap_implication
     _mutate(path, item_id, updates)
-
-
-def items_missing_parts(data: Mapping[str, Any]) -> list[str]:
-    """Ids of items that never said which part of the model they attack.
-
-    The headroom ledger's whole value is per-part accounting, and an item
-    with no ``parts`` contributes nothing to it: its outcome cannot be
-    booked as a disposition, and the time it targeted cannot leave the
-    ``unexplained`` queue. ``parts: []`` is a legitimate answer for a
-    whole-deployment config change and is not reported here — omitting
-    the key is.
-    """
-    return [
-        str(item.get("id"))
-        for item in data.get("items", [])
-        if isinstance(item, Mapping)
-        and item.get("status") != "obsolete"
-        and item.get("parts") is None
-    ]
 
 
 def set_current_best(

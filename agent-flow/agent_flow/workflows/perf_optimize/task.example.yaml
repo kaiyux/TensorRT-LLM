@@ -75,68 +75,25 @@ profile:
   # shows up as jitter the others wait on. One representative per part of
   # the parallelism is enough; capturing all 8 costs 8 exports.
   # profile_ranks: [0, 4]
-  # Optional: the per-kernel coverage contract. When present (an empty
-  # mapping enables the defaults shown), the analyzer's ncu dive covers
-  # EVERY kernel at/above min_share_pct of GPU time (extending down the
-  # kern_sum until coverage_target_pct is reached, over bounded capture
-  # passes), and each profiling round writes a schema-validated
-  # kernel_ledger.yaml answering four questions per kernel — can it be
-  # eliminated? can it be made faster? can it be fused with its
-  # neighbors? can it be overlapped with independent work on another
-  # stream? — each with a roadmap item or an evidence-backed dismissal.
-  # They are ordered by how much they presuppose: elimination assumes
-  # only that the kernel runs today (and recovers its whole share, not a
-  # fraction), faster/fusion assume the work is necessary AND that the
-  # kernel runs alone, overlap drops the alone assumption. The
-  # ledger also records the window's gpu_busy_pct, which converts every
-  # kernel's share of GPU time into the share of WALL CLOCK the noise
-  # floor actually judges. The orchestrator aborts the round on an
-  # incomplete ledger (a replan-only round runs no ncu and is waived),
-  # so the campaign cannot end with a kernel whose
-  # elimination/optimization/fusion/overlap possibility was never
-  # considered. Costs
-  # extra profiling time per round that profiles; requires nsys+ncu in
-  # methods.
+  # Optional: one kernel ledger with four questions and the best current
+  # theoretical performance model. An empty mapping enables these defaults.
+  # Profile every kernel >= min_share_pct of GPU time and extend coverage
+  # down the timeline until coverage_target_pct is reached. Requires nsys+ncu.
+  # Every analyzer turn, including replan-only rounds, writes
+  # analysis/kernel_ledger.yaml with evidence-backed answers per kernel:
+  # eliminate? faster? fuse with neighbors? overlap independent work?
+  # Each kernel references a model (shared region/iteration models are
+  # allowed) recording derivation, assumptions, operating point, predicted
+  # and measured milliseconds, evidence, unexplained gaps, and next test.
+  # Replan uses standing measurements; new facts update the model and its
+  # revision history without a new capture. A failed optimization alone
+  # cannot relax a prediction or prove that a gap is unavoidable.
+  # Missing facts stay explicit; convergence requires an explained residual.
+  # SOL projection is optional. Validation requires all four questions,
+  # sufficient coverage, and a model for each kernel.
   # kernel_coverage:
   #   min_share_pct: 0.5         # every kernel >= this share gets a row
   #   coverage_target_pct: 95    # rows must cover >= this much GPU time
-
-  # Optional: the HEADROOM LEDGER — the campaign's per-part gap
-  # accounting at <workspace>/headroom_ledger.yaml. Requires the SOL
-  # projector (its analytic parts ARE the correlation's regions) and
-  # kernel_coverage (its kernel->part join closes against those shares).
-  # Uncomment (an empty mapping is valid — all defaults) to have the
-  # analyzer record, every round, where the remaining gap-to-SOL sits per
-  # part, which lever each failed item spent against it, and — the target
-  # layer — what a named, buildable implementation would achieve
-  # (sol_ms <= target_ms <= measured_ms). Without it, a failed item's
-  # whole durable payload is `status: failed` plus a number, and the
-  # finding it paid a full benchmark for survives only as prose. Costs
-  # analyst attention per round, and a second profiled concurrency point.
-  # headroom_ledger:
-  #   enforcement: warn          # warn | error. warn (default) reports
-  #                              # ledger problems and continues; error
-  #                              # parks the round at the analyzer.
-  #                              # kernel_ledger.yaml already aborts on
-  #                              # invalidity, so a second aborting gate
-  #                              # over a much richer schema is how a
-  #                              # campaign dies on bookkeeping rather
-  #                              # than on a measurement — raise it only
-  #                              # once a campaign has run the contract.
-  #   target_layer: ranking      # ranking | report_only. ranking sizes
-  #                              # every expected_gain_pct against
-  #                              # measured - target (a named
-  #                              # implementation) instead of
-  #                              # measured - sol (a floor no kernel
-  #                              # reaches). report_only authors and
-  #                              # reports the same targets without
-  #                              # letting them order the plan — the
-  #                              # conservative first-campaign mode,
-  #                              # since the layer's value IS estimate
-  #                              # quality and that can be scored first.
-  #   tolerance_pct: 1.0         # slack on the coverage and join closures
-  #   min_share_pct: 0.5         # unclaimed kernel rows at/above this
-  #                              # share must become `empirical` parts
 
 # Optional: the optimization-loop knobs (defaults shown).
 # optimize:

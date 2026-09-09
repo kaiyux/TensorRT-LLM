@@ -12,7 +12,6 @@ from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
     has_slurm_environment,
-    headroom_ledger,
     kernel_coverage,
     load_and_validate_task_yaml,
     sol_enabled,
@@ -55,11 +54,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "activates the per-kernel coverage contract: the profiler's ncu "
         "dive covers every kernel above the share bar, and the analyzer answers "
         "eliminable?/faster?/fusible?/overlappable? per kernel in a "
-        "schema-validated kernel_ledger.yaml each round. An optional "
-        "`profile.headroom_ledger` block (requires the two above) adds the "
-        "campaign's per-part gap accounting in headroom_ledger.yaml: where "
-        "the remaining gap-to-SOL sits, which lever each failed item spent "
-        "against it, and what a named buildable implementation would achieve. "
+        "schema-validated kernel_ledger.yaml each round. The same ledger "
+        "holds the analyzer's best current theoretical performance model "
+        "for kernels or logical groups, matching silicon measurements, "
+        "model revisions based on evidence, and unexplained gaps. "
         "See task.example.yaml.",
     )
     parser.add_argument(
@@ -67,7 +65,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("workspace/perf-optimize"),
         help="Workspace directory for shared state (task.yaml, roadmap.yaml, "
-        "sol_projection.md, headroom_ledger.yaml, baseline/, tuning/, rounds/, "
+        "sol_projection.md, baseline/, tuning/, rounds/ with kernel_ledger.yaml, "
         "optimization_report.md/.html, progress.yaml, prompts/) and run "
         "artifacts. Each launch snapshots every role's composed system "
         "prompt to prompts/<role>.md.",
@@ -77,7 +75,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Wipe the workspace checkpoint and managed files/directories "
         f"({STATE_FILENAME}, sol_projection.md, roadmap.yaml, "
-        "headroom_ledger.yaml, optimization_report.md/.html, "
+        "optimization_report.md/.html, "
         "progress.yaml, baseline/, rounds/, worktrees/, tuning/, sol_work/, "
         "reused_analysis/) and start fresh. The "
         "TRT-LLM checkout is not touched (abandoned perf-optimize/* branches "
@@ -164,7 +162,6 @@ def main(argv: list[str] | None = None) -> None:
         approaches=task_data["optimize"]["approaches"],
         include_sol=sol_enabled(task_data),
         kernel_coverage=kernel_coverage(task_data),
-        headroom_ledger=headroom_ledger(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
     )

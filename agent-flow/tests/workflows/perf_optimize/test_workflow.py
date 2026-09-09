@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import re
 import shutil
@@ -15,7 +14,6 @@ import yaml
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
 from agent_flow.workflows.perf_optimize import (
-    headroom_ledger,
     kernel_ledger,
     nsys_items,
     roadmap_schema,
@@ -2544,14 +2542,19 @@ def _analyzer_state(ws, **overrides) -> state_module.WorkflowState:
     return state_module.WorkflowState(**data)
 
 
-def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, fake_git):
+@pytest.mark.parametrize("sol_enabled", [False, True])
+def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(
+    tmp_path, fake_git, sol_enabled
+):
     """The prompt states the unchanged build as fact, not as a choice to weigh."""
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     recorder = _RecordingAgent()
     workflow.analyzer = recorder
     try:
-        (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
+        (ws / "task.yaml").write_text(
+            yaml.safe_dump({"sol": {"enabled": sol_enabled}}), encoding="utf-8"
+        )
         # Two items were attempted last round and both were rejected.
         for item in ("item_1_opt-001", "item_2_opt-002"):
             (ws / "rounds" / "round_1" / item).mkdir(parents=True)
@@ -2578,6 +2581,9 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         # A plateau is a legitimate outcome; padding the roadmap is not.
         assert "leave the roadmap with no actionable pending item" in message
         assert "Do not invent items to keep the loop alive" in message
+        assert "A performance shortfall alone does not bound" in message
+        if sol_enabled:
+            assert "unexplained, with the next evidence needed" in message
     finally:
         workflow.close()
 
@@ -3438,6 +3444,7 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "Correlation unavailable" in analyzer
     # An exhausted roadmap owes the remaining-gap attribution.
     assert "Remaining-gap attribution" in analyzer
+    assert "unexplained, with the next evidence needed" in analyzer
     optimizer = with_sol["optimizer"]
     assert "sol_projection.md" in optimizer
     # Context, not spec: aim at the binding ceiling, never grow the item.
@@ -3561,6 +3568,7 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                     "kernel": "gdn_bf16_state",
                     "full_name": "void tensorrt_llm::kernels::gdn<...>",
                     "share_pct": 96.0,
+                    "model": "gdn-state",
                     "ncu": {
                         "duration_us": 41.2,
                         "sm_sol_pct": 12.1,
@@ -3586,6 +3594,22 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                     },
                 }
             ],
+            "models": [
+                {
+                    "id": "gdn-state",
+                    "scope": "kernel",
+                    "operating_point": {"concurrency": 1, "dtype": "bf16", "gpu": "H100"},
+                    "derivation": "64 MB mandatory state traffic / 3.2 TB/s = 0.020 ms",
+                    "assumptions": ["State traffic reaches the measured sustained HBM rate"],
+                    "evidence": ["analysis/state_bytes.txt", "analysis/hbm_bandwidth.txt"],
+                    "predicted_ms": 0.020,
+                    "measured_ms": 0.0412,
+                    "measurement_evidence": ["analysis/nsys_analysis/kernel_times.csv"],
+                    "unexplained": "0.0212 ms beyond mandatory traffic remains unexplained",
+                    "next_test": "Compare state-traffic counters with the source byte count",
+                }
+            ],
+            "model_revisions": [],
         },
         sort_keys=False,
     )
@@ -3636,57 +3660,67 @@ def test_kernel_coverage_run_completes_with_valid_ledger(tmp_path, fake_git):
     }
 
 
-def test_kernel_coverage_waives_the_ledger_on_a_replan_only_round(tmp_path, fake_git):
-    """The contract demands a fresh ledger from a profile, not from a replan.
-
-    A replan-only round runs no ncu at all — the standing ledger still
-    describes the build, because the round that preceded it accepted
-    nothing. Enforcing the contract there would abort the stage over an
-    artifact the round was told not to produce.
-    """
+def test_kernel_coverage_updates_the_ledger_on_every_replan_round(tmp_path, fake_git):
+    """A replan retains the model and incorporates the latest failed experiments."""
     task = _write_task(tmp_path, {**_KC_EXTRA, "optimize": {"max_items_per_round": 1}})
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
-    trace = _stub_agents(
+    trace = _stub_agents_with_ledger(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
         evaluator_verdicts=[("REJECT", "perf_shortfall", -1.0, 99.0)],
     )
     original_analyzer = workflow._run_analyzer
 
-    def analyzer_with_first_round_ledger(state):
+    def analyzer_with_replan_evidence(state):
         original_analyzer(state)
-        if state.round_index == 0:
-            ledger = workflow._analysis_dir(state) / "kernel_ledger.yaml"
-            ledger.write_text(_ledger_yaml("opt-001"), encoding="utf-8")
+        ledger = workflow._analysis_dir(state) / "kernel_ledger.yaml"
+        data = yaml.safe_load(ledger.read_text(encoding="utf-8"))
+        data["models"][0]["unexplained"] = (
+            f"Round {state.round_index + 1}: rejected attempts have not explained the gap"
+        )
+        ledger.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
-    workflow._run_analyzer = analyzer_with_first_round_ledger
+    workflow._run_analyzer = analyzer_with_replan_evidence
     try:
         workflow.run(str(task))
     finally:
         workflow.close()
 
-    # Both items were rejected, so the campaign ends without a final
-    # verification — and without ever aborting on the ledger gate. Rounds
-    # 2 and 3 are both replan-only (nothing was accepted at any point),
-    # so the waiver has to hold for each of them.
-    assert trace == [
-        "benchmarker",
-        "projector",
-        "profiler",
-        "analyzer",
-        "optimizer",
-        "evaluator",
-        "analyzer",
-        "optimizer",
-        "evaluator",
-        "analyzer",
-        "reporter",
-    ]
-    assert (ws / "rounds" / "round_1" / "analysis" / "kernel_ledger.yaml").is_file()
-    # The waiver was exercised, not accidentally satisfied.
-    assert not (ws / "rounds" / "round_2" / "analysis" / "kernel_ledger.yaml").exists()
-    assert not (ws / "rounds" / "round_3" / "analysis" / "kernel_ledger.yaml").exists()
+    assert trace.count("profiler") == 1
+    assert trace.count("analyzer") == 3
+    assert trace[-1] == "reporter"
+    for round_no in (1, 2, 3):
+        ledger = ws / "rounds" / f"round_{round_no}" / "analysis" / "kernel_ledger.yaml"
+        model = yaml.safe_load(ledger.read_text(encoding="utf-8"))["models"][0]
+        assert model["predicted_ms"] == 0.020
+        assert model["unexplained"].startswith(f"Round {round_no}:")
+
+
+def test_kernel_coverage_missing_replan_ledger_parks_the_analyzer(tmp_path, fake_git):
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow, evaluator_verdicts=[("REJECT", "perf_shortfall", -1.0, 99.0)])
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_first_round_ledger(state):
+        original_analyzer(state)
+        if state.round_index == 0:
+            (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+                _ledger_yaml(), encoding="utf-8"
+            )
+
+    workflow._run_analyzer = analyzer_with_first_round_ledger
+    try:
+        with pytest.raises(RuntimeError, match="kernel_ledger.yaml"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace.count("profiler") == 1
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.round_index == 1
+    assert state.stage == state_module.STAGE_ANALYZER
 
 
 def test_kernel_coverage_missing_ledger_blocks_advance(tmp_path, fake_git):
@@ -3869,6 +3903,40 @@ def test_reporter_prompt_names_the_highest_round_ledger(tmp_path, fake_git):
         # Numeric round ordering: round_10 outranks round_2.
         assert str(ws / "rounds" / "round_10" / "analysis" / "kernel_ledger.yaml") in prompt
         assert "none was written" not in prompt
+    finally:
+        workflow.close()
+
+
+@pytest.mark.parametrize("profile_required", [False, True])
+def test_analyzer_receives_latest_numeric_prior_ledger(tmp_path, profile_required):
+    """Replans and fresh profiles both inherit the last model, not the last capture's model."""
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    recorder = _RecordingAgent()
+    workflow.analyzer = recorder
+    try:
+        task = _write_task(tmp_path, _KC_EXTRA)
+        validated = task_schema.load_and_validate_task_yaml(str(task))
+        workflow.task_path.write_text(task_schema.dump_task_yaml(validated), encoding="utf-8")
+        for round_no in (2, 10):
+            analysis = ws / "rounds" / f"round_{round_no}" / "analysis"
+            analysis.mkdir(parents=True)
+            (analysis / "kernel_ledger.yaml").write_text(_ledger_yaml(), encoding="utf-8")
+        workflow._run_analyzer(
+            _analyzer_state(
+                ws,
+                round_index=10,
+                profile_required=profile_required,
+                last_profiled_analysis_dir=str(ws / "rounds" / "round_2" / "analysis"),
+                last_profile_dir=str(ws / "rounds" / "round_11" / "profile"),
+            )
+        )
+        prompt = recorder.messages[0]
+        previous = ws / "rounds" / "round_10" / "analysis" / "kernel_ledger.yaml"
+        destination = ws / "rounds" / "round_11" / "analysis" / "kernel_ledger.yaml"
+        assert str(previous) in prompt
+        assert str(destination) in prompt
+        assert "model_revisions" in prompt
     finally:
         workflow.close()
 
@@ -4393,97 +4461,37 @@ def test_reuse_of_an_empty_source_fails_loudly(tmp_path, fake_git):
         workflow.close()
 
 
-def test_reused_round_without_a_ledger_does_not_enforce_the_coverage_gate(tmp_path, fake_git):
-    """A reused round never ran ncu, so it cannot owe a fresh ledger.
-
-    The contract still binds every round the analyzer actually profiles.
-    """
+@pytest.mark.parametrize("write_ledger", [False, True])
+def test_reused_analysis_requires_analyzer_owned_kernel_ledger(tmp_path, fake_git, write_ledger):
+    """Imported analysis is evidence; the new campaign still owns its ledger and item refs."""
     source = _analyze_workspace(tmp_path / "prior")
-    extra = dict(_KC_EXTRA)
-    extra["optimize"] = {"max_rounds": 1}
-    task = _write_task(tmp_path, extra)
+    (source / "kernel_ledger.yaml").write_text(_ledger_yaml("source-opt"), encoding="utf-8")
+    task = _write_task(tmp_path, {**_KC_EXTRA, "optimize": {"max_rounds": 1}})
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws, reuse_analysis=source)
-    trace = _stub_agents(workflow)  # writes no kernel_ledger.yaml
+    if write_ledger:
+        trace = _stub_agents_with_ledger(workflow)
+    else:
+        trace = _stub_agents(workflow)
     try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-
-    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
-    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
-
-
-def _run_reuse_campaign_with_source_ledger(tmp_path, ledger_yaml: str):
-    """Run a one-round reuse campaign whose source carries ``ledger_yaml``."""
-    source = _analyze_workspace(tmp_path / "prior")
-    (source / "kernel_ledger.yaml").write_text(ledger_yaml, encoding="utf-8")
-    extra = dict(_KC_EXTRA)
-    extra["optimize"] = {"max_rounds": 1}
-    task = _write_task(tmp_path, extra)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws, reuse_analysis=source)
-    trace = _stub_agents(workflow)
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-    return ws, trace
-
-
-def test_reused_source_ledger_that_fails_the_contract_is_waived(tmp_path, fake_git):
-    """An unsatisfiable imported ledger degrades; it never wedges the run.
-
-    The reused round is plan-only and never writes a ledger, so nothing a
-    retry does can repair the copy ``--reuse-analysis`` seeded — here one
-    whose ``item`` refs name the *source* campaign's roadmap ids. Aborting
-    on it would leave the campaign stuck on a failure no operator action
-    clears, so it takes the same warn-and-waive as a source with no ledger.
-    """
-    ws, trace = _run_reuse_campaign_with_source_ledger(tmp_path, _ledger_yaml("opt-does-not-exist"))
-
-    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
-    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
-
-
-def test_reused_source_ledger_predating_the_contract_is_waived(tmp_path, fake_git):
-    """The real trap: a source ledger written before the questions grew.
-
-    Every workspace produced before ``elimination`` / ``overlap`` /
-    ``gpu_busy_pct`` became required carries a ledger that can never
-    satisfy today's schema, and ``--reuse-analysis`` documents an earlier
-    campaign as a supported source.
-    """
-    stale = yaml.safe_load(_ledger_yaml())
-    stale["coverage"].pop("gpu_busy_pct")
-    for row in stale["kernels"]:
-        row.pop("elimination")
-        row.pop("overlap")
-    ws, trace = _run_reuse_campaign_with_source_ledger(
-        tmp_path, yaml.safe_dump(stale, sort_keys=False)
-    )
-
-    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
-    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
-
-
-def test_a_self_authored_ledger_is_never_waived(tmp_path, fake_git):
-    """The waive is scoped to the imported copy, not to every failure.
-
-    A round that profiled authored its own ledger, so a failing one is a
-    retryable defect and must still park the checkpoint.
-    """
-    task = _write_task(tmp_path, _KC_EXTRA)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_ledger(workflow, faster_ref="opt-does-not-exist")
-    try:
-        with pytest.raises(RuntimeError, match="coverage contract"):
+        if write_ledger:
             workflow.run(str(task))
+        else:
+            with pytest.raises(RuntimeError, match="kernel_ledger.yaml"):
+                workflow.run(str(task))
     finally:
         workflow.close()
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.stage == state_module.STAGE_ANALYZER
+    if write_ledger:
+        assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+        assert state.done is True
+        ledger = kernel_ledger.load_ledger(
+            ws / "rounds" / "round_1" / "analysis" / "kernel_ledger.yaml"
+        )
+        assert ledger["kernels"][0]["faster"]["ref"] == "opt-001"
+    else:
+        assert trace == ["projector", "analyzer"]
+        assert state.stage == state_module.STAGE_ANALYZER
 
 
 def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path):
@@ -4928,278 +4936,10 @@ def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
     assert "straggler verdict" in profiler
 
 
-# ------------------------------------------------------------- headroom ledger
-
-# The ledger keys its analytic parts on the SOL correlation's regions and
-# closes its join against the per-kernel ledger, so the task must carry
-# both. Two concurrency points so the bracket is a real bracket.
-_HL_EXTRA = {
-    "profile": {"kernel_coverage": {}, "headroom_ledger": {}},
-    "benchmark": {"concurrency": [8, 64], "num_prompts": [8, 64]},
-}
+# ------------------------------------------------ unified performance model
 
 
-def _hl_extra(**headroom) -> dict:
-    extra = copy.deepcopy(_HL_EXTRA)
-    extra["profile"]["headroom_ledger"] = headroom
-    return extra
-
-
-def _headroom_yaml(**overrides) -> str:
-    data = {
-        "version": headroom_ledger.HEADROOM_LEDGER_VERSION,
-        "operating_point": {
-            "concurrency": [8, 64],
-            "isl": 1024,
-            "osl": 1024,
-            "build_sha": "b" * 10,
-            "node": "node-1",
-            "capture_state": "gpu-bound",
-        },
-        "timing": {"step_ms": 10.0, "kernel_ms": 9.0},
-        "coverage": {
-            "modeled_kernel_ms": 6.0,
-            "modeled_pct": 66.7,
-            "empirical_kernel_ms": 2.0,
-            "unmodeled_kernel_ms": 1.0,
-            "non_kernel_ms": 1.0,
-        },
-        "parts": [
-            {
-                "id": "gdn_state:linear_attn:bf16",
-                "source": "analytic",
-                "at": {
-                    8: {"measured_ms": 1.0, "sol_ms": 0.6, "gap_ms": 0.4},
-                    64: {"measured_ms": 4.0, "sol_ms": 2.0, "gap_ms": 2.0},
-                },
-                "sensitivity": "steep",
-                "bound": "memory",
-                "kernels": ["gdn_bf16_state"],
-                "partition": {
-                    "closed_ms": 0.0,
-                    "attributed_ms": 0.0,
-                    "open_ms": 0.0,
-                    "unexplained_ms": 2.0,
-                },
-            },
-            {
-                # Counted, but carrying no analytic ceiling — the bucket
-                # that keeps "no modeled gap" from reading as "no headroom".
-                "id": "host:response-walk",
-                "source": "unmodeled",
-                "at": {
-                    8: {"measured_ms": 0.4, "sol_ms": None, "gap_ms": None},
-                    64: {"measured_ms": 1.0, "sol_ms": None, "gap_ms": None},
-                },
-                "sensitivity": "steep",
-                "bound": "latency",
-            },
-        ],
-    }
-    data.update(overrides)
-    return yaml.safe_dump(data, sort_keys=False)
-
-
-_HL_PART = "gdn_state:linear_attn:bf16"
-
-# Curve mode is on (two concurrency points), so the stub analyzer owes a
-# baseline curve covering exactly them.
-_HL_CURVE = [
-    {"concurrency": 8, "value": 90.0, "tok_s_user": 20.0, "tok_s_gpu": 90.0},
-    {"concurrency": 64, "value": 110.0, "tok_s_user": 12.0, "tok_s_gpu": 110.0},
-]
-_HL_MEASURED_CURVE = [
-    {"concurrency": 8, "value": 94.1, "tok_s_user": 21.0, "tok_s_gpu": 94.1},
-    {"concurrency": 64, "value": 116.2, "tok_s_user": 12.6, "tok_s_gpu": 116.2},
-]
-
-
-def _stub_agents_with_headroom(workflow, ledger_yaml=None, **kwargs):
-    """`_stub_agents_with_ledger` plus a headroom ledger and its inputs.
-
-    The analyzer writes the campaign ledger and gives every roadmap item
-    a `parts` list; the evaluator emits the structured verdict fields the
-    orchestrator books dispositions from.
-    """
-    kwargs.setdefault("analyzer_items", [[_item(parts=[_HL_PART])]])
-    kwargs.setdefault("baseline_curve", _HL_CURVE)
-    kwargs.setdefault("evaluator_curve", _HL_MEASURED_CURVE)
-    trace = _stub_agents_with_ledger(workflow, **kwargs)
-    original_analyzer = workflow._run_analyzer
-    original_evaluator = workflow._run_evaluator
-
-    def analyzer_with_headroom(state):
-        original_analyzer(state)
-        if (
-            workflow.headroom_ledger_path.is_file()
-            and workflow.headroom_ledger_path.read_text(encoding="utf-8").strip()
-        ):
-            # Round N > 1 updates in place; the orchestrator-owned
-            # dispositions and history are read, never rewritten.
-            return
-        workflow.headroom_ledger_path.write_text(
-            ledger_yaml if ledger_yaml is not None else _headroom_yaml(), encoding="utf-8"
-        )
-
-    def evaluator_with_fields(state, *, agent=None, progress_ctx=None):
-        original_evaluator(state, agent=agent, progress_ctx=progress_ctx)
-        for path in filter(None, (workflow.progress_path, getattr(progress_ctx, "path", None))):
-            data = progress_module.read_progress(path)
-            for entry in data["optimization"]:
-                if entry.get("agent") == "evaluator" and entry.get("item_id"):
-                    entry.setdefault("gap_implication", "mechanism-inapplicable")
-                    entry.setdefault("gap_implication_note", "gated on a shape this build lacks")
-                    entry.setdefault("lever", "launch-geometry-tuning")
-                    entry.setdefault("parts", [_HL_PART])
-            progress_module.write_progress(path, data)
-
-    workflow._run_analyzer = analyzer_with_headroom
-    workflow._run_evaluator = evaluator_with_fields
-    return trace
-
-
-def test_headroom_ledger_run_completes_and_resolves_the_contract(tmp_path, fake_git):
-    task = _write_task(tmp_path, _HL_EXTRA)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_headroom(workflow)
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-    state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.done is True
-    resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
-    assert resolved["profile"]["headroom_ledger"] == {
-        "enforcement": "warn",
-        "target_layer": "ranking",
-        "tolerance_pct": 1.0,
-        "min_share_pct": 0.5,
-    }
-    assert (ws / "headroom_ledger.yaml").is_file()
-
-
-def test_headroom_ledger_books_the_verdict_as_a_disposition(tmp_path, fake_git):
-    """A failed item leaves a machine-readable fact, not a paragraph."""
-    task = _write_task(tmp_path, _HL_EXTRA)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_headroom(
-        workflow, evaluator_verdicts=[("REJECT", "perf_shortfall", 0.0, 100.0)]
-    )
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-    ledger = yaml.safe_load((ws / "headroom_ledger.yaml").read_text(encoding="utf-8"))
-    (disposition,) = ledger["parts"][0]["dispositions"]
-    assert disposition["item"] == "opt-001"
-    assert disposition["outcome"] == "failed"
-    assert disposition["gap_implication"] == "mechanism-inapplicable"
-    assert disposition["lever"] == "launch-geometry-tuning"
-    assert disposition["note"] == "gated on a shape this build lacks"
-    assert disposition["evidence"].endswith("evaluation.md")
-    # The lever is spent, but the part is NOT retired: one failure is an
-    # anecdote, and the time keeps its place in the work queue.
-    assert ledger["parts"][0]["partition"]["unexplained_ms"] == 2.0
-    assert ledger["parts"][0].get("attribution") is None
-    # And the roadmap carries the same implication without a progress read.
-    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    assert roadmap["items"][0]["gap_implication"] == "mechanism-inapplicable"
-
-
-def test_headroom_ledger_records_history_once_per_round(tmp_path, fake_git):
-    task = _write_task(tmp_path, _HL_EXTRA)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_headroom(workflow)
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-    history = yaml.safe_load((ws / "headroom_ledger.yaml").read_text(encoding="utf-8"))["parts"][0][
-        "history"
-    ]
-    # One row per closed batch, at the primary (highest bracketing) point.
-    assert [row["round"] for row in history] == sorted({row["round"] for row in history})
-    assert history[0] == {"round": 1, "measured_ms": 4.0, "gap_ms": 2.0}
-
-
-def test_headroom_ledger_warns_but_does_not_stop_the_round(tmp_path, fake_git):
-    """The default gate must not wedge a campaign on bookkeeping.
-
-    `kernel_ledger.yaml` already aborts a round on invalidity; stacking a
-    second aborting gate over a far richer schema is how a campaign dies
-    on an accounting detail instead of on a measurement.
-    """
-    task = _write_task(tmp_path, _HL_EXTRA)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    broken = _headroom_yaml(version=99)
-    _stub_agents_with_headroom(workflow, ledger_yaml=broken)
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
-
-
-def test_headroom_ledger_error_enforcement_parks_the_checkpoint(tmp_path, fake_git):
-    task = _write_task(tmp_path, _hl_extra(enforcement="error"))
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_headroom(workflow, ledger_yaml=_headroom_yaml(version=99))
-    try:
-        with pytest.raises(RuntimeError, match="headroom-ledger contract"):
-            workflow.run(str(task))
-    finally:
-        workflow.close()
-    state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.stage == state_module.STAGE_ANALYZER
-
-
-def test_headroom_ledger_error_enforcement_reports_a_missing_ledger(tmp_path, fake_git):
-    task = _write_task(tmp_path, _hl_extra(enforcement="error"))
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_ledger(
-        workflow, analyzer_items=[[_item(parts=[_HL_PART])]], baseline_curve=_HL_CURVE
-    )
-    try:
-        with pytest.raises(RuntimeError, match="was not written"):
-            workflow.run(str(task))
-    finally:
-        workflow.close()
-
-
-def test_headroom_ledger_reports_an_item_that_named_no_parts(tmp_path, fake_git):
-    # An item with no `parts` cannot be booked anywhere, so the time it
-    # targeted can never leave the unexplained queue.
-    task = _write_task(tmp_path, _hl_extra(enforcement="error"))
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_headroom(workflow, analyzer_items=[[_item()]])
-    try:
-        with pytest.raises(RuntimeError, match="declares no 'parts'"):
-            workflow.run(str(task))
-    finally:
-        workflow.close()
-
-
-def test_headroom_ledger_snapshot_lets_the_next_round_detect_a_moved_ceiling(tmp_path, fake_git):
-    task = _write_task(tmp_path, _HL_EXTRA)
-    ws = tmp_path / "ws"
-    workflow = Workflow(workspace=ws)
-    _stub_agents_with_headroom(workflow)
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
-    snapshots = list(ws.glob("rounds/round_*/analysis/headroom_ledger.yaml.snapshot"))
-    assert snapshots, "a validated ledger is frozen so the next round can diff against it"
-
-
-def test_without_the_block_no_headroom_ledger_is_required(tmp_path, fake_git):
+def test_unified_ledger_is_the_only_ledger_artifact(tmp_path, fake_git):
     task = _write_task(tmp_path, _KC_EXTRA)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -5209,40 +4949,175 @@ def test_without_the_block_no_headroom_ledger_is_required(tmp_path, fake_git):
     finally:
         workflow.close()
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
-    assert not (ws / "headroom_ledger.yaml").is_file()
+    assert not (ws / "headroom_ledger.yaml").exists()
+    assert not list(ws.glob("rounds/round_*/analysis/headroom_ledger*"))
+    assert list(ws.glob("rounds/round_*/analysis/kernel_ledger.yaml"))
 
 
-def test_headroom_driving_prompts_name_the_ledger_and_the_bracket(tmp_path):
-    prompts = _capture_driving_prompts(tmp_path, _HL_EXTRA)
-    analyzer = prompts["analyzer"]
-    assert "headroom_ledger.yaml" in analyzer
-    assert "[8, 64]" in analyzer
-    assert "engineering gap" in analyzer
-    reporter = prompts["reporter"]
-    assert "Headroom Accounting" in reporter
-    # The gate stays measured-vs-measured.
-    assert "headroom_ledger.yaml" not in prompts["evaluator"]
-    assert "headroom_ledger.yaml" not in prompts["qa"]
+@pytest.mark.parametrize("missing", ["models", "model"])
+def test_kernel_model_missing_blocks_the_analyzer(tmp_path, fake_git, missing):
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_ledger(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_without_model(state):
+        original_analyzer(state)
+        ledger = workflow._analysis_dir(state) / "kernel_ledger.yaml"
+        data = yaml.safe_load(ledger.read_text(encoding="utf-8"))
+        if missing == "models":
+            del data["models"]
+        else:
+            del data["kernels"][0]["model"]
+        ledger.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_without_model
+    try:
+        with pytest.raises(RuntimeError, match="model"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.round_index == 0
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+@pytest.mark.parametrize("revision", ["missing", "no_evidence", "justified"])
+def test_replan_model_changes_require_evidence_backed_revisions(tmp_path, fake_git, revision):
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents_with_ledger(
+        workflow, evaluator_verdicts=[("REJECT", "perf_shortfall", -1.0, 99.0)]
+    )
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_revised_model(state):
+        original_analyzer(state)
+        if state.round_index == 0:
+            return
+        ledger = workflow._analysis_dir(state) / "kernel_ledger.yaml"
+        data = yaml.safe_load(ledger.read_text(encoding="utf-8"))
+        data["models"][0]["predicted_ms"] = 0.025
+        if revision != "missing":
+            data["model_revisions"] = [
+                {
+                    "round": 2,
+                    "model": "gdn-state",
+                    "reason": "Source inspection found 16 MB of previously omitted mandatory reads",
+                    "evidence": ["analysis/state_read_audit.txt"]
+                    if revision == "justified"
+                    else [],
+                    "changes": {"predicted_ms": {"from": 0.020, "to": 0.025}},
+                }
+            ]
+        ledger.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_with_revised_model
+    try:
+        if revision == "justified":
+            workflow.run(str(task))
+        else:
+            with pytest.raises(RuntimeError, match="revision|evidence"):
+                workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace.count("profiler") == 1
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    if revision == "justified":
+        assert state.done is True
+        ledger = yaml.safe_load(
+            (ws / "rounds" / "round_2" / "analysis" / "kernel_ledger.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert ledger["models"][0]["predicted_ms"] == 0.025
+        assert ledger["model_revisions"][0]["evidence"] == ["analysis/state_read_audit.txt"]
+    else:
+        assert state.round_index == 1
+        assert state.stage == state_module.STAGE_ANALYZER
+
+
+@pytest.mark.parametrize("retain_revision", [False, True])
+def test_replan_preserves_model_revisions_from_previous_replan(tmp_path, fake_git, retain_revision):
+    task = _write_task(tmp_path, {**_KC_EXTRA, "optimize": {"max_items_per_round": 1}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents_with_ledger(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        evaluator_verdicts=[("REJECT", "perf_shortfall", -1.0, 99.0)],
+    )
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_model_history(state):
+        original_analyzer(state)
+        if state.round_index == 0:
+            return
+        ledger = workflow._analysis_dir(state) / "kernel_ledger.yaml"
+        data = yaml.safe_load(ledger.read_text(encoding="utf-8"))
+        data["models"][0]["predicted_ms"] = 0.025
+        if state.round_index == 1 or retain_revision:
+            data["model_revisions"] = [
+                {
+                    "round": 2,
+                    "model": "gdn-state",
+                    "reason": "Source inspection found additional mandatory state reads",
+                    "evidence": ["analysis/state_read_audit.txt"],
+                    "changes": {"predicted_ms": {"from": 0.020, "to": 0.025}},
+                }
+            ]
+        ledger.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_with_model_history
+    try:
+        if retain_revision:
+            workflow.run(str(task))
+        else:
+            with pytest.raises(RuntimeError, match="revision"):
+                workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace.count("profiler") == 1
+    assert trace.count("analyzer") == 3
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    if retain_revision:
+        assert state.done is True
+    else:
+        assert state.round_index == 2
+        assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_unified_model_is_analyzer_owned_and_judges_remain_measured(tmp_path):
+    prompts = _capture_driving_prompts(tmp_path, _KC_EXTRA)
+    assert "kernel_ledger.yaml" in prompts["analyzer"]
+    assert "Theoretical model vs silicon" in prompts["reporter"]
+    assert "headroom_ledger.yaml" not in prompts["analyzer"]
+    assert "headroom_ledger.yaml" not in prompts["reporter"]
+    for role in ("evaluator", "qa"):
+        assert "kernel_ledger.yaml" not in prompts[role]
+        assert "headroom_ledger.yaml" not in prompts[role]
 
 
 @pytest.mark.parametrize(
-    ("headroom", "concurrency", "focus", "expected"),
+    ("coverage", "concurrency", "focus", "expected"),
     [
-        (True, [8, 32, 128, 256], [32, 128], "scored concurrencies [32, 128]"),
-        (True, [8, 32, 128, 256], None, "scored concurrencies [8, 256]"),
-        (True, [8, 32, 128, 256], [32], "scored concurrencies [32]"),
+        (True, [8, 32, 128, 256], [32, 128], "largest concurrency point, 256, only"),
+        (True, [8, 32, 128, 256], None, "largest concurrency point, 256, only"),
+        (True, [8, 32, 128, 256], [32], "largest concurrency point, 256, only"),
         (False, [8, 32, 128, 256], [32, 128], "largest concurrency point, 256, only"),
         (False, 32, None, "scalar mode: one replay at the configured concurrency"),
     ],
 )
 def test_profiler_driving_prompt_selects_effective_profiling_points(
     tmp_path: Path,
-    headroom: bool,
+    coverage: bool,
     concurrency: int | list[int],
     focus: list[int] | None,
     expected: str,
 ) -> None:
-    """The replay instruction agrees with the scored bracket and workload shape."""
+    """The unified ledger does not add mandatory profiling replays."""
     extra = {
         "benchmark": {
             "concurrency": concurrency,
@@ -5251,29 +5126,20 @@ def test_profiler_driving_prompt_selects_effective_profiling_points(
             else 128,
         }
     }
-    if headroom:
-        extra["profile"] = {"kernel_coverage": {}, "headroom_ledger": {}}
+    if coverage:
+        extra["profile"] = {"kernel_coverage": {}}
     if focus is not None:
         extra["optimize"] = {"focus_concurrencies": focus}
     profiler = _capture_driving_prompts(tmp_path, extra)["profiler"]
     replay = profiler.split("replay the canonical benchmark load", 1)[1].split(", and drive", 1)[0]
     assert expected in replay
-    if headroom:
-        assert "once per distinct point" in replay
-        assert "largest concurrency point" not in replay
     if isinstance(concurrency, list):
         assert "`benchmark.num_prompts` is a list, use the entry paired" in replay
         assert "each selected point in `benchmark.concurrency`" in replay
         assert "otherwise use the scalar prompt count" in replay
 
 
-def test_report_only_driving_prompt_does_not_rank_on_targets(tmp_path):
-    prompts = _capture_driving_prompts(tmp_path, _hl_extra(target_layer="report_only"))
-    assert "report-only" in prompts["analyzer"]
-    assert "engineering gap" not in prompts["analyzer"]
-
-
-def test_default_driving_prompts_omit_the_headroom_ledger(tmp_path):
+def test_default_driving_prompts_omit_the_performance_model_contract(tmp_path):
     prompts = _capture_driving_prompts(tmp_path)
-    assert "headroom_ledger.yaml" not in prompts["analyzer"]
-    assert "Headroom Accounting" not in prompts["reporter"]
+    assert "kernel_ledger.yaml" not in prompts["analyzer"]
+    assert "Theoretical model vs silicon" not in prompts["reporter"]

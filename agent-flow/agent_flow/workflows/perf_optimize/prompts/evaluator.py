@@ -297,15 +297,11 @@ in whenever they apply:
   parse it reliably.
 - `gap_implication_note` — one sentence backing it, naming the
   mechanism and the evidence.
-- `parts` — the roadmap item's `parts` list, so the outcome can be
-  booked against the parts of the model it actually bears on. Pass the
-  item's list unless your own evidence says otherwise.
 - `lever` — a short label for the *mechanism family* this attempt spent
   (`launch-geometry-tuning`, `glue-chain-fusion`, `host-work-removal`).
-  Two attempts against the same bottleneck must carry different labels
-  when they tried genuinely different mechanisms: a failed attempt
-  closes a lever, not a bottleneck, and only *distinct* levers
-  converging can retire headroom.
+  Distinguish mechanisms so later analysis can tell what was tested.
+  A failed attempt establishes only what the cited evidence supports;
+  it does not prove that other implementations cannot improve.
 - `measured_gain_pooled_pct` and `measurement_confidence` — when you
   repeated the measurement and it disagrees with the scored arm, record
   your pooled estimate and mark it `repeated` or `not-reproducible`.

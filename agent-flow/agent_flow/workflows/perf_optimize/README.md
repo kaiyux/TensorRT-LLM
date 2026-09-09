@@ -102,11 +102,10 @@ round loop:
   *Remaining-gap attribution* section in `profile_findings.md` — every
   part of the gap gets a new item or an evidence-backed reason it
   cannot be closed in this campaign (unexplained parts stay labeled
-  unexplained). With a `profile.headroom_ledger` block it additionally
-  authors the campaign's **headroom ledger** — per-part gap accounting
-  plus a named target implementation per part — and ranks the roadmap on
-  the *engineering* gap (`measured - target`) rather than on the gap to
-  physics.
+  unexplained). With `profile.kernel_coverage`, it maintains a single
+  **kernel ledger** containing all four kernel questions and the best
+  current theoretical model, revised every round from facts about the
+  workload, hardware and actual implementation.
 - **optimizer** — one independent persistent optimizer is created for each
   dispatched item. With `item_execution: parallel`, up to
   `max_items_per_round` pairs run concurrently from the same frozen round
@@ -181,10 +180,10 @@ round loop:
   each verdict citing an artifact (a failed item's *Gap implication*,
   a round's *Remaining-gap attribution*, the projection's caveats) —
   a campaign may end short of the ceiling, but never without saying
-  why. With a `profile.headroom_ledger` block that breakdown is
-  *rendered from* `headroom_ledger.yaml` in a **Headroom Accounting**
-  section rather than re-derived from the round markdown, and every
-  ceiling or measurement revision is quoted verbatim.
+  why. With `profile.kernel_coverage`, the **Kernel Coverage**
+  section renders both the four questions and theoretical-model-versus-silicon
+  comparison from the latest kernel ledger, including evidence for model
+  revisions and explicitly unexplained discrepancies.
 
 The orchestrator — not the agents — owns the roadmap lifecycle fields and
 the git state of the TRT-LLM checkout, driven by the evaluator's
@@ -325,9 +324,11 @@ directly.
   disproven items obsolete, bounding the gains the measurements cap, and
   adding what the failures imply. Those verdicts are the round's real
   yield — an item measured dead is evidence about *this* build — and
-  converting them into roadmap edits is what the turn is for. The
-  per-kernel ledger contract is waived for such a round (it ran no ncu);
-  the standing ledger still describes the build.
+  converting them into roadmap edits and model updates is what the turn
+  is for. The analyzer writes a new kernel/model ledger using standing
+  measurements and the latest evidence, preserving prior revisions and
+  recording any justified change to the model. The same ledger validation
+  applies without a new ncu capture.
 
 The orchestrator selects the mode, and a replan round is not a skipped
 round: if it leaves nothing actionable, that is the roadmap-exhausted
@@ -394,18 +395,14 @@ without silently launching another capture.
 
 Two deliberate limits:
 
-- **Ledger state is never imported.** A source `roadmap.yaml` lands in
-  `reused_analysis/prior_roadmap.yaml` as reference material only — its
-  statuses, `measured_gain_pct` and `current_best` describe the *source*
-  campaign's checkout, not this one's. The plan-only analyzer weighs it
-  as evidence (carry the pending items forward, don't re-propose what
-  failed) rather than inheriting it. A source `headroom_ledger.yaml` is
-  not imported either — its partition and its dispositions are claims
-  about another checkout. For plan-only reuse, the *inputs* to a fresh
-  one do travel (`sol.json`, `regions.json`, `kernel_ledger.yaml` come
-  with the profile), so a reused round can author its own from imported
-  evidence. With `--reanalyze`, the analyzer regenerates these derived
-  artifacts from the saved captures.
+- **Roadmap state is never imported.** A source `roadmap.yaml` lands in
+  `reused_analysis/prior_roadmap.yaml` as reference material only; its
+  statuses, gains and current best describe the source checkout. Imported
+  `kernel_ledger.yaml`, `sol.json` and `regions.json` provide evidence for
+  the analyzer, which writes this round's own kernel/model ledger and
+  roadmap with local item references, source measurement conditions and
+  citations, and an initially empty local model revision history. With `--reanalyze`, it regenerates derived artifacts from the
+  saved captures.
 - **The baseline is inherited, not re-measured.** Every gain this
   campaign reports is computed against numbers measured by the source
   run, so the two must describe the same system. The import writes
@@ -421,15 +418,11 @@ checkpoint. To resume a campaign already started in re-analysis mode,
 rerun without `--reanalyze`: the checkpoint preserves the choice. Plain
 `--reuse-analysis` on resume is ignored with a warning.
 
-Note that a run whose `profile.kernel_coverage` contract is on does
-**not** enforce the per-kernel ledger for a plan-only reused round that
-carries none, nor for a replan-only round (neither produces a fresh
-analysis); every fresh analysis, including `--reanalyze`, is still bound
-by it. A plan-only reused round that *did* import a ledger is held to
-the contract, but one this campaign
-cannot satisfy — an older schema, or `item` refs naming the source
-campaign's roadmap ids — is waived with a warning rather than aborted,
-since the plan-only round never writes a ledger a retry could repair.
+A run with `profile.kernel_coverage` validates this round's kernel/model
+ledger after every analyzer turn, including plan-only reuse and replan-only
+rounds. These rounds preserve source measurement provenance while updating
+the model and four-question reasoning from available facts; they need no
+new capture.
 
 ## Usage
 
@@ -537,7 +530,6 @@ running the CLI.
 ├── task.yaml                        # resolved spec (defaults filled in)
 ├── prompts/<role>.md                # composed system prompt per role, snapshotted at launch
 ├── roadmap.yaml                     # the ranked plan; statuses/gains updated as the loop runs
-├── headroom_ledger.yaml             # per-part gap accounting + target layer (with a profile.headroom_ledger block)
 ├── sol_projection.md                # projector's SOL ceiling + baseline-vs-SOL gap (blank when sol.enabled: false)
 ├── sol_work/peaks.json              # projector's machine-readable peaks (analyzer's correlation joins against it)
 ├── baseline/
@@ -641,7 +633,7 @@ running the CLI.
   coverage target is reached, captured over up to 3 bounded ncu passes
   that re-filter on still-missing stems so once-per-step kernels are
   not starved by per-layer hot ones). The profiler owns targeting and
-  capture coverage; for each fresh analysis the analyzer must then
+  capture coverage; on every turn the analyzer must then
   answer four questions per enumerated kernel — *can it be eliminated?*
   *can it be made faster?* *can it be fused with its neighbors?* *can it
   be overlapped with independent work on another stream?* — in
@@ -693,66 +685,35 @@ running the CLI.
   untried tail. Requires `nsys` + `ncu` in `profile.methods`; costs
   extra profiling wall-clock in rounds that collect fresh captures.
 
-- **Headroom ledger (optional).** A `profile.headroom_ledger` block in
-  `task.yaml` (empty mapping = defaults: `enforcement: warn`,
-  `target_layer: ranking`, `tolerance_pct: 1.0`, `min_share_pct: 0.5`)
-  adds the campaign's **accounting layer** at
-  `<workspace>/headroom_ledger.yaml` — campaign-scoped, unlike the
-  per-round `kernel_ledger.yaml`. Each round the analyzer records, per
-  *part* of the deployment, where the remaining gap-to-SOL sits
-  (`measured_ms` / `sol_ms` / `gap_ms` at **both** bracketing focus
-  concurrencies, so a part's `sensitivity` is measured rather than
-  assumed), which kernel-ledger rows the part is made of, how its gap
-  splits into `closed` / `attributed` / `open` / `unexplained`, and —
-  the **target layer** — what a named, buildable implementation would
-  achieve. That inserts a third tier between the floor and today,
-  `sol_ms <= target_ms <= measured_ms`, splitting the gap into an
-  *engineering* half (`measured - target`: a better implementation is
-  known — this is where items come from, and with `target_layer:
-  ranking` it is what `expected_gain_pct` is sized against) and a
-  *structural* half (`target - sol`: nobody knows how to reach the
-  floor). Requires the SOL projector and `profile.kernel_coverage`.
+  The same ledger also contains the analyzer's **best theoretical
+  performance model**. Every kernel references a model, and several
+  kernels may share a logical-region or iteration model so fusion,
+  elimination and overlap do not force artificial kernel boundaries or
+  double-count savings. Each model states its operating point, derivation,
+  assumptions, hardware constraints, predicted milliseconds, matching
+  measured milliseconds and evidence, unexplained discrepancy, and next
+  discriminating experiment. Missing predictions or measurements are
+  explicit `null` values with an explanation and next test.
 
-  The rules exist to stop a campaign quietly talking itself out of real
-  headroom, one plausible revision at a time. **A failed item closes a
-  lever, not a part**: it earns a `disposition` — mechanism, label and
-  citation — while retiring the part's gap needs an `attribution` whose
-  basis actually holds (every kernel dismissed on all four ledger
-  questions, or two or more *distinct* levers converging). One failure
-  is an anecdote. The ceiling is a bound, not a description: `sol_ms`
-  moves only through a `model_revisions` entry proving the *model* was
-  wrong, `measured_ms` only through `measurement_revisions`, and
-  `target_ms` only through `target_revisions` — each requiring a `cause`
-  from a closed enum, a `detail` naming the specific defect (a detail
-  that restates its cause is rejected), and a resolving `evidence`. The
-  `gap_implication` vocabulary gains `change-not-live` for a change that
-  was applied but never executed in the measured binary: it looks
-  identical to `applied-but-no-gain` in the numbers and means the
-  opposite, since the mechanism was never tested, so neither it nor
-  `blocked-by-constraint` may count toward a convergence basis. Coverage
-  is mandatory and must reconcile to the step: every part is tagged
-  `analytic` (a ceiling exists), `empirical` (an ncu bound class only) or
-  `unmodeled` (counted, unbounded), and a part with no ceiling must leave
-  `sol_ms` null rather than invent one — so "no modeled gap" can never be
-  read as "no headroom".
+  On every turn, including replan-only rounds, the analyzer writes a new
+  `analysis/kernel_ledger.yaml` using standing measurements or a new
+  capture as appropriate. It preserves previous models and appends
+  evidence-backed changes in `model_revisions`, including the old and new
+  value of each changed field. Experiments improve the implementation when
+  they expose inefficiency and improve the model when they expose missing
+  costs or invalid assumptions. A failed optimization alone justifies
+  neither relaxing the prediction nor claiming the gap is unavoidable.
+  A measurement below a theoretical lower bound calls for investigating
+  model or measurement compatibility, not clamping the result. Convergence
+  means facts explain the residual under matching conditions; an
+  unexplained gap remains open even when the campaign ends.
 
-  The orchestrator owns `dispositions` and `history`, appending them
-  after each batch closes from the evaluator's **structured** progress
-  fields rather than by regex over prose (the `Gap implication:` line has
-  been written four different ways inside one campaign). It validates the
-  rest the moment the analyzer's turn ends — shape, the arithmetic
-  identity that the kernel join must reproduce `regions.json`'s
-  `measured_ms` (a mismatch reports the residual in ms *and* share_pct,
-  which usually names the missing row), the partition against live
-  roadmap state, and whether each attribution basis holds. It **warns
-  rather than aborts** by default: `kernel_ledger.yaml` already stops a
-  round on invalidity, and a second aborting gate over a much richer
-  schema is how a campaign dies on bookkeeping instead of on a
-  measurement; set `enforcement: error` once a campaign has run the
-  contract. The evaluator and QA see none of it — the ledger, the SOL
-  projection and the target layer are all invisible to them, because a
-  target is a *plan* and their gates stay measured-vs-measured. The
-  reporter renders a *Headroom Accounting* section from the file.
+  The reporter renders both kernel dispositions and model-versus-silicon
+  evidence in one *Kernel Coverage* section. The evaluator and QA retain
+  their measured-versus-measured gates. No separate accounting ledger,
+  implementation-target layer, partition buckets or mandatory attribution
+  machinery is required, and the SOL projector remains optional context.
+
 - **Optimization casebook.** The benchmarker/analyzer load the
   `trtllm-agent-toolkit:perf-optimization-casebook` skill as read-only
   reference; the optimizer uses it *actionably* (how-to-apply /
@@ -776,7 +737,8 @@ running the CLI.
   grounded at all, and never fabricates one. It
   runs once per campaign: the ceiling depends only on the hardware +
   model + operating point, so every later round compares against the
-  same `sol_projection.md`. Consumers: the analyzer (roadmap ranking
+  initial `sol_projection.md` as provenance, while the analyzer updates its
+  current model from new facts. Consumers: the analyzer (roadmap ranking
   context; each round it also joins its fresh per-op measurements
   against the projector's `sol_work/peaks.json` with the skill's
   `sol_calc.py analyze` and reports the joined table in

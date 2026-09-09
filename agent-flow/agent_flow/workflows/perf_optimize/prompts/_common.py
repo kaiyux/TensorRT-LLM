@@ -17,10 +17,9 @@ variant for the optimizer, the optimization report's HTML companion
 spec, and the SOL-projection consumption blocks (``SOL_ANALYZER_CONTEXT``
 / ``SOL_OPTIMIZER_CONTEXT`` / ``SOL_OPTIMIZE_REPORTER_GUIDANCE``,
 appended only when the projector stage is enabled — the default, unless
-``task.yaml`` sets ``sol.enabled: false``), and the headroom-ledger
-contract (``headroom_ledger_analyzer_note`` /
-``HEADROOM_LEDGER_REPORTER_GUIDANCE``, appended only when ``task.yaml``
-declares ``profile.headroom_ledger``).
+``task.yaml`` sets ``sol.enabled: false``), and the unified kernel/model ledger
+contract (appended only when ``task.yaml`` declares
+``profile.kernel_coverage``).
 """
 
 from typing import Sequence
@@ -57,7 +56,6 @@ __all__ = [
     "EXECUTION_SLURM_BOOTSTRAP",
     "EXPECTATION_GATE",
     "GIT_DISCIPLINE",
-    "HEADROOM_LEDGER_REPORTER_GUIDANCE",
     "KERNEL_COVERAGE_REPORTER_GUIDANCE",
     "KERNEL_REUSE",
     "KERNEL_REUSE_ANALYZER",
@@ -82,7 +80,6 @@ __all__ = [
     "TUNING_CONFIG_NOTE",
     "approach_restriction_note",
     "build_offline_analysis_reference",
-    "headroom_ledger_analyzer_note",
     "kernel_coverage_analyzer_note",
     "kernel_coverage_ncu_targeting",
 ]
@@ -900,19 +897,22 @@ column is the baseline snapshot.
   `expected_gain_pct` by recoverable headroom on the binding resource.
   Host/scheduler/queueing costs are outside the projection's model of
   kernel execution plus per-launch latency.
-- Reuse the ceiling across rounds. A documented model defect may justify
-  a correction; when the headroom ledger is enabled, record it through
-  `model_revisions`. An optimization failure alone never changes SOL.
+- Treat the projection as the initial theoretical model, not a frozen
+  answer. Maintain the best current model as new facts establish missing
+  costs or invalid assumptions; with kernel coverage, record changes in
+  `kernel_ledger.yaml`'s `model_revisions`. An optimization failure alone
+  never justifies weakening a bound. Preserve the baseline projection as
+  provenance while current predictions evolve.
 - Fresh measured evidence outranks the projection. In
   `profile_findings.md`, state where each ranked hypothesis confirms or
   contradicts it. Projected numbers must remain labeled as projections.
 - When no actionable item remains despite meaningful projected headroom,
   include **## Remaining-gap attribution** in `profile_findings.md`.
-  Derive it from the standing correlation and headroom ledger when present:
-  name each part, its roadmap item or evidence-backed campaign constraint,
+  Derive it from the standing correlation and kernel ledger when present:
+  name each kernel or logical region, its roadmap item or evidence-backed campaign constraint,
   and any `unexplained` remainder. Cite failed items' `evaluation.md`
-  *Gap implication* evidence; apply the ledger's attribution rules rather
-  than making a separate accounting judgment for this table.
+  *Gap implication* evidence; preserve the ledger's unexplained discrepancies instead of inventing
+  an explanation for this table.
 - If the projection is missing or unavailable, skip correlation and its
   use in ranking, and record the reason in *Caveats*.
 
@@ -922,10 +922,11 @@ column is the baseline snapshot.
 Keep `regions.json`, `sol.json`, and any `sol_recipes/` in this round's
 `analysis/` directory. The peaks file remains at
 `<campaign_workspace>/sol_work/peaks.json`. Re-run correlation in full analyses, including re-analysis,
-using the selected capture measurements and the standing ceiling (or a documented model
-revision). Replan-only rounds reuse the standing correlation. Human SOL
+using the selected capture measurements and the best current model.
+Replan-only rounds preserve standing measurements and may revise analytical
+predictions from new facts without collecting measurements. Human SOL
 and remaining-gap tables derive their numbers from these artifacts and
-`headroom_ledger.yaml` when present.
+`kernel_ledger.yaml` when present.
 """
 )
 
@@ -1011,13 +1012,21 @@ captured (which buckets the whole gap fell into), echoed in the
 Executive Summary.
 
 Weighing rules:
-- **SOL numbers come only from `sol_projection.md`** — never re-derive
-  or extrapolate them. The baseline side comes from the projection's
+- **SOL numbers come only from `sol_projection.md`** for this initial-
+  projection comparison — never re-derive or extrapolate them. Label this
+  baseline projection clearly; the Kernel Coverage section shows the best
+  current model and its revisions from `kernel_ledger.yaml`. The baseline side comes from the projection's
   own measured-vs-SOL table; the final side comes from the final
   verification's independent measurement, else the roadmap ledger
   (`current_best`) — say which. When the final verification did not run
   (nothing accepted), final == baseline and the section must say the
   campaign captured none of the projected headroom.
+- When facts supersede the initial projection, label its comparison
+  **superseded initial model**, cite the model revision, and use the best
+  current model for claims about remaining opportunity. A historical
+  percent-of-SOL headline is not evidence that the remaining gap is
+  recoverable. Never present a falsified prediction as the campaign's
+  current theoretical limit.
 - **Echo the headroom story where it matters**: one sentence in the
   Executive Summary (how much of the SOL headroom was captured, and —
   when most of it was not — the dominant accountability bucket why) and
@@ -1036,10 +1045,11 @@ Weighing rules:
 - The projection is a model, not a measurement — when it conflicts with
   measured evidence, measured evidence wins, and the conflict is worth
   a sentence.
-- The ceiling models kernel execution plus per-launch latency only — a
-  measured result far below it often indicates serving-stack
-  scheduler/queueing costs the model does not price; treat that as
-  supporting evidence for host-side categories, not as a contradiction.
+- The projection models kernel execution plus per-launch latency only.
+  Attribute missing time to host/scheduler costs only when traces or
+  measurements establish them; a large discrepancy alone does not
+  distinguish implementation inefficiency from model error. Check units,
+  operating conditions, scope and assumptions before drawing a conclusion.
 - If `sol_projection.md` is missing or declares itself unavailable, the
   section must honestly say **"Projection unavailable (<reason>)"** and
   the report falls back to measured evidence alone — never fabricate
@@ -1097,13 +1107,22 @@ def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: flo
     return f"""\
 ## Per-kernel coverage contract (this task declares `profile.kernel_coverage`)
 
-Every full analysis, including re-analysis, write `analysis/kernel_ledger.yaml` for the kernels
-enumerated from the selected capture's timeline: all kernels at/above {min_share_pct}%
-and enough additional rows to cover {coverage_target_pct}% of GPU time.
-A missing row or question, invalid roadmap reference, or insufficient
+Every analyzer turn, including re-analysis and replan-only rounds, write
+this round's `analysis/kernel_ledger.yaml`. It is the single ledger for
+kernel opportunities and the best theoretical performance model. Enumerate
+all kernels at/above {min_share_pct}% and enough additional rows to cover
+{coverage_target_pct}% of GPU time from the selected capture's timeline.
+A missing row, question or model, invalid roadmap reference, or insufficient
 coverage aborts the stage. Re-analysis rebuilds the ledger from saved
 evidence, independently of the profiler's ncu target selection. Replan-only
-rounds reuse the standing ledger and owe no new capture or ledger.
+rounds copy the standing measurements and coverage into a fresh ledger,
+then update the questions and model from new facts and attempt outcomes;
+they owe no new capture. Preserve measurement provenance and prior
+`model_revisions`; never pass off unchanged measurements as a fresh capture.
+For a new campaign seeded by reused analysis, read its ledger as prior art,
+write a new version-2 ledger with local roadmap references and initial
+`model_revisions: []`, and preserve the source operating conditions and
+measurement citations. Start local revision history from this initial model.
 
 ### Materiality and shared disposition rules
 
@@ -1242,10 +1261,52 @@ Dismissal tags:
 - `phase-boundary` — name the capture, stream, or prefill/decode boundary
   preventing the pairing.
 
+### Maintain the best theoretical model, based on facts
+
+For each kernel, reference one best current model in `models`. A model may
+cover a kernel, a logical region shared by several kernels, or an iteration:
+fusion and elimination change kernel boundaries without changing the work
+being modeled. State its derivation, assumptions, hardware constraints,
+operating point, predicted time, measured time, and evidence for each.
+Use matching units and scope: identify hardware, shapes/dtypes, concurrency,
+rank, capture/build, and timing aggregation in `operating_point`; compare
+predicted and measured milliseconds only under compatible conditions.
+A shared model appears once. Never sum overlapping kernel durations or
+alternative fusion/elimination/overlap savings as independent gains.
+
+Every round, review new trace/counter measurements, source facts and
+experiment outcomes against this model. Improve the implementation when
+facts expose inefficiency; revise the model when facts expose invalid
+assumptions, omitted necessary work, or a demonstrably wrong hardware
+constraint. Record each changed model field with its previous and new
+value, reason, round and evidence in append-only `model_revisions`. Carry
+unchanged models and revision history forward. If fusion or elimination
+retires a model, record `changes.removed` with `from` equal to its complete
+previous model mapping and `to: null`, plus the reason and evidence;
+preserve its earlier revisions. Replan-only rounds must also update the model
+when new facts warrant it, keeping measured values and their provenance
+unchanged unless new measurements actually exist.
+
+A failed optimization alone cannot justify relaxing the model, retiring a
+kernel's remaining opportunity, or claiming convergence. Establish whether
+the intended mechanism actually executed and what the experiment proves.
+Measured time below a predicted lower bound exposes an invalid model or
+incompatible measurement: investigate and record the correction, never
+clamp the measurement or silently move the prediction to match it. Unknown
+predictions or measurements are `null`, with the missing facts named in
+`unexplained` and a concrete `next_test`; unknown never means no opportunity.
+Convergence means the implementation approaches a defensible prediction
+and facts explain the residual, not merely that two numbers agree. Keep
+unexplained gaps open and identify the next experiment that can distinguish
+implementation limits from model error. Request new runtime evidence from
+the profiler/evaluator; never launch a GPU experiment as the Analyzer.
+The initial SOL projection, when available, is evidence for a model, not a
+requirement or a permanently frozen answer. Keep it intact as provenance.
+
 ### The kernel ledger contract (`kernel_ledger.yaml`)
 
 ```yaml
-version: 1
+version: 2
 source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct
@@ -1256,6 +1317,7 @@ kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
     share_pct: 18.4                     # % of in-window GPU time (nsys_analysis)
+    model: state-update                # references models[].id
     ncu:                                # metrics mapping (or the string below)
       duration_us: 41.2
       sm_sol_pct: 12.1
@@ -1284,6 +1346,7 @@ kernels:                        # descending share_pct; one row per kernel/group
   - kernel: allreduce_fusion            # a collective: never goes under ncu at all
     full_name: "void tensorrt_llm::kernels::ar_fusion::..."
     share_pct: 9.2
+    model: allreduce
     ncu: "unavailable: collective — kernel replay deadlocks the ranks"
     bound: comm                         # with the string form, `bound` sits here
     elimination:
@@ -1302,6 +1365,58 @@ kernels:                        # descending share_pct; one row per kernel/group
       concurrent_with: "nothing independent in reach: every rank blocks here before
         the next layer (cuda_gpu_trace, step 120)"
       ref: "no-independent-partner: the collective is the layer's barrier"
+models:
+  - id: state-update
+    scope: kernel                      # kernel | region | iteration
+    operating_point:
+      hardware: H100-SXM
+      concurrency: 32
+      dtype: bf16
+      shape: "state [32, 64, 128]"
+      rank: 0
+      capture: round-2-capture
+      build: "profile_manifest.json runtime.build"
+      timing: "mean per invocation in steady-state steps 100-150"
+    derivation: "mandatory 8 MB / measured sustainable 2 TB/s = 0.004 ms"
+    assumptions: ["Each state element is read and written once; no reuse across steps"]
+    evidence: ["modeling_x.py:412 mandatory traffic; calibration/bandwidth.md"]
+    predicted_ms: 0.004
+    measured_ms: 0.0412
+    measurement_evidence: ["server_ncu.csv state-update duration, profile_manifest.json"]
+    unexplained: "0.0372 ms above mandatory traffic bound; replay counters suggest extra traffic"
+    next_test: "Count actual bytes and cache misses for the state-update launch"
+  - id: allreduce
+    scope: region
+    operating_point:
+      capture: round-2-capture
+      hardware: "8 H100-SXM, NVLink"
+      concurrency: 32
+      dtype: bf16
+      shape: "TP partials [32, 8192]"
+      rank: all
+      build: "profile_manifest.json runtime.build"
+      timing: "critical-path collective per iteration, steps 100-150"
+    derivation: "Need actual collective algorithm and channel bandwidth before bounding latency"
+    assumptions: ["TP reduction is necessary; fused epilogue shares this region"]
+    evidence: ["source collective call and cuda_gpu_trace step 120"]
+    predicted_ms: null
+    measured_ms: null
+    measurement_evidence: []
+    unexplained: "Collective timing and channel calibration unavailable at this operating point"
+    next_test: "Request rank-aligned collective timing and channel calibration"
+model_revisions: []                    # preserved and appended each round
+# Revision entry shape (actual changes only, with artifact citations):
+# - round: 3
+#   model: state-update
+#   reason: "Source confirms a second mandatory state read omitted by the model"
+#   evidence: ["modeling_x.py:416 and trace/traffic.csv"]
+#   changes:
+#     predicted_ms:
+#       from: 0.004
+#       to: 0.006
+#     derivation:
+#       from: "mandatory 8 MB / measured sustainable 2 TB/s = 0.004 ms"
+#       to: "mandatory 12 MB / measured sustainable 2 TB/s = 0.006 ms"
 ```
 
 - `disposition: item` references an existing or newly authored roadmap id;
@@ -1325,7 +1440,8 @@ kernels:                        # descending share_pct; one row per kernel/group
   original evidence plus `carried from round <k>`. Re-derive changed
   rows, include newly qualifying kernels, and re-derive fusion/overlap
   when the neighbor/partner changed. Recompute materiality whenever
-  `gpu_busy_pct` changes. Replan-only rounds keep standing measurements.
+  `gpu_busy_pct` changes. Replan-only rounds keep standing measurements in their new ledger and
+  refresh model/disposition reasoning from the latest evidence.
 - Derive **## Kernel disposition ledger** in `profile_findings.md` from
   the authoritative YAML: kernel, GPU share %, wall-clock share %, bound,
   eliminate →, faster →, fusion →, overlap →, plus one-line rationales.
@@ -1338,7 +1454,7 @@ KERNEL_COVERAGE_REPORTER_GUIDANCE = """\
 ## Kernel Coverage (this task declares `profile.kernel_coverage`)
 
 Every analyzer round wrote a `kernel_ledger.yaml` into its `analysis/`
-directory — one row per kernel at/above the task's share bar, each
+directory, including updated models and their evidence history — one row per kernel at/above the task's share bar, each
 answering *eliminable?*, *faster?*, *fusible?* and *overlappable?* with
 a roadmap item or an evidence-backed dismissal. `Read` the **final round's** ledger
 (your instructions name it) and add one section to
@@ -1372,6 +1488,17 @@ budget ran out — the untried tail a follow-up campaign starts from —
 and mirror those into Remaining Roadmap / Durable facts (`[alive]`).>
 ```
 
+After the four-question table, render a **Theoretical model vs silicon**
+table from the same ledger, one row per distinct model: scope/operating
+point, predicted ms, measured ms, unexplained residual, and next test.
+Explain what facts changed the model across rounds using `model_revisions`.
+Distinguish measured implementation improvements from model corrections;
+neither counts as the other. Mark unknown predictions explicitly and
+surface measurements below a predicted lower bound as a model discrepancy.
+Do not sum shared regions or overlapped durations. Convergence requires
+facts explaining the residual; never hide an open discrepancy because the
+campaign stopped or an attempted optimization failed.
+
 Rigor rules for this section:
 
 - **Every cell traces to the ledger or the roadmap** — dispositions and
@@ -1383,8 +1510,8 @@ Rigor rules for this section:
   evolved); the guarantee the section attests is the final state's.
 - **Say how much of the table ncu actually measured.** A row whose `ncu`
   is the `unavailable: <reason>` string, or whose metrics are null with
-  a `note` explaining the gap, was dispositioned from nsys and the SOL
-  correlation — not from a capture. Count those rows, state it in the
+  a `note` explaining the gap, was dispositioned from nsys, source facts and any available
+  model evidence — not from ncu metrics. Count those rows, state it in the
   headline ("ncu contributed per-kernel metrics for 3 of 22 rows; the
   rest carry the ledger's degrade reason"), and qualify each such
   `bound` cell with the ledger's reason (`memory — no ncu: replay
@@ -1393,348 +1520,6 @@ Rigor rules for this section:
 - If the final round's ledger is missing or invalid, say so plainly
   ("Kernel coverage ledger unavailable (<reason>)") — never reconstruct
   rows from memory.
-"""
-
-
-# --------------------------------------------------------------------------- #
-# Headroom ledger (analyzer / reporter) — built per run
-# --------------------------------------------------------------------------- #
-
-
-def headroom_ledger_analyzer_note(
-    target_layer: str = "ranking",
-    enforcement: str = "warn",
-    min_share_pct: float = 0.5,
-) -> str:
-    """Return the campaign's headroom accounting and target contract.
-
-    Args:
-        target_layer: Whether targets guide ranking or remain report-only.
-        enforcement: Whether invalid ledgers abort the stage or warn.
-        min_share_pct: Minimum GPU share requiring an empirical part.
-    """
-    if target_layer == "ranking":
-        ranking_rule = """\
-**Size expected gains from the engineering gap.** Bound an item's
-`expected_gain_pct` by recoverable `measured_ms - target_ms`, and identify
-that implementation in `expected_gain_rationale`. Keep pending roadmap
-items ordered by expected gain on the scored points. `basis: none-known`
-means zero engineering gap: its distance to SOL is structural, so a
-proposal against it is research rather than a supported gain estimate."""
-    else:
-        ranking_rule = """\
-**The target layer is report-only this campaign.** Author and report
-targets, but continue sizing gains from measured evidence and ordering
-pending roadmap items by `expected_gain_pct`; targets do not steer it."""
-    consequence = (
-        "aborts the analyzer stage"
-        if enforcement == "error"
-        else "warns without stopping the round"
-    )
-    return f"""\
-## The headroom ledger (`headroom_ledger.yaml`)
-
-Update this campaign-level file at the workspace root every round. It
-records per-part headroom, spent levers, and buildable targets. Replan-only
-rounds incorporate new verdicts using standing measurements; full
-analyses refresh interpretation of the selected captures under their
-recorded effective profiling policy, without collecting measurements.
-
-### The three tiers
-
-```
-sol_ms <= target_ms <= measured_ms
-```
-
-- `sol_ms`: mandatory work at hardware peak with ideal structure.
-- `target_ms`: a named, buildable implementation's predicted time.
-- `measured_ms`: current observed time.
-
-`measured_ms - target_ms` is the **engineering gap**;
-`target_ms - sol_ms` is the **structural gap** without a known realization.
-
-{ranking_rule}
-
-### The shape
-
-```yaml
-version: 1
-operating_point:                # the model is valid ONLY for these points
-  concurrency: [64, 512]        # points from the effective profiling policy
-  isl: 1024
-  osl: 1024
-  build_sha: <the profiled HEAD>
-  node: <node>
-  capture_state: gpu-bound      # gpu-bound | host-bound | mixed
-timing:
-  step_ms: 18.372               # anchored median iteration
-  kernel_ms: 17.335             # per-rank-step kernel time
-coverage:                       # MANDATORY; must reconcile to step_ms
-  modeled_kernel_ms: 10.210     #   analytic parts (a sol_ms exists)
-  modeled_pct: 58.9
-  empirical_kernel_ms: 6.342    #   ncu bound class only, no ceiling
-  unmodeled_kernel_ms: 0.784    #   counted but not bounded (the below-bar tail)
-  non_kernel_ms: 1.037          #   host/scheduler/idle, outside the model
-  residual_ms: 0.001            #   what the buckets miss — recorded, never absorbed
-parts:
-  - id: gdn_state:linear_attn:bf16    # == the sol.json per_op[] region id
-    source: analytic                  # analytic | empirical | unmodeled
-    at:
-      64:  {{measured_ms: 0.412, sol_ms: 0.267, gap_ms: 0.145}}
-      512: {{measured_ms: 3.1321, sol_ms: 2.1386, gap_ms: 0.9935}}
-    sensitivity: steep                # flat | steep (null only if one point)
-    bound: memory
-    kernels: [_cached_replay_kernel]  # the join into kernel_ledger.yaml rows
-    partition:                        # sums to gap_ms at the HIGHEST point
-      closed_ms: 0.0
-      attributed_ms: 0.0
-      open_ms: 0.0
-      unexplained_ms: 0.9935
-    attribution:                      # the only field that FORECLOSES
-      attributed_ms: 0.0
-      basis: null                     # kernel-ledger-exhaustive | convergent-levers
-      note: null                      # required and non-empty when > 0
-    target:                           # see "The target block" below
-      target_ms: 2.62
-      ...
-part_lifecycle:                       # a part an accepted item deleted
-  - {{round: 2, part: logits_upcast:bf16_to_fp32, event: eliminated,
-     by: opt-001, measured_ms: 0.9792, sol_ms: 0.2871}}
-model_revisions: []                   # the ONLY way sol_ms moves
-measurement_revisions: []             # the ONLY way a measured_ms is restated
-target_revisions: []                  # the ONLY way target_ms moves
-```
-
-You own the fields above. `dispositions` and `history` are
-**orchestrator-owned**, appended from evaluator verdicts after each batch.
-Read them without modifying them.
-
-### Parts, coverage, and the kernel join
-
-- `analytic`: use `sol.json`'s `per_op[].region` verbatim as the part id.
-- `empirical`: use the kernel-ledger row label. Every row at/above
-  {min_share_pct}% unclaimed by an analytic part becomes an empirical part.
-- `unmodeled`: use a stable structural-stage name such as
-  `host:response-walk` for counted time without a ceiling.
-
-Coverage is mandatory. Reconcile its modeled, empirical, unmodeled,
-non-kernel, and residual buckets to `step_ms`; retain the residual.
-`parts[].kernels` is the authoritative join into the kernel ledger:
-
-```
-sum(kernels[].share_pct) / 100 x kernel_ms = part measured_ms in regions.json
-```
-
-Use `regions.json` for this check: `sol.json` substitutes `exposed_ms`
-for communication rows. The orchestrator reports join residuals in ms
-and share_pct. Reuse stable ids across rounds, updating membership when
-kernels change. An optional `part: <part id>` on kernel-ledger rows is a
-reverse annotation derived from this join, not a second accounting source.
-
-### Concurrency sensitivity
-
-Enter each part at the operating points required by the effective
-profiling policy. Sensitivity requires two distinct bracketing points;
-a single point cannot establish it. With both endpoints, classify the gap:
-
-- `flat`: comparable at both ends.
-- `steep`: materially different; estimate its benefit separately at each
-  scored point and say which points `expected_gain_pct` claims.
-
-### The partition and attribution
-
-```
-gap_ms = closed_ms + attributed_ms + open_ms + unexplained_ms
-```
-
-- `closed`: recovered by an accepted item.
-- `attributed`: proven not closable in this campaign.
-- `open`: targeted by a pending item.
-- `unexplained`: remaining unaccounted time; prioritize it for further
-  investigation. Execution priority remains the roadmap's expected gain.
-
-**A failed item rules out its lever, not the whole part.** Positive
-`attribution.attributed_ms` requires one validated `basis`:
-
-- `kernel-ledger-exhaustive`: every joined kernel has all four questions
-  dispositioned `dismissed`.
-- `convergent-levers`: at least **two** dispositions with distinct `lever`
-  values and `gap_implication` in
-  {{`applied-but-no-gain`, `mechanism-already-present`}}.
-
-`change-not-live` and `blocked-by-constraint` dispositions do not establish
-that the mechanism was tested and never count toward either basis.
-Without a qualifying basis, keep the time `unexplained` and retain the
-spent-lever history.
-
-### Revision evidence
-
-Only `model_revisions` changes `sol_ms`; only `measurement_revisions`
-restates a measurement; only `target_revisions` changes a target.
-Every revision requires `cause` from its closed enum, a non-empty `detail`
-naming the specific defect, and a resolving `evidence` reference. Merely
-restating the cause in `detail` is rejected and reopens adjudication.
-Examples of concrete evidence:
-
-- `missing-factor`: the recipe counted 1 layer instead of 92; cite
-  `<recipe>@<sha>` and the model's layer count.
-- `wrong-peak`: sparse TFLOPS were used instead of dense; cite
-  `peaks.json`'s source and the correct value.
-- `wrong-parallelism`: the recipe assumed all SMs, but the grid has N
-  blocks; cite ncu `launch__grid_size`.
-- `mixed-state-capture`: state how many iterations were host-bound and
-  how compute absence exposed communication; cite `regions.json`.
-
-An optimization failure alone cannot revise SOL or retire headroom.
-Investigate an implementation defect, a model defect, or a measurement
-defect and use the appropriate path. Raising SOL, restating measured
-time downward, and attributing a gap each require evidence for the
-headroom they remove from consideration.
-
-### The target block
-
-```yaml
-    target:
-      target_ms: 2.62
-      structure: >-
-        One persistent kernel per layer: load S and the conv window once
-        into registers/SMEM, apply the update chain without round-tripping
-        S through HBM, store S once.
-      basis: derived            # existing-impl | published | derived | none-known
-      basis_ref: >-
-        same recipe arithmetic as sol_ms (<recipe>): S read once, written once
-      today: "5 kernels: _cached_replay, _causal_conv1d_update, ..."
-      achieved_efficiency:      # MEASURED, with a named source
-        value: 0.78
-        source: "moe_gemm_fc1 demonstrates 78% MBU on this node and workload"
-      delta:                    # must sum to measured_ms - target_ms
-        - {{cause: state-round-trip, ms: 0.42, evidence: "cuda_gpu_trace step 120"}}
-        - {{cause: launch-overhead, ms: 0.09, evidence: "5 launches vs 1; alpha from peaks.json"}}
-        - {{cause: unattributed, ms: 0.00}}
-      falsifier: >-
-        if the reduction cannot be held in registers at heads_local=16 the
-        fusion is unbuildable and target_ms collapses to measured_ms.
-```
-
-Compute targets using the same mandatory-work arithmetic as the ceiling:
-
-```
-target_ms = mandatory_work / achieved_efficiency
-          + n_launches x alpha_launch          # alpha from peaks.json
-          + observed_serialization
-```
-
-- `basis: none-known`: when no real implementation can be named, set
-  `target_ms == measured_ms`, omit `delta`, and leave the gap structural.
-- `existing-impl`: cite a resolving reference to the existing kernel.
-- `derived`: reuse the same recipe arithmetic as `sol_ms` to avoid
-  incompatible units or double-counted savings.
-- `achieved_efficiency`: **measured**, with a named source — this part's
-  ncu metrics, a same-class reference kernel in the same trace, or a
-  profiled `existing-impl`.
-- Named `delta` causes must be observable in traces or kernel/launch
-  counts. Include an explicit `unattributed` remainder and reconcile the
-  total to `measured_ms - target_ms`.
-- `falsifier`: required; name the dependency or constraint that would
-  make the target unbuildable.
-- Author targets for the largest gaps first; parts without targets retain
-  their accounting and do not acquire an invented engineering estimate.
-
-When an attempt falsifies a target, evaluate its optimizer finding and
-supporting evaluator/source evidence for a `target_revisions` entry.
-Use the dismissal vocabulary for `cause` (`multi-consumer-pinned`,
-`phase-boundary`, `resource-saturated`, `fast-path-blocked: <guard>`,
-`needs-rebuild: <artifact>`, ...). Its `detail` must identify the observed
-consumer, dependency, compiler register pressure, or blocking guard.
-A target revision reclassifies engineering gap as structural; it does
-not establish attribution or change the SOL ceiling.
-
-### `## Target implementation` — the findings section
-
-Every full analysis, including re-analysis, derive this section in `profile_findings.md` from
-the ledger and correlation artifacts, using model **execution order**:
-layer stages, attention/MoE blocks, tail, then runtime plumbing. Include
-empirical, unmodeled, and non-kernel stages so uncovered work is visible.
-Use columns `today | target structure | basis | measured | target | SOL
-| eng. gap | struct. gap`; append an engineering-gap ranking as a derived
-view. Do not independently author a second set of numbers or dispositions.
-
-### Roadmap linkage and progress
-
-Give every roadmap item a `parts` list naming the parts it attacks;
-`parts: []` is reserved for a whole-deployment change. Measure progress
-in absolute milliseconds (`closed_ms`, `attributed_ms`, `open_ms`,
-`unexplained_ms`, `eliminated_ms`). A % of SOL changes its denominator
-when a part is eliminated and cannot replace this accounting.
-
-The orchestrator validates the ledger when your turn ends; an invalid
-ledger {consequence}.
-"""
-
-
-HEADROOM_LEDGER_REPORTER_GUIDANCE = """\
-## Headroom Accounting (this task declares `profile.headroom_ledger`)
-
-The campaign maintained `headroom_ledger.yaml` at the workspace root:
-per-part gap accounting, the levers each round spent, and — where the
-analyzer authored one — a named target implementation per part. `Read`
-it and add one section to `optimization_report.md`, placed **between
-"Projection vs Measured" and "Config & Code Diff Summary"** (the HTML
-companion mirrors it like every other section):
-
-```
-## Headroom Accounting
-
-<Open with the coverage headline from `coverage`: modeled X ms of the
-kernel step (Y%), empirical Z ms carrying only a bound class, unmodeled
-W ms carrying no ceiling at all, plus non-kernel V ms outside the
-ceiling's model — stated in that order, because a reader who sees only
-the modeled share will mistake "little modeled gap" for "little
-headroom".
-
-Then the per-part table, in descending `unexplained_ms`, with the
-columns: part, source, measured, target, SOL, eng. gap, struct. gap,
-closed, attributed, open, unexplained, levers spent —
-where `levers spent` lists each disposition's `lever` with its
-`gap_implication`, and the campaign outcome of the item that produced
-it. Follow with the campaign totals in absolute milliseconds, and the
-`eliminated_ms` credit for any part an accepted item deleted outright.
-
-Lift the analyzer's `## Target implementation` walk from the final
-full analysis's `profile_findings.md` in structural (execution) order,
-unchanged. Print the engineering-gap ranking after it as a derived view.
-
-Close with every `model_revisions` and `measurement_revisions` entry
-**verbatim** — cause, detail and evidence. Those are the entries that
-moved the bar the campaign was measured against, and a reader cannot
-audit the result without seeing them.>
-```
-
-Rigor rules for this section:
-
-- **Every number comes from the ledger.** Do not re-derive a partition
-  from the round markdown, and do not soften an `unexplained` bucket
-  into an attributed one. `unexplained` is a finding, not a gap in the
-  report.
-- **Absolute milliseconds, not % of SOL.** Quote a % of SOL only
-  alongside the part set it was computed over: an accepted item that
-  deletes an inefficient part raises the average without anything
-  getting faster.
-- **Report the partition to the precision the noise floor justifies.**
-  Four decimals on a sub-millisecond bucket implies a confidence
-  repeated measurement on this hardware does not support; say so where
-  an item carries `measurement_confidence: not-reproducible` or a
-  pooled estimate that differs from the scored one.
-- **A target is a plan, not a measurement.** Never present `target_ms`
-  as something achieved, and carry each target's `basis` into the table
-  so a `derived` target never reads like a profiled one. A part with
-  `basis: none-known` is reported as such — its whole gap is structural.
-- **This section replaces the remaining-gap accountability table** that
-  *Projection vs Measured* would otherwise re-derive; that section keeps
-  its headroom-captured headline and points here.
-- If the ledger is missing or invalid, say so plainly ("Headroom ledger
-  unavailable (<reason>)") and fall back to the projection's own
-  accountability breakdown — never reconstruct a partition from memory.
 """
 
 

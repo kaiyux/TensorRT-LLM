@@ -51,7 +51,7 @@ def _perf_optimize_workspace(root: Path, rounds: int = 2) -> Path:
         analysis = root / "rounds" / f"round_{index}" / "analysis"
         _write(analysis / "profile_findings.md", f"# findings round {index}\n")
         _write(analysis / "server_nsys.nsys-rep", "trace\n")
-        _write(analysis / "kernel_ledger.yaml", f"version: 1  # round {index}\n")
+        _write(analysis / "kernel_ledger.yaml", f"version: 2  # round {index}\n")
     _write(root / "optimization_report.md", "# report\n")
     return root
 
@@ -156,6 +156,66 @@ def test_discover_skips_a_trailing_replan_round(tmp_path):
 
     assert found.findings == (source / "rounds" / "round_2" / "analysis" / "profile_findings.md")
     assert found.kernel_ledger == found.findings.parent / "kernel_ledger.yaml"
+
+
+@pytest.mark.parametrize("provenance", ["source", "manifest"])
+def test_discover_reuses_newest_ledger_for_selected_capture(tmp_path, provenance):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile", "standing-capture")
+    analysis = source / "rounds" / "round_1" / "analysis"
+    findings = _write(analysis / reuse.FINDINGS_NAME, "full findings")
+    _write(analysis / reuse.KERNEL_LEDGER_NAME, "version: 2\n")
+    _write(analysis / "nsys_analysis" / "summary.json", "{}")
+    for number in (2, 10):
+        later = source / "rounds" / f"round_{number}" / "analysis"
+        _write(
+            later / reuse.KERNEL_LEDGER_NAME,
+            "version: 2\nsource: rounds/round_1/analysis/nsys_analysis\n"
+            f"model_revisions: [{{round: {number}}}]\n",
+        )
+        if provenance == "manifest":
+            _write(
+                later / "analysis_manifest.yaml",
+                "capture_id: standing-capture\nprofile_dir: rounds/round_1/profile\n",
+            )
+
+    found = reuse.discover(source)
+
+    assert found.findings == findings
+    assert found.profile_dir == profile
+    assert (
+        found.kernel_ledger
+        == source / "rounds" / "round_10" / "analysis" / reuse.KERNEL_LEDGER_NAME
+    )
+
+
+@pytest.mark.parametrize("provenance", ["missing", "other-capture", "invalid-manifest", "outside"])
+def test_discover_keeps_sibling_ledger_when_newer_provenance_does_not_match(tmp_path, provenance):
+    source = tmp_path / "source"
+    _capture(source / "rounds" / "round_1" / "profile", "selected-capture")
+    analysis = source / "rounds" / "round_1" / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    sibling = _write(analysis / reuse.KERNEL_LEDGER_NAME, "version: 2\n")
+    _capture(source / "rounds" / "round_2" / "profile", "different-capture")
+    _capture(tmp_path / "outside", "outside-capture")
+    references = {
+        "missing": "unknown capture",
+        "other-capture": "rounds/round_2/profile",
+        "invalid-manifest": "rounds/round_1/profile",
+        "outside": "../outside",
+    }
+    later = source / "rounds" / "round_3" / "analysis"
+    _write(later / reuse.KERNEL_LEDGER_NAME, f"version: 2\nsource: {references[provenance]}\n")
+    if provenance == "invalid-manifest":
+        _write(
+            later / "analysis_manifest.yaml",
+            "capture_id: wrong-capture\nprofile_dir: rounds/round_1/profile\n",
+        )
+
+    found = reuse.discover(source)
+
+    assert found.findings == analysis / reuse.FINDINGS_NAME
+    assert found.kernel_ledger == sibling
 
 
 def test_discover_recognizes_a_profile_that_omitted_nsys(tmp_path):
@@ -275,14 +335,45 @@ def test_import_from_perf_optimize_brings_ledger_and_prior_roadmap(tmp_path):
     imported = _import_into(source, ws)
 
     analysis = ws / "rounds" / "round_1" / "analysis"
-    # The newest round's findings + its sibling ledger.
+    # Full findings remain analysis; the source ledger is reference material.
     assert "round 2" in (analysis / "profile_findings.md").read_text(encoding="utf-8")
-    assert "round 2" in (analysis / "kernel_ledger.yaml").read_text(encoding="utf-8")
+    prior = ws / reuse.REUSE_DIRNAME / reuse.PRIOR_KERNEL_LEDGER_NAME
+    assert "round 2" in prior.read_text(encoding="utf-8")
+    assert not (analysis / reuse.KERNEL_LEDGER_NAME).exists()
     assert imported.kernel_ledger is True
     # The source roadmap is prior art only — never this campaign's ledger.
     assert (ws / reuse.REUSE_DIRNAME / reuse.PRIOR_ROADMAP_NAME).is_file()
     assert not (ws / "roadmap.yaml").exists()
     assert imported.prior_roadmap is True
+
+
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_import_preserves_replan_ledger_as_prior_art_with_source_provenance(tmp_path, reanalyze):
+    source = tmp_path / "source"
+    _capture(source / "rounds" / "round_1" / "profile")
+    analysis = source / "rounds" / "round_1" / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME, "full profiling findings")
+    _write(analysis / reuse.KERNEL_LEDGER_NAME, "version: 2\n")
+    source_ledger = _write(
+        source / "rounds" / "round_7" / "analysis" / reuse.KERNEL_LEDGER_NAME,
+        "version: 2\nsource: rounds/round_1/profile\n"
+        "model_revisions: [{round: 7, evidence: [rounds/round_7/analysis/facts.md]}]\n",
+    )
+    workspace = tmp_path / "workspace"
+
+    imported = _split_import(source, workspace, reanalyze=reanalyze)
+
+    prior = workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_KERNEL_LEDGER_NAME
+    assert imported.kernel_ledger
+    assert prior.read_text() == source_ledger.read_text()
+    assert not (workspace / "rounds" / "round_1" / "analysis" / reuse.KERNEL_LEDGER_NAME).exists()
+    assert not (
+        workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_ANALYSIS_DIRNAME / reuse.KERNEL_LEDGER_NAME
+    ).exists()
+    manifest = imported.manifest_path.read_text()
+    assert str(source_ledger) in manifest
+    assert "reused_analysis/kernel_ledger.yaml" in manifest
+    assert "prior" in manifest and "model revision history" in manifest
 
 
 def test_import_writes_a_manifest_naming_source_and_destinations(tmp_path):
@@ -464,10 +555,12 @@ def test_reanalysis_preserves_prior_findings_separately_from_fresh_outputs(tmp_p
 
     prior = workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_ANALYSIS_DIRNAME
     assert (prior / reuse.FINDINGS_NAME).read_text() == "source conclusions"
-    assert (prior / reuse.KERNEL_LEDGER_NAME).read_text() == "source ledger"
+    prior_ledger = workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_KERNEL_LEDGER_NAME
+    assert prior_ledger.read_text() == "source ledger"
+    assert not (prior / reuse.KERNEL_LEDGER_NAME).exists()
     assert (prior / "nsys_analysis" / "summary.json").is_file()
     assert not imported.findings
-    assert not imported.kernel_ledger
+    assert imported.kernel_ledger
     assert not (workspace / "rounds" / "round_1" / "analysis" / reuse.FINDINGS_NAME).exists()
     assert findings.read_text() == "source conclusions"
 

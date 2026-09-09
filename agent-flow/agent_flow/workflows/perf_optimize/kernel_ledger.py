@@ -1,117 +1,62 @@
-"""Schema for the perf-optimize ``kernel_ledger.yaml`` contract.
+"""Unified per-round kernel coverage and theoretical performance ledger.
 
-The ledger is the machine-readable exhaustiveness proof behind
-``profile.kernel_coverage``: one row per kernel (or grouped kernel
-family) at/above the task's share bar, each row answering the four
-per-kernel questions — *(1) can it be eliminated?*, *(2) can it be made
-faster?*, *(3) can it be fused with its neighbors?* and *(4) can it be
-overlapped with independent work on another stream?* — with either a
-roadmap item or an evidence-backed dismissal. The analyzer writes one
-ledger per round into that round's ``analysis/`` directory; the
-orchestrator validates it the moment the turn ends (shape here, roadmap
-cross-references and the coverage target in :func:`cross_validate`), so
-a campaign can never conclude with a hot kernel whose elimination,
-optimization, fusion, or overlap possibility was silently skipped.
+The analyzer owns ``kernel_ledger.yaml``. Every enumerated kernel answers
+elimination, faster, fusion, and overlap, and references the best current
+performance model for that kernel, logical region, or iteration. Shared
+models survive fusion and changing kernel boundaries without duplicating
+or summing their predicted time.
 
-The four are ordered by how much they presuppose, each asking less than
-the last:
+Version 2 adds these fields to the coverage and four-question contract::
 
-- *elimination* presupposes only that the kernel currently runs. It is
-  first because a `yes` moots the other three and recovers the row's
-  **whole** share rather than a fraction of it.
-- *faster* and *fusion* presuppose the work is necessary **and** that
-  the kernel must run alone.
-- *overlap* drops the alone assumption: a kernel at its bound-class
-  ceiling (``faster`` → ``at-sol-floor``) whose neighbors move only
-  mandatory bytes (``fusion`` → ``neighbors-at-bandwidth-floor``) is
-  legitimately closed on both and can still give back most of its share
-  by running concurrently with independent work.
-
-``share_pct`` is read from the nsys **timeline decomposition** under
-``analysis/nsys_analysis/``, not from ``nsys_stats.txt``: ``kern_sum``
-sums overlapping streams across the whole capture, while the
-decomposition is an interval union clipped to the iteration window. The
-two rank kernels differently, and the bar this ledger enumerates down to
-should be the share of an iteration, not of a sum. Where the pipeline
-could not run, ``kern_sum`` is the honest fallback — say so in
-``source``.
-
-Shape::
-
-    version: 1
-    source: rounds/round_1/analysis/nsys_analysis   # the decomposition enumerated
-    coverage:
-      enumerated_share_pct: 96.8    # sum of kernels[].share_pct
-      other_share_pct: 3.2          # the explicit below-bar tail roll-up
-      min_share_pct: 0.5            # the bar rows were enumerated down to
-      gpu_busy_pct: 82.4            # GPU busy share of the profiled window —
-                                    # share_pct x this = share of WALL CLOCK,
-                                    # the unit every materiality test uses
+    version: 2
     kernels:
-      - kernel: gdn_bf16_state              # distinctive stem / group label (unique)
-        full_name: "void tensorrt_llm::..." # representative full name(s)
-        part: gdn_state:linear_attn:bf16    # optional: the headroom-ledger part
-        share_pct: 18.4                     # % of in-window GPU time (nsys_analysis)
-        ncu:                                # metrics mapping (or the string below)
-          duration_us: 41.2
-          sm_sol_pct: 12.1
-          mem_sol_pct: 78.5
-          occupancy_pct: null               # a metric the capture did not yield
-          bound: memory                     # compute | memory | latency | balanced | comm
-          note: "occupancy section empty: replay stalled"   # required by the null
-        elimination:                        # question 1 — should it run at all?
-          disposition: dismissed            # item | dismissed
-          why_it_runs: "state update read by the next layer's gate (NVTX + source)"
-          ref: "mandatory-math: per-step recurrence, no padded/invariant part"
-        faster:                             # question 2 — make this kernel faster
-          disposition: item                 # item | dismissed
-          ref: opt-003                      # item id, or the dismissal evidence
-        fusion:                             # question 3 — fuse with neighbors
-          disposition: dismissed
-          neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace step 120)"
-          ref: "multi-consumer-pinned: intermediate feeds residual + norm (cuda_gpu_trace)"
-        overlap:                            # question 4 — run concurrently with
-          disposition: item                 # independent work on an aux stream
-          concurrent_with: "moe_gemm (data-independent; serialized on stream 7,
-            cuda_gpu_trace step 120)"
-          ref: opt-004
-      - kernel: allreduce_fusion            # a collective: never goes under ncu
-        full_name: "void tensorrt_llm::kernels::ar_fusion::..."
-        share_pct: 9.2
-        ncu: "unavailable: collective — kernel replay deadlocks the ranks"
-        bound: comm                         # with the string form, `bound` sits here
-        elimination:
-          disposition: dismissed
-          why_it_runs: "TP-sharded partials summed for the next layer's norm (source)"
-          ref: "mandatory-math: the parallelism, not the kernel, requires the sum"
-        faster:
-          disposition: dismissed
-          ref: "approach-restricted: strategy A/B falsified in a prior round; no NVLS here"
-        fusion:
-          disposition: dismissed
-          neighbors: "sigmoid_gate_mul_add -> THIS -> scaleMatrixPerTensorVec (step 120)"
-          ref: "already-fused: this IS the AR + residual/norm/quant fused epilogue"
-        overlap:
-          disposition: dismissed
-          concurrent_with: "nothing independent in reach: every rank blocks here
-            before the next layer (cuda_gpu_trace step 120)"
-          ref: "no-independent-partner: the collective is the layer's barrier"
+      - kernel: state_update
+        model: state_region
+        # full_name, share_pct, ncu, and all four questions as before
+    models:
+      - id: state_region
+        scope: region                 # kernel | region | iteration
+        operating_point:             # prediction and measurement match these conditions
+          concurrency: 512
+          precision: bf16
+          hardware: B200
+          timing: in-window GPU interval union
+        derivation: "mandatory bytes / independently measured bandwidth = 2 ms"
+        assumptions: ["state is read once and written once"]
+        evidence: ["analysis/traffic.md: byte derivation and bandwidth experiment"]
+        predicted_ms: 2.0              # null only with unexplained + next_test
+        measured_ms: 3.0               # null only with unexplained + next_test
+        measurement_evidence: ["analysis/nsys_analysis/regions.json: state_region"]
+        unexplained: "1 ms remains; replay suggests incomplete memory-level parallelism"
+        next_test: "measure occupancy and outstanding requests at this shape"
+    model_revisions:
+      - round: 2
+        model: state_region
+        reason: "counter evidence shows a required second state read"
+        evidence: ["rounds/round_2/analysis/ncu.txt: DRAM read bytes"]
+        changes:
+          predicted_ms: {from: 1.0, to: 2.0}
 
-Ownership mirrors ``roadmap.yaml``: only the analyzer writes the ledger
-(a fresh file each round, carrying forward still-valid dismissals); the
-orchestrator only validates. ``item`` refs may point at items of any
-status — a kernel whose fix was already accepted or failed *was*
-considered, which is exactly what the ledger proves.
+The initial ledger has an empty revision history. New models establish their
+first derivation and evidence in ``models``; a revision requires a model from
+the previous ledger. Revisions retain their ordered history. Changes to the model's scope,
+operating point, derivation, assumptions, or prediction require a current-round,
+evidence-backed revision matching the previous and current values. Removing
+a model requires ``changes.removed: {from: <previous model>, to: null}``,
+which also preserves what was removed. Measurements may improve beyond a
+prediction: that falsifies the model and leaves an explicit residual to
+investigate. A failed optimization alone does not establish a physical floor.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 LEDGER_FILENAME = "kernel_ledger.yaml"
 
 DISPOSITIONS = ("item", "dismissed")
@@ -123,9 +68,8 @@ QUESTIONS = ("elimination", "faster", "fusion", "overlap")
 # The curated vocabulary of *why a kernel cannot be eliminated, made
 # faster, fused, or overlapped* — the leading tag of a `dismissed` ref,
 # spelled out per question in the analyzer prompt. Collected here so
-# consumers that need the same "why not" enum (a headroom-ledger
-# ``target_revisions`` cause, which asks exactly this question about a
-# planned kernel) reuse it rather than growing a parallel one that drifts.
+# consumers can reuse the same "why not" enum rather than growing a
+# parallel vocabulary that drifts.
 #
 # A ref is `tag` or `tag: <detail>`; :func:`dismissal_tag` splits it.
 # Not enforced on ``ref`` itself: a dismissal's value is its cited
@@ -219,7 +163,7 @@ class LedgerError(ValueError):
 
 def _is_number(value: Any) -> bool:
     # bool is an int subclass — reject it explicitly.
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _validate_coverage(data: Mapping[str, Any], errors: list[str]) -> None:
@@ -378,23 +322,248 @@ def _validate_row(row: Any, index: int, seen: set[str], errors: list[str]) -> No
     full_name = row.get("full_name")
     if not isinstance(full_name, str) or not full_name.strip():
         errors.append(f"'{where}.full_name' must be a non-empty string, got {full_name!r}")
-    # Optional link to the headroom ledger's part this row's time belongs
-    # to — formalizing what has been living in `regions.json` `_note`
-    # prose. Rows with no `part` are what makes the headroom ledger's
-    # `empirical` coverage bucket non-zero, so the field is how the two
-    # accounting systems reconcile; absent, the campaign behaves exactly
-    # as it did before the link existed.
-    part = row.get("part")
-    if part is not None and not (isinstance(part, str) and part.strip()):
-        errors.append(
-            f"'{where}.part' must be a non-empty headroom-ledger part id or omitted, got {part!r}"
-        )
+    model = row.get("model")
+    if not isinstance(model, str) or not model.strip():
+        errors.append(f"'{where}.model' must be a non-empty model id, got {model!r}")
     share = row.get("share_pct")
     if not _is_number(share) or share < 0:
         errors.append(f"'{where}.share_pct' must be a number >= 0, got {share!r}")
     _validate_ncu(row, where, errors)
     for question in QUESTIONS:
         _validate_disposition(row, question, where, errors)
+
+
+MODEL_SCOPES = ("kernel", "region", "iteration")
+_THEORY_FIELDS = ("scope", "operating_point", "derivation", "assumptions", "predicted_ms")
+_MODEL_FIELDS = (
+    *_THEORY_FIELDS,
+    "evidence",
+    "measured_ms",
+    "measurement_evidence",
+    "unexplained",
+    "next_test",
+)
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _string_list(value: Any, where: str, errors: list[str], *, nonempty: bool) -> None:
+    if (
+        not isinstance(value, list)
+        or (nonempty and not value)
+        or any(not _nonempty_string(entry) for entry in value)
+    ):
+        qualifier = "non-empty " if nonempty else ""
+        errors.append(f"'{where}' must be a {qualifier}list of non-empty strings")
+
+
+def _validate_models(data: Mapping[str, Any], errors: list[str]) -> None:
+    models = data.get("models")
+    if not isinstance(models, list) or not models:
+        errors.append("'models' must be a non-empty list of performance models")
+        return
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, model in enumerate(models):
+        where = f"models[{index}]"
+        if not isinstance(model, dict):
+            errors.append(f"'{where}' must be a mapping")
+            continue
+        model_id = model.get("id")
+        if not _nonempty_string(model_id):
+            errors.append(f"'{where}.id' must be a non-empty string")
+        elif model_id in by_id:
+            errors.append(f"'{where}.id' duplicates {model_id!r}")
+        else:
+            by_id[model_id] = model
+        if model.get("scope") not in MODEL_SCOPES:
+            errors.append(f"'{where}.scope' must be one of {list(MODEL_SCOPES)}")
+        point = model.get("operating_point")
+        if not isinstance(point, dict) or not point:
+            errors.append(f"'{where}.operating_point' must be a non-empty mapping")
+        if not _nonempty_string(model.get("derivation")):
+            errors.append(f"'{where}.derivation' must be a non-empty string")
+        _string_list(model.get("assumptions"), f"{where}.assumptions", errors, nonempty=False)
+        _string_list(model.get("evidence"), f"{where}.evidence", errors, nonempty=True)
+        for field in ("predicted_ms", "measured_ms"):
+            value = model.get(field)
+            if field not in model or (value is not None and (not _is_number(value) or value < 0)):
+                errors.append(f"'{where}.{field}' must be a finite number >= 0 or explicit null")
+        predicted = model.get("predicted_ms")
+        measured = model.get("measured_ms")
+        _string_list(
+            model.get("measurement_evidence"),
+            f"{where}.measurement_evidence",
+            errors,
+            nonempty=measured is not None,
+        )
+        unresolved = predicted is None or measured is None or predicted != measured
+        for field in ("unexplained", "next_test"):
+            value = model.get(field)
+            if not isinstance(value, str) or (unresolved and not value.strip()):
+                errors.append(
+                    f"'{where}.{field}' must be a string, non-empty for a null time or "
+                    "nonzero measured-minus-predicted residual; missing evidence or a "
+                    "falsified prediction remains open for investigation"
+                )
+    references: dict[str, list[str]] = {}
+    kernels = data.get("kernels")
+    for index, row in enumerate(kernels if isinstance(kernels, list) else []):
+        if not isinstance(row, dict) or not _nonempty_string(row.get("model")):
+            continue
+        model_id = row["model"]
+        if model_id not in by_id:
+            errors.append(f"'kernels[{index}].model' references unknown model {model_id!r}")
+        references.setdefault(model_id, []).append(row.get("kernel", f"kernels[{index}]"))
+    for model_id, model in by_id.items():
+        if model.get("scope") == "kernel" and len(references.get(model_id, [])) != 1:
+            errors.append(
+                f"model {model_id!r} with scope 'kernel' must reference exactly one kernel row; "
+                "use 'region' or 'iteration' for a shared model"
+            )
+
+
+def _is_removal(revision: Mapping[str, Any]) -> bool:
+    removed = revision.get("changes", {}).get("removed", {})
+    return (
+        isinstance(removed, dict)
+        and isinstance(removed.get("from"), dict)
+        and ("to" in removed and removed["to"] is None)
+    )
+
+
+def _validate_revisions(data: Mapping[str, Any], errors: list[str]) -> None:
+    revisions = data.get("model_revisions")
+    if not isinstance(revisions, list):
+        errors.append("'model_revisions' must be a list (empty for an initial model)")
+        return
+    models = data.get("models")
+    known_ids = {
+        model["id"]
+        for model in (models if isinstance(models, list) else [])
+        if isinstance(model, dict) and _nonempty_string(model.get("id"))
+    }
+    # Historical revisions to a retired model remain valid after its removal.
+    for revision in revisions:
+        if (
+            isinstance(revision, dict)
+            and isinstance(revision.get("changes"), dict)
+            and _is_removal(revision)
+            and _nonempty_string(revision.get("model"))
+        ):
+            known_ids.add(revision["model"])
+    for index, revision in enumerate(revisions):
+        where = f"model_revisions[{index}]"
+        if not isinstance(revision, dict):
+            errors.append(f"'{where}' must be a mapping")
+            continue
+        round_no = revision.get("round")
+        if not isinstance(round_no, int) or isinstance(round_no, bool) or round_no < 1:
+            errors.append(f"'{where}.round' must be a positive integer")
+        model_id = revision.get("model")
+        if not _nonempty_string(model_id):
+            errors.append(f"'{where}.model' must be a non-empty model id")
+        elif model_id not in known_ids:
+            errors.append(f"'{where}.model' references unknown model {model_id!r}")
+        if not _nonempty_string(revision.get("reason")):
+            errors.append(f"'{where}.reason' must explain the model revision")
+        _string_list(revision.get("evidence"), f"{where}.evidence", errors, nonempty=True)
+        changes = revision.get("changes")
+        if not isinstance(changes, dict) or not changes:
+            errors.append(f"'{where}.changes' must be a non-empty mapping of from/to values")
+            continue
+        for field, change in changes.items():
+            if field not in (*_MODEL_FIELDS, "removed"):
+                errors.append(f"'{where}.changes' names unknown model field {field!r}")
+            if not isinstance(change, dict) or set(change) != {"from", "to"}:
+                errors.append(f"'{where}.changes.{field}' must contain exactly 'from' and 'to'")
+            elif change["from"] == change["to"]:
+                errors.append(f"'{where}.changes.{field}' must record an actual change")
+            elif field in ("predicted_ms", "measured_ms"):
+                for endpoint, value in change.items():
+                    if value is not None and (not _is_number(value) or value < 0):
+                        errors.append(
+                            f"'{where}.changes.{field}.{endpoint}' must be a finite "
+                            "number >= 0 or null"
+                        )
+            if field == "removed" and not _is_removal(revision):
+                errors.append(
+                    f"'{where}.changes.removed' must record the previous model mapping "
+                    "as 'from' and null as 'to'"
+                )
+
+
+def _validate_model_updates(
+    ledger: Mapping[str, Any],
+    previous: Mapping[str, Any] | None,
+    round_no: int | None,
+    errors: list[str],
+) -> None:
+    revisions = ledger.get("model_revisions", [])
+    if previous is None:
+        if revisions:
+            errors.append("initial ledger must have an empty 'model_revisions' history")
+        return
+    old_history = previous.get("model_revisions", [])
+    if revisions[: len(old_history)] != old_history:
+        errors.append("'model_revisions' must preserve the complete previous revision history")
+        return
+    additions = revisions[len(old_history) :]
+    if round_no is not None and any(entry["round"] != round_no for entry in additions):
+        errors.append("new 'model_revisions' must record the current round")
+    old_models = {model["id"]: model for model in previous.get("models", [])}
+    new_models = {model["id"]: model for model in ledger.get("models", [])}
+    for entry in additions:
+        if entry["model"] not in old_models:
+            errors.append(
+                f"model_revisions for {entry['model']!r} requires a model from the previous "
+                "ledger; a new model establishes its first derivation and evidence in 'models'"
+            )
+    for model_id, old in old_models.items():
+        updates = [entry for entry in additions if entry["model"] == model_id]
+        new = new_models.get(model_id)
+        if new is None:
+            if not any(
+                entry["changes"].get("removed") == {"from": old, "to": None} for entry in updates
+            ):
+                errors.append(
+                    f"removed model {model_id!r} requires an evidence-backed current-round "
+                    "model_revisions entry with changes.removed from the previous model to null"
+                )
+            continue
+        changed_theory = {field for field in _THEORY_FIELDS if old.get(field) != new.get(field)}
+        recorded_fields = {field for entry in updates for field in entry["changes"]}
+        for field in changed_theory - recorded_fields:
+            errors.append(
+                f"model {model_id!r} changed {field!r} without an evidence-backed "
+                "current-round model_revisions entry"
+            )
+        for field in recorded_fields:
+            if field == "removed":
+                errors.append(f"model {model_id!r} is still present but has a removal revision")
+                continue
+            value = old.get(field)
+            for entry in updates:
+                change = entry["changes"].get(field)
+                if change is None:
+                    continue
+                if change["from"] != value:
+                    errors.append(
+                        f"model_revisions for {model_id!r}.{field} has 'from' that does not "
+                        "match the previous value"
+                    )
+                value = change["to"]
+            if value != new.get(field):
+                errors.append(
+                    f"model_revisions for {model_id!r}.{field} has 'to' that does not "
+                    "match the current value"
+                )
+        if old.get("measured_ms") != new.get("measured_ms") and new.get("measured_ms") is not None:
+            if not new.get("measurement_evidence"):
+                errors.append(
+                    f"model {model_id!r} refreshed measured_ms without measurement evidence"
+                )
 
 
 def load_ledger(path: str | Path) -> dict[str, Any]:
@@ -438,6 +607,9 @@ def load_ledger(path: str | Path) -> dict[str, Any]:
     for index, row in enumerate(kernels):
         _validate_row(row, index, seen, errors)
 
+    _validate_models(data, errors)
+    _validate_revisions(data, errors)
+
     if errors:
         bullet = "\n  - "
         raise LedgerError(
@@ -450,6 +622,9 @@ def cross_validate(
     ledger: Mapping[str, Any],
     roadmap: Mapping[str, Any],
     coverage_target_pct: float,
+    *,
+    previous: Mapping[str, Any] | None = None,
+    round_no: int | None = None,
 ) -> list[str]:
     """Context checks a shape-valid ledger still owes; returns the problems.
 
@@ -459,6 +634,10 @@ def cross_validate(
       claimed planned but never actually landed in the plan.
     - The enumerated rows must reach the task's declared coverage target
       — the deterministic teeth behind "every kernel was considered".
+    - When ``previous`` is supplied, model revisions preserve their full
+      history and account for changes to the theory or removal of a model.
+      ``round_no`` identifies the current round, including repeated analyzer
+      turns within that round.
     """
     errors: list[str] = []
     item_ids = {
@@ -484,4 +663,5 @@ def cross_validate(
             f"enumerate further down the ranking (grouping related kernels is "
             f"fine) until the target is covered"
         )
+    _validate_model_updates(ledger, previous, round_no, errors)
     return errors

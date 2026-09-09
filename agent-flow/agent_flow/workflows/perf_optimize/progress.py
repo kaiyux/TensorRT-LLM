@@ -102,10 +102,8 @@ _CURVE_FIELD_SCHEMA: dict[str, Any] = {
 }
 
 # What a terminal verdict proved about the bottleneck the item targeted.
-# Promoted out of the free-text ``summary`` because the ``Gap
-# implication:`` line has been written four different ways inside a
-# single campaign, and regex over prose is not a contract. Mirrors
-# :data:`headroom_ledger.GAP_IMPLICATIONS`.
+# These optional facts let the analyzer update its kernel ledger without
+# interpreting free-text summaries or exposing its model to the evaluator.
 GAP_IMPLICATIONS = (
     "mechanism-already-present",
     "mechanism-inapplicable",
@@ -332,13 +330,6 @@ class ProgressContext:
     current_round: int = 0
     current_attempt: int | None = None
     current_item_id: str = ""
-    # Whether this campaign runs the headroom ledger. The new evaluator
-    # fields stay optional in the tool schema either way — a required
-    # field would break every campaign that does not have the ledger —
-    # but with the contract on, a terminal verdict that omits its gap
-    # implication is rejected here rather than silently losing the one
-    # fact a failed attempt paid a full benchmark to learn.
-    headroom_ledger: bool = False
     _tool_cache: list[Any] | None = field(default=None, repr=False, compare=False)
 
 
@@ -458,7 +449,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     append_analyzer_progress = _make_summary_tool(
         "analyzer",
         "Short human-readable summary: the source capture or standing "
-        "analysis, offline analyses performed, findings and ledgers written, "
+        "analysis, offline analyses performed, findings and kernel ledger written, "
         "and roadmap items added / reordered / marked obsolete with expected "
         "gains. Name missing evidence that needs a profiler capture.",
     )
@@ -542,23 +533,13 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     "description": "One sentence backing the gap_implication, "
                     "naming the mechanism and the evidence.",
                 },
-                "parts": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "The roadmap item's `parts` — which parts of "
-                    "the model this verdict bears on. Pass the item's list "
-                    "unless your evidence says the verdict actually bears on "
-                    "different parts; an empty list is legitimate for a "
-                    "whole-deployment change.",
-                },
                 "lever": {
                     "type": "string",
                     "description": "Short label for the mechanism family this "
-                    "attempt spent (e.g. 'launch-geometry-tuning', "
-                    "'glue-chain-fusion', 'host-work-removal'). A failed "
-                    "attempt closes a LEVER, not a part, so two attempts on "
-                    "the same part must carry different labels when they tried "
-                    "genuinely different mechanisms.",
+                    "attempt tested (e.g. 'launch-geometry-tuning', "
+                    "'glue-chain-fusion', 'host-work-removal'). Different "
+                    "mechanisms need distinct labels. A failed attempt alone "
+                    "does not establish that a mechanism cannot improve performance.",
                 },
                 "target_blocker": _TARGET_BLOCKER_SCHEMA,
                 "measured_gain_pooled_pct": {
@@ -588,14 +569,6 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     async def append_evaluator_progress(args: dict[str, Any]) -> dict[str, Any]:
         decision = args["decision"]
         implication = args.get("gap_implication")
-        if ctx.headroom_ledger and decision != "APPROVE" and not implication:
-            raise ValueError(
-                "this campaign runs the headroom ledger, so a PUSH_BACK or "
-                "REJECT must carry `gap_implication` (one of "
-                f"{list(GAP_IMPLICATIONS)}) plus `gap_implication_note` and "
-                "`lever`. A verdict without them discards the only durable "
-                "finding a failed attempt paid a full benchmark to produce."
-            )
         entry = _base_entry("evaluator")
         entry["summary"] = args["summary"]
         entry["decision"] = decision
@@ -609,8 +582,6 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         for field_name in ("gap_implication_note", "lever", "measurement_confidence"):
             if args.get(field_name):
                 entry[field_name] = str(args[field_name])
-        if args.get("parts") is not None:
-            entry["parts"] = [str(part) for part in args["parts"]]
         if args.get("target_blocker"):
             blocker = args["target_blocker"]
             entry["target_blocker"] = {

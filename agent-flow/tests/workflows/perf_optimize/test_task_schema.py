@@ -442,102 +442,14 @@ def test_kernel_coverage_accessor_defends_against_malformed_specs():
     assert merged == {"min_share_pct": 2.0, "coverage_target_pct": 95.0}
 
 
-# -------------------------------------------------------- profile.headroom_ledger
-
-# The contract needs both a ceiling to account against and a kernel ledger
-# to close its join with, so every valid fixture carries them.
-_HL_BASE = {"profile": {"kernel_coverage": {}}}
-
-
-def _hl_task(tmp_path, block: dict | None = None):
-    profile = {"kernel_coverage": {}, "headroom_ledger": block if block is not None else {}}
-    return _write_task(tmp_path, {"profile": profile})
-
-
-def test_headroom_ledger_absent_by_default(tmp_path):
-    data = task_schema.load_and_validate_task_yaml(_write_task(tmp_path, _HL_BASE))
-    assert "headroom_ledger" not in data["profile"]
-    assert task_schema.headroom_ledger(data) is None
-
-
-def test_empty_headroom_ledger_block_enables_defaults(tmp_path):
-    data = task_schema.load_and_validate_task_yaml(_hl_task(tmp_path))
-    assert data["profile"]["headroom_ledger"] == {
-        "enforcement": "warn",
-        "target_layer": "ranking",
-        "tolerance_pct": 1.0,
-        "min_share_pct": 0.5,
-    }
-    assert task_schema.headroom_ledger(data) == data["profile"]["headroom_ledger"]
-
-
-def test_headroom_ledger_user_values_win(tmp_path):
-    data = task_schema.load_and_validate_task_yaml(
-        _hl_task(tmp_path, {"enforcement": "error", "target_layer": "report_only"})
-    )
-    block = data["profile"]["headroom_ledger"]
-    assert block["enforcement"] == "error"
-    assert block["target_layer"] == "report_only"
-    # Untouched knobs still resolve.
-    assert block["tolerance_pct"] == 1.0
-
-
-def test_headroom_ledger_defaults_to_warning(tmp_path):
-    # kernel_ledger.yaml already aborts a round on invalidity; a second
-    # aborting gate over a much richer schema would wedge campaigns on
-    # bookkeeping rather than on measurements.
-    data = task_schema.load_and_validate_task_yaml(_hl_task(tmp_path))
-    assert data["profile"]["headroom_ledger"]["enforcement"] == "warn"
-
-
-@pytest.mark.parametrize("field,bad", [("enforcement", "abort"), ("target_layer", "rank")])
-def test_headroom_ledger_enums_are_closed(tmp_path, field, bad):
-    with pytest.raises(task_schema.TaskSchemaError, match=field):
-        task_schema.load_and_validate_task_yaml(_hl_task(tmp_path, {field: bad}))
-
-
-@pytest.mark.parametrize("field", ["tolerance_pct", "min_share_pct"])
-@pytest.mark.parametrize("bad", [0, -1, 101, "some", True])
-def test_headroom_ledger_percentages_must_be_in_range(tmp_path, field, bad):
-    with pytest.raises(task_schema.TaskSchemaError, match=field):
-        task_schema.load_and_validate_task_yaml(_hl_task(tmp_path, {field: bad}))
-
-
-def test_headroom_ledger_rejects_unknown_keys(tmp_path):
-    # Silently ignoring an unknown knob is how a campaign ends up running
-    # under a setting nobody applied.
-    with pytest.raises(task_schema.TaskSchemaError, match="unknown field"):
-        task_schema.load_and_validate_task_yaml(_hl_task(tmp_path, {"abort_on_error": True}))
-
-
-def test_headroom_ledger_requires_the_sol_projector(tmp_path):
+def test_kernel_model_ledger_does_not_require_sol(tmp_path):
     task = _write_task(
         tmp_path,
-        {"profile": {"kernel_coverage": {}, "headroom_ledger": {}}, "sol": {"enabled": False}},
+        {"profile": {"kernel_coverage": {}}, "sol": {"enabled": False}},
     )
-    with pytest.raises(task_schema.TaskSchemaError, match="SOL projector"):
-        task_schema.load_and_validate_task_yaml(task)
-
-
-def test_headroom_ledger_requires_the_kernel_coverage_contract(tmp_path):
-    task = _write_task(tmp_path, {"profile": {"headroom_ledger": {}}})
-    with pytest.raises(task_schema.TaskSchemaError, match="kernel_coverage"):
-        task_schema.load_and_validate_task_yaml(task)
-
-
-def test_headroom_ledger_must_be_a_mapping(tmp_path):
-    task = _write_task(tmp_path, {"profile": {"kernel_coverage": {}, "headroom_ledger": True}})
-    with pytest.raises(task_schema.TaskSchemaError, match="must be a mapping"):
-        task_schema.load_and_validate_task_yaml(task)
-
-
-def test_headroom_ledger_accessor_defends_against_malformed_specs():
-    assert task_schema.headroom_ledger({}) is None
-    assert task_schema.headroom_ledger({"profile": "nope"}) is None
-    assert task_schema.headroom_ledger({"profile": {"headroom_ledger": None}}) is None
-    merged = task_schema.headroom_ledger({"profile": {"headroom_ledger": {"enforcement": "error"}}})
-    assert merged["enforcement"] == "error"
-    assert merged["target_layer"] == "ranking"
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert data["profile"]["kernel_coverage"] == task_schema.KERNEL_COVERAGE_DEFAULTS
+    assert not task_schema.sol_enabled(data)
 
 
 def test_remote_run_root_is_optional_and_can_be_explicit(tmp_path):
@@ -678,7 +590,6 @@ def test_the_census_matches_a_fully_populated_spec(tmp_path):
                 "methods": ["nsys", "ncu"],
                 "nsys_iter_range": "100-150",
                 "kernel_coverage": {"min_share_pct": 1.0, "coverage_target_pct": 90.0},
-                "headroom_ledger": {"enforcement": "error", "target_layer": "report_only"},
             },
             "optimize": {
                 "max_rounds": 2,
@@ -713,17 +624,12 @@ def test_the_census_matches_a_fully_populated_spec(tmp_path):
     unknown += _unknown_keys(
         resolved.get("profile"),
         "profile.",
-        set(base_schema.KNOWN_PROFILE_KEYS) | {"kernel_coverage", "headroom_ledger"},
+        set(base_schema.KNOWN_PROFILE_KEYS) | {"kernel_coverage"},
     )
     unknown += _unknown_keys(
         (resolved.get("profile") or {}).get("kernel_coverage"),
         "profile.kernel_coverage.",
         set(task_schema.KNOWN_KERNEL_COVERAGE_KEYS),
-    )
-    unknown += _unknown_keys(
-        (resolved.get("profile") or {}).get("headroom_ledger"),
-        "profile.headroom_ledger.",
-        set(task_schema.KNOWN_HEADROOM_LEDGER_KEYS),
     )
     unknown += _unknown_keys(
         resolved.get(base_schema.SLURM_ENVIRONMENT_FIELD),

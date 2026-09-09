@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 from rich.markup import escape
@@ -31,12 +31,14 @@ from agent_flow.workflows.perf_analyze.sol_methodology import (
 )
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
-from . import gitops, headroom_ledger, kernel_ledger, nsys_items, reuse, roadmap_schema
+from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
 from .profile import PROFILE_MANIFEST_NAME, ProfileError, validate_profile_manifest
 from .progress import (
     EVALUATOR_DECISIONS,
+    GAP_IMPLICATIONS,
     INTEGRATOR_DECISIONS,
+    MEASUREMENT_CONFIDENCES,
     OPTIMIZATION_STAGE,
     ProgressContext,
     append_workflow_event,
@@ -76,7 +78,6 @@ from .task_schema import (
     profile_ranks,
     sol_enabled,
 )
-from .task_schema import headroom_ledger as headroom_ledger_config
 
 
 def _progress_has_entries(path: Path) -> bool:
@@ -252,9 +253,6 @@ class PerfOptimizeWorkflow:
         self.tuning_config_path = self.tuning_dir / "extra_llm_api_options.yaml"
         self.tuning_accepted_path = self.tuning_dir / "extra_llm_api_options.accepted.yaml"
         self.roadmap_path = workspace / "roadmap.yaml"
-        # Campaign-scoped, unlike the per-round kernel ledger: its history
-        # and its revisions are inherently cross-round.
-        self.headroom_ledger_path = workspace / headroom_ledger.HEADROOM_LEDGER_FILENAME
         self.sol_work_dir = workspace / "sol_work"
         # Where ``--reuse-analysis`` parks its provenance manifest and the
         # source campaign's roadmap (prior art, never the live ledger).
@@ -303,7 +301,6 @@ class PerfOptimizeWorkflow:
                 self.state_path,
                 self.sol_projection_path,
                 self.roadmap_path,
-                self.headroom_ledger_path,
                 self.report_path,
                 self.report_html_path,
                 self.progress_path,
@@ -373,7 +370,6 @@ class PerfOptimizeWorkflow:
         self._progress_ctx = ProgressContext(
             path=self.progress_path,
             global_lock=self._progress_lock,
-            headroom_ledger=self._headroom_ledger() is not None,
         )
         progress_tools = build_progress_tools(self._progress_ctx)
 
@@ -510,32 +506,14 @@ class PerfOptimizeWorkflow:
                         self.roadmap_path,
                         analysis_dir / "profile_findings.md",
                     ]
-                    # A reused round never ran ncu, so any ledger sitting
-                    # in its analysis/ is the copy --reuse-analysis seeded
-                    # from the source campaign, not one this round authored.
-                    imported_ledger = (
-                        state.reuse_pending
-                        and (analysis_dir / kernel_ledger.LEDGER_FILENAME).is_file()
-                    )
-                    enforce_ledger = (
-                        self._kernel_coverage() is not None
-                        # A replan-only round runs no ncu at all: the
-                        # standing ledger still describes this build.
-                        and not replan_only
-                        # Hold a reused round to the contract exactly when the
-                        # source had a ledger to hold it to.
-                        and (not state.reuse_pending or imported_ledger)
-                    )
+                    enforce_ledger = self._kernel_coverage() is not None
                     if enforce_ledger:
                         analyzer_outputs.append(analysis_dir / kernel_ledger.LEDGER_FILENAME)
                     self._require_stage_outputs(STAGE_ANALYZER, analyzer_outputs)
                     roadmap = self._validate_roadmap()
                     if enforce_ledger:
-                        self._validate_kernel_ledger(
-                            roadmap, analysis_dir, log=log, imported=imported_ledger
-                        )
+                        self._validate_kernel_ledger(roadmap, analysis_dir, round_no=round_no)
                     self._validate_nsys_items(roadmap, analysis_dir)
-                    self._validate_headroom_ledger(state, roadmap, analysis_dir, log=log)
                     if not replan_only and not state.reuse_pending:
                         self._record_analysis_source(state, analysis_dir)
                     if not replan_only and not (state.reuse_pending or state.reanalyze_pending):
@@ -713,12 +691,6 @@ class PerfOptimizeWorkflow:
             max_rounds_override=self.max_rounds_override,
         )
         self.task_path.write_text(dump_task_yaml(task_data), encoding="utf-8")
-        # The constructor could not see the spec yet, so the shared
-        # progress context learns here whether this campaign runs the
-        # headroom ledger — the flag is what makes a terminal verdict owe
-        # its structured gap implication.
-        self._progress_ctx.headroom_ledger = headroom_ledger_config(task_data) is not None
-
         # Materialize the live tuning config (the single
         # --extra_llm_api_options every serve in this workflow uses) and
         # its last-accepted snapshot. In a disagg campaign the same file
@@ -819,18 +791,6 @@ class PerfOptimizeWorkflow:
             print_message(
                 "[yellow]no profile findings in the reuse source — round 1 will "
                 "profile normally[/yellow]",
-                log,
-            )
-        elif (
-            not self.reanalyze
-            and self._kernel_coverage() is not None
-            and not imported.kernel_ledger
-        ):
-            print_message(
-                f"[yellow]reused analysis carries no "
-                f"{kernel_ledger.LEDGER_FILENAME} — the per-kernel coverage "
-                f"contract is not enforced for the reused round (round 2+ "
-                f"re-profiles under it as usual)[/yellow]",
                 log,
             )
 
@@ -1147,7 +1107,6 @@ class PerfOptimizeWorkflow:
             path=progress_path,
             global_path=self.progress_path,
             global_lock=self._progress_lock,
-            headroom_ledger=self._headroom_ledger() is not None,
         )
         tools = build_progress_tools(progress_ctx)
         optimizer = _make_agent(
@@ -1239,7 +1198,7 @@ class PerfOptimizeWorkflow:
                 gain = self._latest_evaluator_measured_gain(progress_path)
                 value = self._latest_evaluator_measured_value(progress_path)
                 curve = self._latest_evaluator_curve(progress_path)
-                # The headroom-ledger payload: what this verdict proved,
+                # The experiment evidence: what this verdict proved,
                 # against which parts, spending which lever. Carried on
                 # the batch row because `_finish_item_batch` is the one
                 # choke point every path converges on, and by then the
@@ -1550,7 +1509,6 @@ class PerfOptimizeWorkflow:
         # below — this is the one choke point every path converges on
         # (serial, all-failed parallel, and post-integration), and after
         # it the structured payload each verdict carried is gone.
-        self._update_headroom_ledger(state, log)
 
         state.round_index += 1
         state.item_index = 0
@@ -1801,75 +1759,42 @@ class PerfOptimizeWorkflow:
                 )
         return roadmap
 
-    def _waive_imported_ledger(self, why: str, log) -> None:
-        """Warn that a reused round's imported ledger is being waived."""
-        print_message(
-            f"[yellow]the {kernel_ledger.LEDGER_FILENAME} imported by "
-            f"--reuse-analysis does not satisfy this campaign's coverage "
-            f"contract, so it is waived for the reused round (round 2+ "
-            f"re-profiles under it as usual):\n{why}[/yellow]",
-            log,
-        )
-
     def _validate_kernel_ledger(
         self,
         roadmap: dict[str, Any],
         analysis_dir: Path,
-        log=None,
-        imported: bool = False,
+        *,
+        round_no: int,
     ) -> None:
-        """Validate the round's kernel ledger as part of the analyzer gate.
-
-        No-op unless the task declares ``profile.kernel_coverage``. With
-        the contract active, the ledger must be shape-valid, every
-        ``disposition: item`` ref must name a real roadmap item, and the
-        enumerated rows must reach the declared coverage target — the
-        deterministic teeth behind "every kernel's elimination,
-        optimization, fusion, or overlap possibility was considered".
-        Raising leaves the checkpoint parked at the analyzer, so
-        re-running retries the stage.
-
-        ``imported`` marks the one ledger the round did not author: the
-        copy ``--reuse-analysis`` seeded from a source campaign. A retry
-        cannot repair that file — the reused round runs plan-only and
-        never writes a ledger — so a source ledger this campaign cannot
-        satisfy (an older schema, or ``item`` refs naming the *source*
-        campaign's roadmap ids) would wedge the run on a failure no
-        operator action clears. It degrades to the same warn-and-waive
-        the source-had-no-ledger case already takes; rounds 2+ profile
-        and are enforced normally.
-        """
+        """Gate each analyzer output on coverage and evidence-backed model updates."""
         coverage = self._kernel_coverage()
         if coverage is None:
             return
         ledger_path = analysis_dir / kernel_ledger.LEDGER_FILENAME
+        previous_path = self._latest_kernel_ledger(before_round=round_no)
         try:
             ledger = kernel_ledger.load_ledger(ledger_path)
+            previous = kernel_ledger.load_ledger(previous_path) if previous_path else None
             problems = kernel_ledger.cross_validate(
-                ledger, roadmap, float(coverage["coverage_target_pct"])
+                ledger,
+                roadmap,
+                float(coverage["coverage_target_pct"]),
+                previous=previous,
+                round_no=round_no,
             )
         except kernel_ledger.LedgerError as exc:
-            if imported:
-                self._waive_imported_ledger(str(exc), log)
-                return
             raise RuntimeError(
                 f"analyzer stage finished but {kernel_ledger.LEDGER_FILENAME} failed "
-                f"validation:\n{exc}\nEvery kernel above the coverage bar must "
-                f"carry all four dispositions "
-                f"({' / '.join(kernel_ledger.QUESTIONS)}), and the coverage block "
-                f"its `gpu_busy_pct`. Re-run the workflow to retry the analyzer "
-                f"stage, or pass --clean to start over."
+                f"validation:\n{exc}\nEvery kernel must carry all four dispositions "
+                f"({' / '.join(kernel_ledger.QUESTIONS)}) and a performance model. "
+                f"Re-run the workflow to retry the analyzer stage."
             ) from exc
         if problems:
             bullet = "\n  - "
-            if imported:
-                self._waive_imported_ledger(bullet.lstrip("\n") + bullet.join(problems), log)
-                return
             raise RuntimeError(
-                f"analyzer stage finished but {ledger_path} failed the coverage "
+                f"analyzer stage finished but {ledger_path} failed the kernel ledger "
                 f"contract:{bullet}{bullet.join(problems)}\n"
-                f"Re-run the workflow to retry the analyzer stage, or pass "
-                f"--clean to start over."
+                f"Re-run the workflow to retry the analyzer stage."
             )
 
     def _validate_nsys_items(self, roadmap: dict[str, Any], analysis_dir: Path) -> None:
@@ -1901,287 +1826,6 @@ class PerfOptimizeWorkflow:
                 f"Re-run the workflow to retry the analyzer stage, or pass "
                 f"--clean to start over."
             )
-
-    # ---------------------------------------------------------- headroom ledger
-
-    def _headroom_ledger_instruction(self, round_no: int, analysis_dir: Path) -> str:
-        """The analyzer's per-round headroom-ledger directive ("" when off)."""
-        config = self._headroom_ledger()
-        if config is None:
-            return ""
-        points = self._focus_points() or self._curve_points()
-        bracket = (
-            f"[{min(points)}, {max(points)}]"
-            if len(points) >= 2
-            else f"[{points[0]}]"
-            if points
-            else "the scored point"
-        )
-        ranking = (
-            "Rank the roadmap on the **engineering gap** (`measured - target`) "
-            "and size every `expected_gain_pct` against it, not against "
-            "`measured - sol` — a gain sized against a floor no kernel reaches "
-            "is a wish, while one sized against a named implementation is an "
-            "estimate."
-            if config["target_layer"] == "ranking"
-            else "The target layer is **report-only** this campaign "
-            "(`target_layer: report_only`): author and report targets, but keep "
-            "ranking the roadmap on measured evidence as before, so the layer's "
-            "predictions can be scored before they steer GPU time."
-        )
-        consequence = (
-            "The orchestrator validates it the moment your turn ends and an "
-            "invalid ledger **aborts the stage**"
-            if config["enforcement"] == "error"
-            else "The orchestrator validates it the moment your turn ends and "
-            "**warns** on any problem without stopping the round — which means "
-            "a sloppy ledger silently degrades the campaign's accounting rather "
-            "than announcing itself"
-        )
-        return (
-            f"This campaign runs the **headroom ledger** "
-            f"(`profile.headroom_ledger`). Author / update "
-            f"`{self.headroom_ledger_path}` this round per the contract in "
-            f"your system prompt: one part per `{analysis_dir}/sol.json` "
-            f"region plus `empirical` parts for the kernel-ledger rows no "
-            f"analytic region claims, each measured at both bracketing "
-            f"concurrencies {bracket}, each joined to its kernel-ledger rows, "
-            f"and each partitioned into closed / attributed / open / "
-            f"unexplained. {ranking} {consequence}. You own every field except "
-            f"`dispositions` and `history`, which the orchestrator appends "
-            f"from the evaluators' structured verdicts — read them, never "
-            f"write them"
-            + (
-                ""
-                if round_no == 1
-                else ", and remember a `sol_ms` that moves needs a "
-                "`model_revisions` entry, a restated `measured_ms` a "
-                "`measurement_revisions` one, and a moved `target_ms` a "
-                "`target_revisions` one naming what the attempt actually found"
-            )
-            + ".\n\n"
-        )
-
-    def _headroom_analysis_dir(self, state: WorkflowState, analysis_dir: Path) -> Path:
-        """Where this round's SOL correlation and kernel ledger actually live.
-
-        A profiling round wrote them into its own ``analysis/``. A
-        replan-only round captured nothing, so the standing correlation —
-        the one the round planned from — is what its ledger rows still
-        describe.
-        """
-        if (analysis_dir / "sol.json").is_file():
-            return analysis_dir
-        standing = state.last_profiled_analysis_dir
-        return Path(standing) if standing else analysis_dir
-
-    def _validate_headroom_ledger(
-        self,
-        state: WorkflowState,
-        roadmap: dict[str, Any],
-        analysis_dir: Path,
-        log=None,
-    ) -> None:
-        """Validate the campaign's headroom ledger as part of the analyzer gate.
-
-        No-op unless the task declares ``profile.headroom_ledger``. With
-        the contract active the ledger must be shape-valid, its analytic
-        parts must be regions the correlation actually bounds, its
-        kernel→part join must close against ``regions.json``, its
-        partition must respect live roadmap state, and any attribution
-        must rest on a basis that holds.
-
-        ``enforcement`` decides the consequence. The default is ``warn``:
-        ``kernel_ledger.yaml`` already aborts a round on invalidity, and
-        stacking a second aborting gate over a far richer schema would
-        risk wedging campaigns on bookkeeping rather than on
-        measurements. Under ``error`` a problem raises, which leaves the
-        checkpoint parked at the analyzer so re-running retries the stage.
-        """
-        config = self._headroom_ledger()
-        if config is None:
-            return
-        if not self.headroom_ledger_path.is_file():
-            self._report_headroom_problems(
-                [
-                    f"{self.headroom_ledger_path.name} was not written — the "
-                    f"campaign has no per-part accounting, so a failed item "
-                    f"leaves no durable record of the lever it spent"
-                ],
-                config,
-                log,
-            )
-            return
-        tolerance = float(config["tolerance_pct"])
-        source_dir = self._headroom_analysis_dir(state, analysis_dir)
-        try:
-            ledger = headroom_ledger.load_ledger(self.headroom_ledger_path, tolerance)
-        except headroom_ledger.HeadroomLedgerError as exc:
-            self._report_headroom_problems([str(exc)], config, log)
-            return
-        problems = headroom_ledger.cross_validate(
-            ledger,
-            roadmap=roadmap,
-            context=headroom_ledger.load_context(source_dir),
-            previous=self._previous_headroom_ledger(state),
-            focus_points=self._focus_points() or self._curve_points(),
-            tolerance_pct=tolerance,
-            min_share_pct=float(config["min_share_pct"]),
-        )
-        problems.extend(
-            f"roadmap item {item_id!r} declares no 'parts' — its outcome cannot "
-            f"be booked against any part, so the time it targeted can never "
-            f"leave the unexplained queue (write `parts: []` for a genuine "
-            f"whole-deployment change)"
-            for item_id in roadmap_schema.items_missing_parts(roadmap)
-        )
-        if problems:
-            self._report_headroom_problems(problems, config, log)
-        else:
-            self._snapshot_headroom_ledger(state)
-
-    def _report_headroom_problems(self, problems: list[str], config: dict[str, Any], log) -> None:
-        bullet = "\n  - "
-        body = f"{bullet}{bullet.join(problems)}"
-        if config["enforcement"] == "error":
-            raise RuntimeError(
-                f"analyzer stage finished but {self.headroom_ledger_path} failed "
-                f"the headroom-ledger contract:{body}\nRe-run the workflow to "
-                f"retry the analyzer stage, or pass --clean to start over."
-            )
-        print_message(
-            f"[yellow]{self.headroom_ledger_path.name} does not satisfy the "
-            f"headroom-ledger contract; the round continues (`enforcement: "
-            f"warn`), but the accounting below is not trustworthy:{body}[/yellow]",
-            log,
-        )
-
-    def _headroom_snapshot_path(self, state: WorkflowState) -> Path:
-        return self._analysis_dir(state) / f"{headroom_ledger.HEADROOM_LEDGER_FILENAME}.snapshot"
-
-    def _snapshot_headroom_ledger(self, state: WorkflowState) -> None:
-        """Freeze the validated ledger so the next round can diff against it.
-
-        The revision rules are the point: a ``sol_ms`` or ``target_ms``
-        that moved without the entry explaining why is only detectable
-        against what the previous round actually said.
-        """
-        try:
-            self._headroom_snapshot_path(state).write_text(
-                self.headroom_ledger_path.read_text(encoding="utf-8"), encoding="utf-8"
-            )
-        except OSError:
-            # A snapshot is a convenience for the next round's drift
-            # check, never a reason to fail a round that validated.
-            pass
-
-    def _previous_headroom_ledger(self, state: WorkflowState) -> dict[str, Any] | None:
-        """The newest earlier round's validated ledger snapshot, or ``None``."""
-        snapshots: list[tuple[int, Path]] = []
-        for path in self.rounds_dir.glob(
-            f"round_*/analysis/{headroom_ledger.HEADROOM_LEDGER_FILENAME}.snapshot"
-        ):
-            match = re.fullmatch(r"round_(\d+)", path.parent.parent.name)
-            # Strictly earlier: this round's own snapshot (a resume that
-            # re-ran the analyzer) is not a previous state to diff against.
-            if match and int(match.group(1)) <= state.round_index:
-                snapshots.append((int(match.group(1)), path))
-        if not snapshots:
-            return None
-        try:
-            data = yaml.safe_load(max(snapshots)[1].read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            return None
-        return data if isinstance(data, dict) else None
-
-    def _update_headroom_ledger(self, state: WorkflowState, log=None) -> None:
-        """Book this batch's verdicts into the ledger, from structured fields.
-
-        Orchestrator-owned and mechanical: one disposition per part each
-        terminal item named, plus a history row per part. A disposition
-        closes a **lever**, never a part — retiring a gap needs a
-        part-level attribution with its own basis, which only the
-        analyzer may claim.
-
-        Note the two-phase timing. This pairs round N's correlation —
-        measured *before* these accepts landed — with round N's verdicts.
-        The measured refresh arrives with round N+1's analyzer, which is
-        why ``history`` is keyed by round and never back-dated.
-        """
-        if self._headroom_ledger() is None or not self.headroom_ledger_path.is_file():
-            return
-        round_no = state.round_index + 1
-        try:
-            roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-        except roadmap_schema.RoadmapError:
-            return
-        for entry in state.item_batch:
-            item_id = str(entry.get("current_item_id", ""))
-            item = roadmap_schema.find_item(roadmap, item_id) if item_id else None
-            # The roadmap is the authoritative outcome: every path into
-            # this method has just written it, while the batch row's own
-            # status is only terminal in serial mode.
-            if item is None or item.get("status") not in ("accepted", "failed"):
-                continue
-            verdict = self._headroom_verdict(entry, item)
-            if verdict is None:
-                continue
-            try:
-                headroom_ledger.append_dispositions(
-                    self.headroom_ledger_path,
-                    round_no=round_no,
-                    item_id=item_id,
-                    outcome=str(item["status"]),
-                    **verdict,
-                )
-            except (headroom_ledger.HeadroomLedgerError, OSError, yaml.YAMLError) as exc:
-                print_message(
-                    f"[yellow]could not book {item_id} into "
-                    f"{self.headroom_ledger_path.name}: {exc}[/yellow]",
-                    log,
-                )
-                return
-        try:
-            headroom_ledger.record_history(self.headroom_ledger_path, round_no)
-        except (headroom_ledger.HeadroomLedgerError, OSError, yaml.YAMLError):
-            return
-
-    def _headroom_verdict(
-        self, entry: Mapping[str, Any], item: Mapping[str, Any]
-    ) -> dict[str, Any] | None:
-        """The disposition payload for one terminal item, or ``None`` to skip.
-
-        Parts come from the evaluator's structured field when it supplied
-        one, else from the roadmap item the analyzer authored. An item
-        that named no parts is skipped rather than guessed at: inventing
-        a part for it would put a fabricated fact into the one artifact
-        whose whole value is that its facts are real.
-        """
-        item_id = str(item.get("id"))
-        implication = str(entry.get("gap_implication") or "")
-        if implication not in headroom_ledger.GAP_IMPLICATIONS:
-            # An accepted item carries no gap implication by contract —
-            # the mechanism ran and the part got faster, which is what
-            # `applied-but-no-gain` records the negative of. A terminal
-            # rejection that omitted one has nothing to book.
-            implication = "applied-but-no-gain" if item.get("status") == "accepted" else ""
-        if not implication:
-            return None
-        parts = entry.get("parts")
-        if not isinstance(parts, list) or not parts:
-            parts = item.get("parts") or []
-        if not parts:
-            return None
-        return {
-            "gap_implication": implication,
-            "lever": str(entry.get("lever") or item.get("category") or "unlabelled-lever"),
-            "note": str(
-                entry.get("gap_implication_note")
-                or f"{item_id}: {item.get('title', 'no title recorded')}"
-            ),
-            "evidence": str(entry.get("evaluation_path") or self.roadmap_path.name),
-            "parts": [str(part) for part in parts],
-        }
 
     # ------------------------------------------------------------ shared lookups
 
@@ -2229,24 +1873,76 @@ class PerfOptimizeWorkflow:
         """``profile.kernel_coverage`` (defaults merged) when set, else ``None``."""
         return kernel_coverage(self._task_data())
 
-    def _headroom_ledger(self) -> dict[str, Any] | None:
-        """``profile.headroom_ledger`` (defaults merged) when set, else ``None``."""
-        return headroom_ledger_config(self._task_data())
-
-    def _latest_kernel_ledger(self) -> Path | None:
+    def _latest_kernel_ledger(self, *, before_round: int | None = None) -> Path | None:
         """The highest-round ``kernel_ledger.yaml``, or ``None``.
 
         The reporter's coverage proof is the final analyzer state; rounds
         are scanned numerically so ``round_10`` outranks ``round_9``.
+        ``before_round`` excludes the current output during updates and retries.
         """
         candidates: list[tuple[int, Path]] = []
         for path in self.rounds_dir.glob(f"round_*/analysis/{kernel_ledger.LEDGER_FILENAME}"):
             match = re.fullmatch(r"round_(\d+)", path.parent.parent.name)
-            if match:
+            if match and (before_round is None or int(match.group(1)) < before_round):
                 candidates.append((int(match.group(1)), path))
         if not candidates:
             return None
         return max(candidates)[1]
+
+    def _kernel_ledger_instruction(self, state: WorkflowState, *, reused: bool = False) -> str:
+        """Direct every analyzer turn to maintain the same evidence-based ledger."""
+        coverage = self._kernel_coverage()
+        if coverage is None:
+            return ""
+        round_no = state.round_index + 1
+        ledger_path = self._analysis_dir(state) / kernel_ledger.LEDGER_FILENAME
+        previous = self._latest_kernel_ledger(before_round=round_no)
+        prior = self.reuse_dir / reuse.PRIOR_KERNEL_LEDGER_NAME
+        history = (
+            f"Read `{previous}` as the previous ledger, including replan updates. "
+            f"Carry forward its model revision history verbatim. For every changed "
+            f"model assumption, derivation, operating point or prediction, append "
+            f"a round {round_no} `model_revisions` entry with the exact `from` and "
+            f"`to` values, reason, and supporting evidence. Preserve prior files. "
+            if previous
+            else "Start this campaign's `model_revisions` with an empty list. "
+        )
+        if previous is None and prior.is_file():
+            history += (
+                f"Read `{prior}` as read-only prior art. Check its capture and "
+                f"operating conditions against the evidence being analyzed, cite "
+                f"any models you retain, and bind question references to this "
+                f"campaign's roadmap. Its revision history belongs to another "
+                f"campaign and remains in the prior artifact. "
+            )
+        return (
+            f"Apply the **per-kernel coverage contract**: write `{ledger_path}` "
+            f"this round, including on replan-only and reused-analysis turns. "
+            f"Enumerate kernels at/above {coverage['min_share_pct']}% of GPU time "
+            f"and extend to {coverage['coverage_target_pct']}% coverage. Record "
+            f"`coverage.gpu_busy_pct` and answer all four questions — eliminable? "
+            f"faster? fusible? overlappable? — with roadmap references or cited "
+            f"evidence. Mirror the answers under `## Kernel disposition ledger` "
+            f"in the findings. Maintain the **best current theoretical performance "
+            f"model** in this same ledger, using shared region models where kernel "
+            f"boundaries change through fusion or elimination. {history}"
+            f"Compare predictions with measured silicon performance under matching "
+            f"conditions; retain source capture/build identities and measurement "
+            f"evidence. On replan-only turns, keep standing measurements and "
+            f"incorporate the experiments' new facts into the model and four "
+            f"answers. An unsuccessful attempt alone establishes neither model "
+            f"error nor exhausted headroom. Correct a prediction when evidence "
+            f"falsifies its assumptions, and keep unknown predictions null and "
+            f"remaining discrepancies explicit with the next discriminating test. "
+            + (
+                "These are inherited measurements; state their provenance and "
+                "any mismatch with this campaign's requested conditions. "
+                if reused
+                else ""
+            )
+            + "The orchestrator validates the ledger and evidence-backed revisions "
+            "when your turn ends.\n\n"
+        )
 
     def _optimize_block(self) -> dict[str, Any]:
         block = self._task_data().get("optimize")
@@ -2487,30 +2183,22 @@ class PerfOptimizeWorkflow:
         return curve
 
     def _latest_evaluator_ledger_fields(self, path: Path | None = None) -> dict[str, Any]:
-        """The latest verdict's headroom-ledger payload, defensively read.
+        """The latest verdict's experimental evidence, defensively read.
 
-        Agent-supplied data, so every field is validated and a bad one is
-        dropped rather than propagated: a disposition carrying a
-        fabricated part id or an off-enum implication would put a false
-        fact into the one artifact whose whole value is that its facts
-        are real. Returns only the keys that survived.
+        Agent-supplied data is validated before propagation. Returns only
+        supported evidence fields with the expected types and enum values.
         """
         entry = latest_entry(path or self.progress_path, "evaluator")
         if entry is None:
             return {}
         fields: dict[str, Any] = {}
         implication = entry.get("gap_implication")
-        if implication in headroom_ledger.GAP_IMPLICATIONS:
+        if implication in GAP_IMPLICATIONS:
             fields["gap_implication"] = implication
         for key in ("gap_implication_note", "lever"):
             if isinstance(entry.get(key), str) and entry[key].strip():
                 fields[key] = entry[key].strip()
-        parts = entry.get("parts")
-        if isinstance(parts, list):
-            named = [str(p).strip() for p in parts if isinstance(p, str) and p.strip()]
-            if named:
-                fields["parts"] = named
-        if entry.get("measurement_confidence") in headroom_ledger.MEASUREMENT_CONFIDENCES:
+        if entry.get("measurement_confidence") in MEASUREMENT_CONFIDENCES:
             fields["measurement_confidence"] = entry["measurement_confidence"]
         pooled = entry.get("measured_gain_pooled_pct")
         if isinstance(pooled, (int, float)) and not isinstance(pooled, bool):
@@ -2744,7 +2432,8 @@ class PerfOptimizeWorkflow:
                 f"sanity-bound their `expected_gain_pct`; the imported "
                 f"measured evidence still outranks it. Any measured↔SOL "
                 f"correlation the source produced is already in "
-                f"`{analysis_dir}` — do not re-derive it.\n\n"
+                f"`{analysis_dir}` — use it as the initial model and revise assumptions "
+                f"when the saved evidence warrants a correction.\n\n"
             )
         self.analyzer(
             self._disagg_directive() + f"Workspace: {self.workspace}\n"
@@ -2768,6 +2457,7 @@ class PerfOptimizeWorkflow:
             f"block).\n\n"
             + projection_context
             + prior_roadmap_context
+            + self._kernel_ledger_instruction(state, reused=True)
             + f"Then **load the `perf-optimization-casebook` skill** (via the "
             f"`Skill` tool) as your system prompt directs, and tag each "
             f"roadmap item's `casebook_ref` with the matching *bottleneck "
@@ -2809,19 +2499,10 @@ class PerfOptimizeWorkflow:
         profile_dir = self._profile_dir(state)
         replay_note = " (scalar mode: one replay at the configured concurrency)"
         if self._curve_mode() and self._curve_points():
-            if self._headroom_ledger() is not None:
-                points = self._focus_points() or self._curve_points()
-                bracket = sorted({min(points), max(points)})
-                replay_note = (
-                    " (Pareto-curve mode with the headroom ledger: replay at the "
-                    f"lowest and highest scored concurrencies {bracket}, once per "
-                    "distinct point"
-                )
-            else:
-                replay_note = (
-                    " (Pareto-curve mode: one replay at the largest concurrency "
-                    f"point, {self._curve_points()[-1]}, only"
-                )
+            replay_note = (
+                " (Pareto-curve mode: one replay at the largest concurrency "
+                f"point, {self._curve_points()[-1]}, only"
+            )
             replay_note += (
                 "; when `benchmark.num_prompts` is a list, use the entry paired "
                 "with each selected point in `benchmark.concurrency`; otherwise "
@@ -2924,30 +2605,16 @@ class PerfOptimizeWorkflow:
                 f"`{self.roadmap_path}` already exists, and {profile_reason}. "
                 f"This round rebuilds the analysis from its capture. "
                 f'Call `read_latest_progress` with `agent: "evaluator"` for '
-                f"the verdicts on the items that **failed** — a REJECT is "
-                f"measured evidence about this runtime, and re-proposing what "
-                f"it disproved wastes the round. Analyze the saved evidence "
+                f"the verdicts on the items that **failed**. Establish which "
+                f"mechanism actually ran and what each experiment proved; a "
+                f"REJECT alone does not disprove the optimization premise. "
+                f"Analyze the saved evidence "
                 f"and update the roadmap in place: re-order / revise "
                 f"still-pending items, add newly exposed ones, mark stale "
                 f"pending items `obsolete`. Never rewrite accepted/failed "
                 f"history, `baseline`, `current_best`, or existing ids."
             )
-        coverage_context = ""
-        coverage = self._kernel_coverage()
-        if coverage is not None:
-            ledger_path = analysis_dir / kernel_ledger.LEDGER_FILENAME
-            coverage_context = (
-                f"Apply the **per-kernel coverage contract** to the saved captures: "
-                f"enumerate kernels at/above {coverage['min_share_pct']}% of GPU "
-                f"time, extending to {coverage['coverage_target_pct']}% coverage. "
-                f"Record `coverage.gpu_busy_pct` from the measured window and "
-                f"answer all four questions — eliminable? faster? fusible? "
-                f"overlappable? — with a roadmap item or evidence-backed "
-                f"dismissal. Write `{ledger_path}` and mirror it under "
-                f"`## Kernel disposition ledger` in the findings. The "
-                f"orchestrator validates coverage and item references; disclose "
-                f"missing capture evidence rather than fabricating it.\n\n"
-            )
+        coverage_context = self._kernel_ledger_instruction(state)
         projection_context = ""
         if self._sol_enabled():
             projection_context = (
@@ -2977,8 +2644,8 @@ class PerfOptimizeWorkflow:
                 f"actionable pending item while projected headroom remains, "
                 f"close `profile_findings.md` with the **Remaining-gap "
                 f"attribution** section per your system prompt — every part "
-                f"of the gap gets a new item or an evidence-backed reason it "
-                f"cannot be closed in this campaign.\n\n"
+                f"of the gap gets a supported item, an evidence-backed constraint, "
+                f"or is marked unexplained, with the next evidence needed.\n\n"
             )
         import_context = ""
         if state.reanalyze_pending:
@@ -2999,7 +2666,6 @@ class PerfOptimizeWorkflow:
             f"Round: {round_no} (**offline analysis**)\n"
             f"Source profile directory (read-only): {profile_dir}\n"
             f"Analysis directory (write derived artifacts here): {analysis_dir}\n\n"
-            + self._headroom_ledger_instruction(round_no, analysis_dir)
             + import_context
             + f"Read `{self.task_path}`, `{self.baseline_results_path}`, and "
             f"`{profile_dir / PROFILE_MANIFEST_NAME}` to establish capture "
@@ -3079,14 +2745,14 @@ class PerfOptimizeWorkflow:
         if self._sol_enabled():
             projection_context = (
                 f"`{self.sol_projection_path}` and any measured↔SOL "
-                f"correlation already in `{profiled_dir}` remain valid for "
-                f"this build — read them, do not re-derive them. If you "
+                f"correlation already in `{profiled_dir}` provide the standing "
+                f"comparison; new facts may correct the model. If you "
                 f"leave the roadmap with no actionable pending item while "
                 f"projected headroom remains, close this round's findings "
                 f"with the **Remaining-gap attribution** section per your "
-                f"system prompt — every part of the gap gets a new item or "
-                f"an evidence-backed reason it cannot be closed in this "
-                f"campaign.\n\n"
+                f"system prompt — every part of the gap gets a supported item, "
+                f"an evidence-backed constraint, or is marked unexplained, "
+                f"with the next evidence needed.\n\n"
             )
         self.analyzer(
             self._disagg_directive() + f"Workspace: {self.workspace}\n"
@@ -3109,16 +2775,18 @@ class PerfOptimizeWorkflow:
             f"{state.round_index}) for each attempt's `decision`, "
             f"`reason_category`, and measured gain, and read the "
             f"`evaluation.md` files under `{prev_round_dir}`. Those verdicts "
-            f"are measurements of **this** build: an item that failed on a "
-            f"perf shortfall bounds what its bottleneck is worth, and one "
-            f"that failed on functionality disproves the reasoning that "
-            f"ranked it. An attempt the orchestrator auto-rejected for "
+            f"describe attempts against **this** build. Determine which mechanism "
+            f"actually ran and what each outcome established. A performance "
+            f"shortfall alone does not bound the bottleneck's recoverable time; "
+            f"a functionality failure may expose an implementation bug. An "
+            f"attempt the orchestrator auto-rejected for "
             f"violating the approach restriction never reached the "
             f"evaluator and has no `evaluation.md` — its "
             f"`optimization_summary.md` is the record, and what it proves is "
             f"about the item's *realizability* under this campaign's "
             f"`optimize.approaches`, not about the bottleneck.\n\n"
             + projection_context
+            + self._kernel_ledger_instruction(state)
             + f"Then update `{self.roadmap_path}` **in place** against that "
             f"evidence: mark `obsolete` every pending item the round's "
             f"verdicts disprove or whose premise they undercut, revise the "
@@ -3645,25 +3313,16 @@ class PerfOptimizeWorkflow:
                 f"resolved to its campaign outcome, the still-pending refs "
                 f"itemized as the untried tail),"
             )
-            coverage_section = "Kernel Coverage / "
-        headroom_read = ""
-        headroom_section = ""
-        if self._headroom_ledger() is not None:
-            available = self.headroom_ledger_path.is_file()
-            headroom_read = (
-                f" `{self.headroom_ledger_path}` (the campaign's per-part gap "
-                f"accounting — the Headroom Accounting section per your system "
-                f"prompt: render the remaining-gap table **from this file**, "
-                f"never re-derive it from the round markdown, and quote every "
-                f"`model_revisions` / `measurement_revisions` entry verbatim, "
-                f"since those are what moved the bar the campaign was measured "
-                f"against),"
-                if available
-                else " the campaign's `headroom_ledger.yaml` (none was written "
-                "— the Headroom Accounting section must say so rather than "
-                "reconstructing the partition from the round reports),"
+            coverage_read += (
+                " Use the same ledger for the **Theoretical model vs silicon** table: "
+                "show each model's conditions, derivation, prediction, measured "
+                "time, unexplained residual, next test, and evidence-backed "
+                "revisions. Distinguish the last modeled capture from subsequent "
+                "accepted changes and final measurements; an unprofiled final "
+                "build has no validated model comparison. A closed roadmap "
+                "does not establish model/implementation convergence."
             )
-            headroom_section = "Headroom Accounting / "
+            coverage_section = "Kernel Coverage / "
         reuse_read = ""
         if state.reuse_analysis_dir:
             reuse_read = (
@@ -3681,7 +3340,7 @@ class PerfOptimizeWorkflow:
             f"The campaign is over ({state.round_index} round(s) ran). Read "
             f"**all** inputs listed in your system prompt: `{self.task_path}`, "
             f"`{self.baseline_results_path}`,"
-            f"{reuse_read}{projection_read}{coverage_read}{headroom_read} "
+            f"{reuse_read}{projection_read}{coverage_read} "
             f"`{self.roadmap_path}` (final "
             f"statuses, expected vs measured gains, baseline/current_best), "
             f"every `optimization_summary.md` / `evaluation.md` under "
@@ -3706,7 +3365,6 @@ class PerfOptimizeWorkflow:
             f"Applied Optimizations / Kernel-Level Comparison / "
             f"{coverage_section}"
             f"Failed Attempts / Final Verification / {projection_section}"
-            f"{headroom_section}"
             f"Config & Code Diff "
             f"Summary / Remaining Roadmap / Durable facts for the next "
             f"campaign), then `Write` "

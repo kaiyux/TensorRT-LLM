@@ -34,7 +34,6 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     CASEBOOK_APPLY,
     EXPECTATION_GATE,
     GIT_DISCIPLINE,
-    HEADROOM_LEDGER_REPORTER_GUIDANCE,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
     KERNEL_REUSE,
     MEASUREMENT_PROTOCOL,
@@ -47,7 +46,6 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     SOL_OPTIMIZER_CONTEXT,
     TUNING_CONFIG_NOTE,
     approach_restriction_note,
-    headroom_ledger_analyzer_note,
     kernel_coverage_analyzer_note,
     kernel_coverage_ncu_targeting,
 )
@@ -807,9 +805,9 @@ def test_sol_analyzer_context_is_context_not_evidence() -> None:
     assert "bound `expected_gain_pct` by recoverable headroom" in block
     assert "Fresh measured evidence outranks the projection" in block
     assert "Projected numbers must remain labeled as projections" in block
-    assert "Reuse the ceiling across rounds" in block
-    assert "record it through `model_revisions`" in block
-    assert "An optimization failure alone never changes SOL" in block
+    assert "Treat the projection as the initial theoretical model, not a frozen answer" in block
+    assert "`kernel_ledger.yaml`'s `model_revisions`" in block
+    assert "never justifies weakening a bound" in block
     assert "projection is missing or unavailable, skip correlation" in block
 
 
@@ -817,11 +815,14 @@ def test_sol_analyzer_context_forbids_silent_exhaustion() -> None:
     block = _norm(SOL_ANALYZER_CONTEXT)
     assert "no actionable item remains despite meaningful projected headroom" in block
     assert "## Remaining-gap attribution" in block
-    assert "each part, its roadmap item or evidence-backed campaign constraint" in block
+    assert (
+        "each kernel or logical region, its roadmap item or evidence-backed campaign constraint"
+        in block
+    )
     assert "any `unexplained` remainder" in block
     assert "failed items' `evaluation.md`" in block
     assert "Gap implication" in block
-    assert "apply the ledger's attribution rules" in block
+    assert "preserve the ledger's unexplained discrepancies" in block
 
 
 def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
@@ -840,8 +841,9 @@ def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
     # campaign-level peaks file, a fresh join every profiling round.
     assert "this round's `analysis/` directory" in block
     assert "Re-run correlation in full analyses, including re-analysis" in block
-    # …and not on the rounds that produce no measured rows to join.
-    assert "Replan-only rounds reuse the standing correlation" in block
+    # Replan preserves measurements while facts may revise the prediction.
+    assert "Replan-only rounds preserve standing measurements" in block
+    assert "may revise analytical predictions from new facts" in block
 
 
 def test_projector_prompt_persists_peaks_for_the_analyzer():
@@ -1472,179 +1474,43 @@ def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective() -> None
     assert "bound recovery by `pct_of_iter`, not the whole rank spread" in prompt
 
 
-# --------------------------------------------------------------- headroom ledger
-
-_HL_BLOCK = {
-    "enforcement": "warn",
-    "target_layer": "ranking",
-    "tolerance_pct": 1.0,
-    "min_share_pct": 0.5,
-}
+# ------------------------------------------------------ unified performance model
 
 
-def _headroom_bundle(**overrides):
-    return build_perf_optimize_prompts(headroom_ledger={**_HL_BLOCK, **overrides})
+def test_kernel_ledger_updates_the_model_on_every_analyzer_turn():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "Every analyzer turn, including re-analysis and replan-only rounds" in block
+    assert "copy the standing measurements and coverage into a fresh ledger" in block
+    assert "preserve measurement provenance" in block.lower()
+    assert "append-only `model_revisions`" in block
+    assert "record each changed model field with its previous and new value" in block.lower()
 
 
-def test_headroom_note_states_the_three_tiers_and_their_owners():
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "sol_ms <= target_ms <= measured_ms" in block
-    # The split is the point: one gap has an owner, the other has none.
-    assert "engineering gap" in block
-    assert "structural gap" in block
-    for field in (
-        "operating_point:",
-        "build_sha:",
-        "capture_state:",
-        "step_ms:",
-        "kernel_ms:",
-        "modeled_kernel_ms:",
-        "empirical_kernel_ms:",
-        "unmodeled_kernel_ms:",
-        "non_kernel_ms:",
-        "residual_ms:",
-        "parts:",
-        "partition:",
-        "attribution:",
-        "closed_ms:",
-        "attributed_ms:",
-        "open_ms:",
-        "unexplained_ms:",
-        "part_lifecycle:",
-    ):
-        assert field in block, field
-    assert "analytic | empirical | unmodeled" in block
-    assert "gpu-bound | host-bound | mixed" in block
+def test_kernel_model_converges_from_facts_and_preserves_unknowns():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "A failed optimization alone cannot justify relaxing the model" in block
+    assert "Measured time below a predicted lower bound exposes an invalid model" in block
+    assert "never clamp the measurement" in block
+    assert "Unknown predictions or measurements are `null`" in block
+    assert "unknown never means no opportunity" in block
+    assert "facts explain the residual" in block
+    assert "unexplained gaps open" in block
+    assert "matching units and scope" in block
+    assert "Never sum overlapping kernel durations" in block
+    assert "logical region shared by several kernels" in block
 
 
-def test_headroom_note_makes_the_lever_distinction_explicit():
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "A failed item rules out its lever, not the whole part" in block
-    assert "kernel-ledger-exhaustive" in block
-    assert "every joined kernel has all four questions dispositioned `dismissed`" in block
-    assert "convergent-levers" in block
-    assert "at least **two** dispositions with distinct `lever` values" in block
-    for implication in (
-        "applied-but-no-gain",
-        "mechanism-already-present",
-        "change-not-live",
-        "blocked-by-constraint",
-    ):
-        assert implication in block
-    assert "never count toward either basis" in block
-    assert "Without a qualifying basis, keep the time `unexplained`" in block
-
-
-def test_headroom_note_says_which_artifact_the_join_closes_against():
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "`parts[].kernels` is the authoritative join" in block
-    assert "sum(kernels[].share_pct) / 100 x kernel_ms = part measured_ms in regions.json" in block
-    assert "`sol.json` substitutes `exposed_ms` for communication rows" in block
-    assert "reverse annotation derived from this join" in block
-
-
-def test_headroom_note_requires_both_bracketing_concurrencies():
-    """The composed policy chooses captures; the ledger records sensitivity."""
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "effective profiling policy" in block
-    assert "Sensitivity requires two distinct bracketing points" in block
-    assert "a single point cannot establish it" in block
-    assert "`flat`" in block and "`steep`" in block
-    assert "estimate its benefit separately at each scored point" in block
-    assert "Profile and enter every part at **both**" not in block
-
-
-def test_headroom_note_licenses_saying_the_target_is_unknown():
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "`basis: none-known`" in block
-    assert "`target_ms == measured_ms`, omit `delta`" in block
-    assert "leave the gap structural" in block
-    assert "`achieved_efficiency`: **measured**, with a named source" in block
-    assert "`falsifier`: required" in block
-    assert "existing-impl | published | derived | none-known" in block
-    assert "Include an explicit `unattributed` remainder" in block
-
-
-def test_headroom_note_separates_the_symptom_from_the_fact():
-    block = _norm(headroom_ledger_analyzer_note())
-    for cause in ("missing-factor", "wrong-peak", "wrong-parallelism", "mixed-state-capture"):
-        assert cause in block
-    for field in (
-        "model_revisions",
-        "measurement_revisions",
-        "target_revisions",
-        "cause",
-        "detail",
-        "evidence",
-    ):
-        assert f"`{field}`" in block
-    assert "non-empty `detail` naming the specific defect" in block
-    assert "resolving `evidence` reference" in block
-    assert "An optimization failure alone cannot revise SOL or retire headroom" in block
-
-
-def test_headroom_note_reserves_dispositions_for_the_orchestrator():
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "`dispositions` and `history` are **orchestrator-owned**" in block
-    assert "Read them without modifying them" in block
-
-
-def test_headroom_note_switches_ranking_with_the_task_knob():
-    ranking = _norm(headroom_ledger_analyzer_note("ranking"))
-    report_only = _norm(headroom_ledger_analyzer_note("report_only"))
-    assert "Size expected gains from the engineering gap" in ranking
-    assert "Size expected gains from the engineering gap" not in report_only
-    assert "report-only this campaign" in report_only
-    assert "targets do not steer it" in report_only
-    for block in (ranking, report_only):
-        assert "Execution priority remains the roadmap's expected gain" in block
-
-
-def test_headroom_note_states_the_real_consequence_of_an_invalid_ledger():
-    warn = _norm(headroom_ledger_analyzer_note(enforcement="warn"))
-    error = _norm(headroom_ledger_analyzer_note(enforcement="error"))
-    assert "warns without stopping the round" in warn
-    assert "aborts the analyzer stage" not in warn
-    assert "aborts the analyzer stage" in error
-    assert "warns without stopping the round" not in error
-
-
-def test_headroom_note_interpolates_the_task_share_bar():
-    assert "at/above 2.5%" in _norm(headroom_ledger_analyzer_note(min_share_pct=2.5))
-
-
-def test_headroom_note_orders_the_target_walk_structurally():
-    block = _norm(headroom_ledger_analyzer_note())
-    assert "## Target implementation" in block
-    assert "model **execution order**" in block
-    assert "Include empirical, unmodeled, and non-kernel stages" in block
-    assert "from the ledger and correlation artifacts" in block
-    assert "engineering-gap ranking as a derived view" in block
-
-
-def test_headroom_reporter_guidance_renders_rather_than_rederives():
-    block = _norm(HEADROOM_LEDGER_REPORTER_GUIDANCE)
-    assert "## Headroom Accounting" in block
-    assert "Do not re-derive a partition" in block
-    assert "verbatim" in block
-    assert "Absolute milliseconds, not % of SOL." in block
-
-
-def test_headroom_bundle_reaches_only_the_analyzer_and_reporter():
-    bundle = _headroom_bundle()
-    assert "headroom_ledger.yaml" in bundle.analyzer
-    assert "## Headroom Accounting" in bundle.reporter
-    # The gate stays measured-vs-measured: a plan must never anchor a
-    # verdict, and neither role may see the ledger, SOL, or the targets.
-    for role in ("evaluator", "qa", "optimizer", "benchmarker", "integrator", "projector"):
-        assert "headroom_ledger.yaml" not in getattr(bundle, role), role
-        assert "target_ms" not in getattr(bundle, role), role
-
-
-def test_default_prompts_omit_the_headroom_contract():
-    bundle = build_perf_optimize_prompts()
-    assert "headroom_ledger.yaml" not in bundle.analyzer
-    assert "## Headroom Accounting" not in bundle.reporter
+def test_unified_ledger_exposes_models_only_to_analyzer_and_reporter():
+    bundle = _coverage_bundle()
+    assert "version: 2" in bundle.analyzer
+    assert "models:" in bundle.analyzer
+    assert "Theoretical model vs silicon" in bundle.reporter
+    assert "model_revisions" in bundle.reporter
+    for role in ("optimizer", "evaluator", "qa"):
+        assert getattr(bundle, role) == getattr(DEFAULT_PROMPTS, role)
+    for role in _ALL_PROMPTS:
+        assert "headroom_ledger.yaml" not in getattr(bundle, role)
+        assert "## Headroom Accounting" not in getattr(bundle, role)
 
 
 def test_evaluator_carries_the_change_not_live_implication():
@@ -1657,7 +1523,7 @@ def test_evaluator_carries_the_change_not_live_implication():
 
 def test_evaluator_is_told_to_pass_the_structured_fields():
     block = _norm(EVALUATOR_SYSTEM_PROMPT)
-    for field in ("gap_implication", "gap_implication_note", "parts", "lever", "target_blocker"):
+    for field in ("gap_implication", "gap_implication_note", "lever", "target_blocker"):
         assert field in block, field
     assert "Prose is not a contract" in block
     # The blocker is a fact about the code that it verifies, not authors.
@@ -1702,9 +1568,9 @@ def test_dump_clears_a_previous_launch_stale_role(tmp_path):
 
 
 def test_profiler_emits_only_the_effective_config_and_replay_policies() -> None:
-    for headroom in (None, _HL_BLOCK):
+    for coverage in (None, {"min_share_pct": 0.5, "coverage_target_pct": 95.0}):
         bundle = build_perf_optimize_prompts(
-            approaches=["code"], include_sol=True, headroom_ledger=headroom
+            approaches=["code"], include_sol=True, kernel_coverage=coverage
         )
         prompt = _norm(bundle.profiler)
         assert prompt.count("Effective profiling point policy") == 1
@@ -1715,13 +1581,8 @@ def test_profiler_emits_only_the_effective_config_and_replay_policies() -> None:
         assert "every item must be `approach: config`" not in prompt
         assert "still measure and report every point" not in prompt
         assert "**One run per concurrency point.**" not in prompt
-        if headroom:
-            assert "lowest and highest scored concurrency points" in prompt
-            assert "optimize.focus_concurrencies" in prompt
-            assert "replay only the **largest**" not in prompt
-        else:
-            assert "replay only the **largest**" in prompt
-            assert "lowest and highest scored concurrency points" not in prompt
+        assert "replay only the **largest**" in prompt
+        assert "lowest and highest scored concurrency points" not in prompt
 
 
 def test_analyzer_omits_other_roles_implementation_and_verdict_instructions() -> None:
@@ -1737,7 +1598,7 @@ def test_analyzer_omits_other_roles_implementation_and_verdict_instructions() ->
 
 
 def test_analyzer_replan_preserves_measurements_and_history() -> None:
-    prompt = _norm(_headroom_bundle().analyzer)
+    prompt = _norm(_coverage_bundle().analyzer)
     assert "launch no server, run no profiler" in prompt
     assert "Do not regenerate measured artifacts" in prompt
     assert "full findings structure applies only to full analysis, including re-analysis" in prompt
@@ -1831,7 +1692,6 @@ def test_analyzer_has_no_capture_commands_under_any_extensions() -> None:
             include_disagg=True,
             include_sol=True,
             kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
-            headroom_ledger=_HL_BLOCK,
         ),
     ):
         prompt = bundle.analyzer
@@ -1865,7 +1725,6 @@ def test_reanalysis_refreshes_ledgers_and_correlation_without_recapture() -> Non
     bundle = build_perf_optimize_prompts(
         include_sol=True,
         kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
-        headroom_ledger=_HL_BLOCK,
     )
     prompt = _norm(bundle.analyzer)
     assert "Re-analysis rebuilds the ledger from saved evidence" in prompt
@@ -1911,3 +1770,37 @@ def test_evaluator_comparative_analysis_preserves_previous_capture() -> None:
     assert "Keep previous captures and analyses read-only" in prompt
     assert "associated round's `analysis/taxonomy.json`" in prompt
     assert "<previous capture or analysis server_nsys.sqlite>" in prompt
+
+
+def test_kernel_ledger_prompt_example_validates(tmp_path):
+    from agent_flow.workflows.perf_optimize.kernel_ledger import load_ledger
+
+    prompt = kernel_coverage_analyzer_note(0.5, 95.0)
+    example = prompt.split("```yaml\n", 1)[1].split("```", 1)[0]
+    path = tmp_path / "kernel_ledger.yaml"
+    path.write_text(example, encoding="utf-8")
+    ledger = load_ledger(path)
+    assert ledger["version"] == 2
+    assert {row["model"] for row in ledger["kernels"]} == {
+        model["id"] for model in ledger["models"]
+    }
+    assert any(model["predicted_ms"] is None for model in ledger["models"])
+
+
+def test_projector_records_initial_model_without_freezing_future_analysis():
+    prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
+    assert "Later facts may expose a faulty assumption or omitted cost" in prompt
+    assert "the analyzer maintains the best current model" in prompt.lower()
+    assert "ceiling stays valid for every later round" not in prompt
+
+
+def test_reporter_distinguishes_superseded_projection_from_current_model():
+    block = _norm(SOL_OPTIMIZE_REPORTER_GUIDANCE)
+    assert "superseded initial model" in block
+    assert "cite the model revision" in block
+    assert "Never present a falsified prediction" in block
+    assert "Attribute missing time to host/scheduler costs only when traces" in block
+    assert (
+        "a large discrepancy alone does not distinguish implementation inefficiency from model error"
+        in block
+    )
