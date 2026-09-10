@@ -204,7 +204,7 @@ def _stub_agents(
     workflow,
     *,
     analyzer_items: list[list[dict]] | None = None,
-    evaluator_verdicts: list[tuple] | None = None,
+    evaluator_verdicts: list[tuple] | dict[str, list[tuple]] | None = None,
     baseline_curve: list[dict] | None = None,
     evaluator_curve: list[dict] | None = None,
 ):
@@ -218,14 +218,15 @@ def _stub_agents(
     - ``analyzer_items`` — items the analyzer stub *adds* to the roadmap,
       one list per invocation (later invocations default to adding none).
     - ``evaluator_verdicts`` — ``(decision, reason, gain, value)`` per
-      evaluator invocation (the last one repeats).
+      evaluator invocation, or a mapping from item ID to per-attempt verdicts
+      for concurrent items (the last verdict repeats in either form).
     - ``baseline_curve`` — curve the analyzer stub writes on
       ``baseline``/``current_best`` (Pareto-curve mode runs).
     - ``evaluator_curve`` — ``curve`` field every evaluator entry carries.
     """
     trace: list[str] = []
     items_per_round = list(analyzer_items if analyzer_items is not None else [[_item()]])
-    verdicts = list(evaluator_verdicts or [("APPROVE", "none", 8.4, 108.4)])
+    verdicts = evaluator_verdicts or [("APPROVE", "none", 8.4, 108.4)]
     counters = {"analyzer": 0, "evaluator": 0}
 
     def _append(entry: dict, local_path: Path | None = None) -> None:
@@ -312,9 +313,15 @@ def _stub_agents(
         trace.append("evaluator")
         report = workflow._attempt_dir(state) / "evaluation.md"
         report.write_text("# evaluation\n", encoding="utf-8")
-        idx = counters["evaluator"]
-        counters["evaluator"] += 1
-        decision, reason, gain, value = verdicts[min(idx, len(verdicts) - 1)]
+        if isinstance(verdicts, dict):
+            item_verdicts = verdicts[state.current_item_id]
+            idx = state.attempt_index
+        else:
+            item_verdicts = verdicts
+            with workflow._progress_lock:
+                idx = counters["evaluator"]
+                counters["evaluator"] += 1
+        decision, reason, gain, value = item_verdicts[min(idx, len(item_verdicts) - 1)]
         entry = {
             "step": 1,
             "agent": "evaluator",
@@ -1325,10 +1332,10 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
     trace = _stub_agents(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
-        evaluator_verdicts=[
-            ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 103.0),
-        ],
+        evaluator_verdicts={
+            "opt-001": [("APPROVE", "none", 8.4, 108.4)],
+            "opt-002": [("APPROVE", "none", 3.0, 103.0)],
+        },
     )
     try:
         workflow.run(str(task))
@@ -1346,12 +1353,13 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
     one = roadmap_schema.find_item(roadmap, "opt-001")
     two = roadmap_schema.find_item(roadmap, "opt-002")
     assert one["status"] == "accepted"
-    assert sorted([one["measured_gain_pct"], two["measured_gain_pct"]]) == [3.0, 8.4]
+    assert one["measured_gain_pct"] == pytest.approx(8.4)
+    assert two["measured_gain_pct"] == pytest.approx(3.0)
     assert two["status"] == "accepted"
     # The Integrator reports the combined state once for the whole batch.
-    assert roadmap["current_best"]["value"] in (108.4, 103.0)
+    assert roadmap["current_best"]["value"] == pytest.approx(108.4)
     assert roadmap["current_best"]["source"] == "rounds/round_1/integration/integration.md"
-    # Per-item artifact dirs and one accept commit per item, in order.
+    # Per-item artifact dirs and one accept commit per item.
     round_dir = ws / "rounds" / "round_1"
     assert (round_dir / "item_1_opt-001" / "attempt_1" / "evaluation.md").is_file()
     assert (round_dir / "item_2_opt-002" / "attempt_1" / "evaluation.md").is_file()
@@ -1596,17 +1604,17 @@ def test_item_and_round_budgets_cap_the_campaign(tmp_path, fake_git):
 
 
 def test_rejected_item_advances_to_next_item_in_same_round(tmp_path, fake_git):
-    """A terminally rejected item is reverted, then the round moves on."""
+    """A terminally rejected item does not block an accepted parallel sibling."""
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
-        evaluator_verdicts=[
-            ("REJECT", "functionality", 0.0, 0.0),
-            ("APPROVE", "none", 4.0, 104.0),
-        ],
+        evaluator_verdicts={
+            "opt-001": [("REJECT", "functionality", 0.0, 0.0)],
+            "opt-002": [("APPROVE", "none", 4.0, 104.0)],
+        },
     )
     try:
         workflow.run(str(task))
@@ -1614,17 +1622,14 @@ def test_rejected_item_advances_to_next_item_in_same_round(tmp_path, fake_git):
         workflow.close()
 
     # opt-001's REJECT is terminal (no retries despite the attempt
-    # budget); the round continued with opt-002 without a fresh analyzer
-    # profile.
+    # budget); sibling opt-002 completes without a fresh analyzer profile.
     assert trace[0:4] == ["benchmarker", "projector", "profiler", "analyzer"]
     assert trace.count("analyzer") == 2
     assert trace.count("optimizer") == 2
     assert trace.count("evaluator") == 2
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    statuses = {
-        roadmap_schema.find_item(roadmap, item_id)["status"] for item_id in ("opt-001", "opt-002")
-    }
-    assert statuses == {"failed", "accepted"}
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "failed"
+    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
     assert roadmap["current_best"]["value"] == pytest.approx(104.0)
     assert fake_git.count("reset_to") >= 2
     assert fake_git.count("commit_all") == 1
@@ -1640,11 +1645,13 @@ def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
     trace = _stub_agents(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
-        evaluator_verdicts=[
-            ("PUSH_BACK", "perf_shortfall", 0.2, 100.2),  # opt-001 attempt 1
-            ("APPROVE", "none", 8.4, 108.4),  # opt-001 attempt 2
-            ("APPROVE", "none", 3.0, 103.0),  # opt-002 attempt 1
-        ],
+        evaluator_verdicts={
+            "opt-001": [
+                ("PUSH_BACK", "perf_shortfall", 0.2, 100.2),
+                ("APPROVE", "none", 8.4, 108.4),
+            ],
+            "opt-002": [("APPROVE", "none", 3.0, 103.0)],
+        },
     )
     resets: list[int] = []
     workflow.optimizer.reset_session = lambda: resets.append(len(trace))
@@ -1656,6 +1663,9 @@ def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
     assert trace[0:4] == ["benchmarker", "projector", "profiler", "analyzer"]
     assert trace.count("optimizer") == 3
     assert trace.count("evaluator") == 3
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap_schema.find_item(roadmap, "opt-001")["attempts"] == 2
+    assert roadmap_schema.find_item(roadmap, "opt-002")["attempts"] == 1
     # The legacy campaign-wide optimizer is not used/reset; each worker owns
     # and closes its own persistent optimizer layer.
     assert resets == []
@@ -4036,12 +4046,12 @@ def test_item_budget_reprofiles_remaining_items(tmp_path, fake_git):
                 _item("opt-004", gain=4.0),
             ]
         ],
-        evaluator_verdicts=[
-            ("REJECT", "perf_shortfall", -0.4, 99.6),
-            ("REJECT", "perf_shortfall", -0.2, 99.8),
-            ("APPROVE", "none", 8.4, 108.4),
-            ("APPROVE", "none", 3.0, 111.652),
-        ],
+        evaluator_verdicts={
+            "opt-001": [("REJECT", "perf_shortfall", -0.4, 99.6)],
+            "opt-002": [("REJECT", "perf_shortfall", -0.2, 99.8)],
+            "opt-003": [("APPROVE", "none", 8.4, 108.4)],
+            "opt-004": [("APPROVE", "none", 3.0, 111.652)],
+        },
     )
     try:
         workflow.run(str(task))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -991,21 +992,12 @@ class PerfOptimizeWorkflow:
             state.batch_started = True
             self._checkpoint(state)
 
-        # A worktree isolates files, not GPUs or the fixed serving port.
-        # Local items still share a frozen base and go through integration,
-        # but their optimizer smoke tests and evaluator runs must not overlap.
-        task = self._task_data()
-        isolated_jobs = has_slurm_environment(task) or has_disagg(task)
-        workers = max(1, len(state.item_batch)) if isolated_jobs else 1
-        if workers == 1 and len(state.item_batch) > 1:
-            print_message(
-                "[dim]local runtime shared — running frozen-base candidates one at a time "
-                "before integration[/dim]",
-                log,
-            )
+        # Every item has its own worktree and agent sessions. Local agents
+        # coordinate shared runtime operations through their flock instructions;
+        # reasoning and source edits can overlap regardless of execution environment.
         errors: list[BaseException] = []
         with ThreadPoolExecutor(
-            max_workers=workers,
+            max_workers=max(1, len(state.item_batch)),
             thread_name_prefix="perf-opt-item",
         ) as executor:
             futures = {
@@ -2454,6 +2446,38 @@ class PerfOptimizeWorkflow:
             "path; a different installed package is a blocker.\n\n"
         )
 
+    def _local_runtime_instruction(self, state: WorkflowState) -> str:
+        """Coordinate shared local runtime sessions without serializing agent turns."""
+        task = self._task_data()
+        if state.item_execution != "parallel" or has_slurm_environment(task) or has_disagg(task):
+            return ""
+        lock_path = shlex.quote(str(self.workspace.resolve() / ".local_runtime.lock"))
+        return (
+            "**Concurrent local items — shared runtime protocol.** Other optimizer/evaluator "
+            "pairs are active in their own worktrees. Reasoning, source edits, CPU-only checks, "
+            "and offline result analysis may run concurrently outside the lock. Before any "
+            "build/install that changes the runtime, GPU test or microbenchmark, server/port "
+            "operation, benchmark replay, or profiling capture, write an item-owned shell "
+            "script under your attempt directory and run it in the foreground with "
+            f'`flock -x --close -- {lock_path} bash "<runtime-session-script>"`. '
+            "All local items use this exact lock file; never unlink it or substitute an "
+            "item-specific lock. If another item holds it, wait for the lock; never bypass "
+            "it or kill the holder. If flock fails or is unavailable, report the blocker "
+            "instead of running the session without it.\n\n"
+            "One locked script must own the complete runtime session: establish this "
+            "candidate's build/install and PYTHONPATH, verify its import/build identity, "
+            "launch, poll readiness, exercise/measure, and tear down. Re-establish and "
+            "verify your candidate after every acquisition because a sibling may have "
+            "changed the shared installation. Install EXIT/INT/TERM cleanup traps before "
+            "launch; tear down and wait for all owned server/profiler process groups before "
+            "the script exits and releases the lock, including on failure or interruption. "
+            "Do not background the flock wrapper or split a live server's lifecycle across "
+            "separate lock acquisitions. Later experiments may use another complete locked "
+            "session. All port inspection and stale-listener cleanup instructions apply "
+            "only after acquiring this lock: a busy port while waiting may belong to a "
+            "sibling, and you must never kill or benchmark that sibling's server.\n\n"
+        )
+
     def _run_benchmarker(self, state: WorkflowState) -> None:
         self._stamp_progress(state, round_no=0)
         if self._curve_mode():
@@ -3079,7 +3103,9 @@ class PerfOptimizeWorkflow:
                 f"your summary, not a claim to re-assert.\n\n"
             )
         (agent or self.optimizer)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._disagg_directive()
+            + self._local_runtime_instruction(state)
+            + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -3305,7 +3331,10 @@ class PerfOptimizeWorkflow:
                 "Keep the candidate unchanged and append a corrected verdict.\n\n"
             )
         (agent or self.evaluator)(
-            correction + self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            correction
+            + self._disagg_directive()
+            + self._local_runtime_instruction(state)
+            + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"

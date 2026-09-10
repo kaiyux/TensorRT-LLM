@@ -108,9 +108,14 @@ round loop:
 - **optimizer** — one independent persistent optimizer is created for each
   dispatched item. With `item_execution: parallel`, up to
   `max_items_per_round` pairs start from the same frozen round base.
-  They run concurrently in separate exclusive Slurm allocations. On a
-  shared local runtime they run one at a time, including smoke tests,
-  so candidates cannot compete for GPUs or port 8000. Both schedules
+  They run concurrently for local, Slurm, and disaggregated tasks. On a
+  shared local runtime, optimizer/evaluator instructions require `flock`
+  on `<workspace>/.local_runtime.lock` around each complete build/GPU/server
+  session, including cleanup. Reasoning, coding, CPU-only checks, and offline
+  analysis can overlap while those runtime sessions wait for exclusive access
+  to the shared GPUs and port 8000. This is a cooperative agent protocol;
+  the workflow does not intercept shell commands. Each session must verify
+  its candidate's runtime after acquiring the lock. All parallel tasks
   retain the frozen base and integration stage. With `serial`, each
   worktree starts from the latest accepted
   campaign state. In both modes, approved and rejected terminal items

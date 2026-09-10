@@ -1,6 +1,8 @@
 """Runtime isolation and accepted-state evidence at role boundaries."""
 
-from threading import Event, Lock
+import shlex
+from pathlib import Path
+from threading import Barrier, Lock
 
 import pytest
 
@@ -15,39 +17,110 @@ from tests.workflows.perf_optimize.test_workflow import (
 )
 
 
-@pytest.mark.parametrize("slurm", [False, True])
-def test_parallel_batch_only_overlaps_workers_with_isolated_jobs(tmp_path, slurm):
-    """A frozen local batch must not let sibling smoke tests share port 8000."""
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {},
+        {"slurm-environment": {"slurm_partition": "batch"}},
+        {"disagg": {"config": "harness.yaml"}},
+    ],
+    ids=["local", "slurm", "disagg"],
+)
+@pytest.mark.parametrize("resume", [False, True])
+def test_parallel_batch_overlaps_workers_for_all_runtimes(
+    tmp_path: Path, runtime: dict, resume: bool
+) -> None:
+    """Optimizer work overlaps even when GPU measurements share a local runtime."""
     with workflow_module.PerfOptimizeWorkflow(tmp_path / "workspace") as workflow:
-        task = {"slurm-environment": {"slurm_partition": "batch"}} if slurm else {}
-        workflow._task_data = lambda: task
+        workflow._task_data = lambda: runtime
         workflow._ensure_item_runtime = lambda state, entry: None
+        batch = [{"current_item_id": item_id} for item_id in ("a", "b", "c")]
+        if resume:
+            batch.extend(
+                [
+                    {"current_item_id": "ready", "status": "candidate_ready"},
+                    {"current_item_id": "failed", "status": "failed"},
+                ]
+            )
         state = WorkflowState(
             task_path=str(workflow.task_path),
-            item_batch=[{"current_item_id": "a"}, {"current_item_id": "b"}],
+            item_execution="parallel",
+            item_batch=batch,
+            batch_started=resume,
         )
         lock = Lock()
-        overlapped = Event()
-        active = 0
-        maximum = 0
+        started = Barrier(3, timeout=10)
+        item_ids = []
 
-        def worker(state, entry, log):
-            nonlocal active, maximum
+        def worker(state: WorkflowState, entry: dict, log) -> None:
             with lock:
-                active += 1
-                maximum = max(maximum, active)
-                if active == 2:
-                    overlapped.set()
-            # A concurrent sibling releases this wait; a local batch proceeds
-            # one at a time even though both items were submitted together.
-            overlapped.wait(timeout=0.2)
-            with lock:
-                active -= 1
+                item_ids.append(entry["current_item_id"])
+            # No item can finish until every pending sibling starts. The
+            # timeout only bounds a scheduler regression that would deadlock.
+            started.wait()
 
         workflow._run_opt_item = worker
         workflow._run_opt_items_parallel(state, workflow_module.get_logger().console)
-        assert maximum == (2 if slurm else 1)
+        assert sorted(item_ids) == ["a", "b", "c"]
+        assert state.batch_started
         assert state.batch_completed
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {},
+        {"slurm-environment": {"slurm_partition": "batch"}},
+        {"disagg": {"config": "harness.yaml"}},
+    ],
+    ids=["local", "slurm", "disagg"],
+)
+@pytest.mark.parametrize("execution", ["serial", "parallel"])
+def test_item_prompts_coordinate_only_shared_parallel_runtime(
+    tmp_path: Path, runtime: dict, execution: str
+) -> None:
+    """Sibling optimizers and evaluators share one lock for complete runtime sessions."""
+    task = _write_task(
+        tmp_path,
+        {"sol": {"enabled": False}, "optimize": {"item_execution": execution}},
+    )
+    with workflow_module.PerfOptimizeWorkflow(tmp_path / "workspace's runtime") as workflow:
+        state = workflow._init_state(str(task), workflow_module.get_logger().console)
+        task_data = {**workflow._task_data(), **runtime}
+        workflow._task_data = lambda: task_data
+        expected_lock = str(workflow.workspace.resolve() / ".local_runtime.lock")
+        for item_index in range(2):
+            state.item_index = item_index
+            state.current_item_id = f"opt-{item_index}"
+            state.item_worktree_path = str(tmp_path / f"candidate-{item_index}")
+            for run_role in (workflow._run_optimizer, workflow._run_evaluator):
+                recorder = _RecordingAgent()
+                run_role(state, agent=recorder)
+                prompt = recorder.messages[-1]
+                if execution == "serial" or runtime:
+                    assert ".local_runtime.lock" not in prompt
+                    assert "flock -x" not in prompt
+                    continue
+
+                command = next(part for part in prompt.split("`") if part.startswith("flock -x "))
+                assert shlex.split(command) == [
+                    "flock",
+                    "-x",
+                    "--close",
+                    "--",
+                    expected_lock,
+                    "bash",
+                    "<runtime-session-script>",
+                ]
+                assert "CPU-only checks" in prompt
+                assert "outside the lock" in prompt
+                assert "complete runtime session" in prompt
+                assert "Re-establish and verify your candidate after every acquisition" in prompt
+                assert "EXIT/INT/TERM cleanup traps" in prompt
+                assert "tear down and wait for all owned server/profiler process groups" in prompt
+                assert "before the script exits and releases the lock" in prompt
+                assert "never unlink" in prompt
+                assert "never kill or benchmark that sibling's server" in prompt
 
 
 @pytest.mark.parametrize("execution", ["serial", "parallel"])
