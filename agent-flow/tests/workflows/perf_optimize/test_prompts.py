@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from agent_flow.workflows.perf_analyze.prompts._common import (
     SOL_METHODOLOGY_FALLBACK as _ANALYZE_METHODOLOGY_FALLBACK,
 )
@@ -930,6 +932,8 @@ def test_sol_analyzer_context_forbids_silent_exhaustion() -> None:
     assert "failed items' `evaluation.md`" in block
     assert "Gap implication" in block
     assert "preserve the ledger's unexplained discrepancies" in block
+    assert "campaign-end accounting brief" in block
+    assert "link to the existing gap explanations" in block
 
 
 def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
@@ -940,9 +944,10 @@ def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
     assert "regions.json" in block
     assert "sol_work/peaks.json" in block
     assert "never invent params or `measured_ms` rows" in block
-    # The joined table lands in the findings' dedicated section, with
-    # honest degradation when a precondition fails.
-    assert "## SOL correlation (measured vs ceiling)" in block
+    # The assembled findings contract selects one destination for the
+    # comparison; the calculator recipe retains honest degradation.
+    assert "## SOL correlation (measured vs ceiling)" not in block
+    assert "report's comparison section" in block
     assert "Correlation unavailable" in block
     # Optimize-specific placement and cadence: per-round artifacts, one
     # campaign-level peaks file, a fresh join every profiling round.
@@ -998,7 +1003,8 @@ def test_sol_reporter_guidance_carries_remaining_gap_accountability():
     # correlation table is a named evidence source for the gap parts.
     assert "Every accountability verdict traces to an artifact" in block
     assert "Gap implication" in block
-    assert "SOL correlation" in block
+    assert "comparison in *Per-layer theoretical performance model*" in block
+    assert "*SOL correlation* when kernel coverage is disabled" in block
     assert "worse than reporting it unexplained" in block
     # A zero-accept campaign still owes the breakdown.
     assert "accepted nothing must still fill the accountability" in block
@@ -1597,6 +1603,12 @@ def test_kernel_ledger_updates_the_model_on_every_analyzer_turn():
     assert "preserve measurement provenance" in block.lower()
     assert "append-only `model_revisions`" in block
     assert "record each changed model field with its previous and new value" in block.lower()
+    assert "Include the full current section on **replan-only** turns" in block
+    assert "name their source round" in block
+    assert "preserve the imported report verbatim" in block
+    assert "clearly labeled current-campaign section with this heading" in block
+    assert "Preserve imported anchors and give the appended section a unique anchor" in block
+    assert "`current-campaign-` if its round anchor already exists in imported text" in block
 
 
 def test_kernel_model_converges_from_facts_and_preserves_unknowns():
@@ -1611,16 +1623,87 @@ def test_kernel_model_converges_from_facts_and_preserves_unknowns():
     assert "matching units and scope" in block
     assert "Never sum overlapping kernel durations" in block
     assert "logical region shared by several kernels" in block
+    report = block.split("### Required analyzer report section:", 1)[1].split(
+        "### The kernel ledger contract", 1
+    )[0]
+    assert "## Per-layer theoretical performance model" in report
+    assert "before **## Ranked bottleneck hypotheses**" in report
+    assert "HTML anchor `per-layer-theoretical-performance-model-round-N`" in report
+    assert "logical layers from config/source" in report
+    assert "model IDs and kernel/region evidence" in report
+    assert "index range/count" in report
+    assert "per-layer, averaged and repeated-total timings" in report
+    assert "sharding" in report
+    assert "shapes/dtypes, FLOPs, necessary memory traffic" in report
+    assert "collectives" in report
+    assert "Substitute numbers and units into formulas" in report
+    assert "hardware constants and their sources" in report
+    assert "Separate theoretical minimum latency from empirical practical estimates" in report
+    assert "Label which kind `predicted_ms` represents in `derivation`" in report
+    assert "record both calculations there when both are available" in report
+    assert "Match the operating point and timing scope" in report
+    assert "unexplained residuals and the next discriminating test" in report
+    assert "critical-path lower bound" in report
+    assert "never double count regions or alternative savings" in report
+    assert "Label incomplete totals as partial" in report
+    assert "include the `sol.json` comparison here once" in report
+    assert "calculator columns and region scopes intact" in report
+    assert "add layer totals only with an explicit mapping" in report
+    assert "equations, bounds, comparison tables and gap explanations in this section" in report
+    assert "nsys/ncu sections own measured diagnostics" in report
+    assert "kernel disposition ledger owns decisions" in report
+    assert "ranked hypotheses own prioritized experiments" in report
+    assert "Both reference the model's gaps instead of repeating them" in report
+    assert "Remaining-gap attribution is brief campaign-end accounting with links" in report
 
 
-def test_unified_ledger_exposes_models_only_to_analyzer_and_reporter():
-    bundle = _coverage_bundle()
+@pytest.mark.parametrize("include_sol", [False, True])
+def test_unified_ledger_exposes_models_only_to_analyzer_and_reporter(include_sol):
+    bundle = build_perf_optimize_prompts(
+        include_sol=include_sol,
+        kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
+    )
     assert "version: 2" in bundle.analyzer
     assert "models:" in bundle.analyzer
-    assert "Theoretical model vs silicon" in bundle.reporter
-    assert "model_revisions" in bundle.reporter
+    assert "## Per-layer theoretical performance model" in bundle.analyzer
+    analyzer = _norm(bundle.analyzer)
+    assert "## SOL correlation (measured vs ceiling)" not in analyzer
+    assert ("sol_calc.py analyze" in analyzer) is include_sol
+    if include_sol:
+        for artifact in ("regions.json", "sol.json", "sol_recipes/", "sol_work/peaks.json"):
+            assert artifact in analyzer
+        for field in (
+            "region",
+            "calls",
+            "measured ms",
+            "SOL ms",
+            "% of SOL",
+            "MFU %",
+            "MBU %",
+            "gap ms",
+            "bound",
+        ):
+            assert field in analyzer
+        assert "Correlation unavailable" in analyzer
+    reporter = _norm(bundle.reporter)
+    assert "Theoretical headroom summary" in reporter
+    assert "link directly to **Per-layer theoretical performance model**" in reporter
+    assert "relative link with its section anchor in both Markdown and HTML" in reporter
+    assert "Use the actual current-campaign anchor" in reporter
+    assert "an imported section with the same heading is historical evidence" in reporter
+    assert "do not reproduce or re-derive them here" in reporter
+    assert "Theoretical model vs silicon" not in bundle.reporter
+    assert "if the analyzer section is absent, report it as unavailable" in reporter.lower()
+    assert "| eliminate → | faster → | fusion → | overlap → |" in bundle.reporter
+    assert ("Projection vs Measured" in bundle.reporter) is include_sol
+    base = build_perf_optimize_prompts(include_sol=include_sol)
+    assert "## Per-layer theoretical performance model" not in base.analyzer
+    assert "## SOL correlation (measured vs ceiling)" in _norm(base.analyzer)
+    assert ("sol_calc.py analyze" in base.analyzer) is include_sol
+    if include_sol:
+        assert SOL_ANALYZER_CONTEXT in base.analyzer
     for role in ("optimizer", "evaluator", "qa"):
-        assert getattr(bundle, role) == getattr(DEFAULT_PROMPTS, role)
+        assert getattr(bundle, role) == getattr(base, role)
     for role in _ALL_PROMPTS:
         assert "headroom_ledger.yaml" not in getattr(bundle, role)
         assert "## Headroom Accounting" not in getattr(bundle, role)
@@ -1715,6 +1798,8 @@ def test_analyzer_replan_preserves_measurements_and_history() -> None:
     assert "launch no server, run no profiler" in prompt
     assert "Do not regenerate measured artifacts" in prompt
     assert "full findings structure applies only to full analysis, including re-analysis" in prompt
+    assert "replan/reuse notes must also include" in prompt
+    assert "its full current per-layer theoretical performance model section" in prompt
     assert "freeze `baseline`" in prompt
     assert "preserve all accepted / failed / in_progress items" in prompt
     assert "Never renumber or reuse ids" in prompt
@@ -1847,6 +1932,10 @@ def test_reanalysis_refreshes_ledgers_and_correlation_without_recapture() -> Non
     assert "<campaign_workspace>/sol_work/peaks.json" in prompt
     assert "**Full analyses**: author the block fresh" in prompt
     assert "replan-only rounds use the standing analysis" in prompt
+    for artifact in ("regions.json", "sol.json", "sol_recipes/"):
+        assert artifact in prompt
+    assert "## SOL correlation (measured vs ceiling)" not in prompt
+    assert "## Per-layer theoretical performance model" in prompt
 
 
 def test_prompt_bundle_profiler_extensions_are_independent() -> None:

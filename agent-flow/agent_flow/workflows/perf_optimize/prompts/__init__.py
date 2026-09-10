@@ -170,8 +170,10 @@ def build_perf_optimize_prompts(
     analyzer gets the four per-kernel questions (eliminable? faster? fusible?
     overlappable?), and the
     ``kernel_ledger.yaml`` contract with the task's bars interpolated and a
-    best theoretical performance model updated from evidence every turn;
-    the reporter gets the "Kernel Coverage" accountability section. The
+    best theoretical performance model updated from evidence every turn.
+    Its report section includes the SOL comparison when enabled, replacing
+    the standalone SOL section. The reporter gets the "Kernel Coverage"
+    accountability section and a model summary linking to the analyzer. The
     other roles are unchanged — the ledger is authored by the analyzer
     and consumed by the reporter, with the orchestrator's deterministic
     validation in between.
@@ -196,6 +198,7 @@ def build_perf_optimize_prompts(
     if kernel_coverage is not None:
         bundle = dataclasses.replace(
             bundle,
+            analyzer=build_analyzer_prompt(include_per_layer_model=True),
             profiler=build_profiler_prompt(
                 ncu_targeting=kernel_coverage_ncu_targeting(
                     float(kernel_coverage["min_share_pct"]),

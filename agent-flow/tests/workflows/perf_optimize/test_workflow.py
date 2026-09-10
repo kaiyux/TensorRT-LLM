@@ -2593,7 +2593,8 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(
         assert "Do not invent items to keep the loop alive" in message
         assert "A performance shortfall alone does not bound" in message
         if sol_enabled:
-            assert "unexplained, with the next evidence needed" in message
+            assert "unexplained" in message
+            assert "links to existing explanations and next tests" in message
     finally:
         workflow.close()
 
@@ -3428,15 +3429,18 @@ def test_projector_prompt_drives_the_sol_skill_over_optimize_artifacts(tmp_path)
     assert "internal-glean-specialist" not in prompt
 
 
-def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_path):
-    without = _capture_driving_prompts(tmp_path, _sol_off_extra())
+@pytest.mark.parametrize("kernel_coverage", [False, True])
+def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_path, kernel_coverage):
+    coverage = {"profile": {"kernel_coverage": {}}} if kernel_coverage else {}
+    without = _capture_driving_prompts(tmp_path, {**coverage, **_sol_off_extra()})
     assert "sol_projection.md" not in without["analyzer"]
     assert "sol_projection.md" not in without["optimizer"]
     assert "Projection vs Measured" not in without["reporter"]
     assert "sol_calc.py analyze" not in without["analyzer"]
     assert "SOL correlation" not in without["analyzer"]
+    assert ("## Per-layer theoretical performance model" in without["analyzer"]) is kernel_coverage
 
-    with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))
+    with_sol = _capture_driving_prompts(tmp_path, {**coverage, **_sol_extra(tmp_path)})
     analyzer = with_sol["analyzer"]
     assert "sol_projection.md" in analyzer
     # Context, not evidence: the trace outranks the projection.
@@ -3449,11 +3453,16 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "internal-perf-sol-analysis" in analyzer
     assert "regions.json" in analyzer
     assert "sol_work/peaks.json" in analyzer
-    assert "SOL correlation" in analyzer
+    assert ("SOL correlation (measured vs ceiling)" in analyzer) is not kernel_coverage
+    assert ("## Per-layer theoretical performance model" in analyzer) is kernel_coverage
+    assert "sol.json" in analyzer
+    if kernel_coverage:
+        assert "SOL correlation / " not in analyzer
     assert "Correlation unavailable" in analyzer
     # An exhausted roadmap owes the remaining-gap attribution.
     assert "Remaining-gap attribution" in analyzer
-    assert "unexplained, with the next evidence needed" in analyzer
+    assert "marked unexplained" in analyzer
+    assert "Keep it brief and link to the comparison's explanations and next tests" in analyzer
     optimizer = with_sol["optimizer"]
     assert "sol_projection.md" in optimizer
     # Context, not spec: aim at the binding ceiling, never grow the item.
@@ -3913,6 +3922,9 @@ def test_reporter_prompt_names_the_highest_round_ledger(tmp_path, fake_git):
         # Numeric round ordering: round_10 outranks round_2.
         assert str(ws / "rounds" / "round_10" / "analysis" / "kernel_ledger.yaml") in prompt
         assert "none was written" not in prompt
+        assert "analysis/profile_findings.md`, beside that ledger" in prompt
+        assert "Theoretical headroom summary" in prompt
+        assert "If the section is missing, say it is unavailable and link to the ledger" in prompt
     finally:
         workflow.close()
 
@@ -3947,6 +3959,12 @@ def test_analyzer_receives_latest_numeric_prior_ledger(tmp_path, profile_require
         assert str(previous) in prompt
         assert str(destination) in prompt
         assert "model_revisions" in prompt
+        assert "## Per-layer theoretical performance model" in prompt
+        assert "HTML anchor `per-layer-theoretical-performance-model-round-11`" in prompt
+        assert str(destination.with_name("profile_findings.md")) in prompt
+        assert "report contract, including on replan/reuse turns" in prompt
+        assert "keep standing measurements" in prompt
+        assert "SOL correlation (measured vs ceiling)" not in prompt
     finally:
         workflow.close()
 
@@ -4506,8 +4524,9 @@ def test_reused_analysis_requires_analyzer_owned_kernel_ledger(tmp_path, fake_gi
         assert state.stage == state_module.STAGE_ANALYZER
 
 
-def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path):
-    task = _write_task(tmp_path)
+@pytest.mark.parametrize("kernel_coverage", [False, True])
+def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path, kernel_coverage):
+    task = _write_task(tmp_path, _KC_EXTRA if kernel_coverage else None)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     recorder = _RecordingAgent()
@@ -4539,6 +4558,14 @@ def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path)
     # It still owes the roadmap and the fit check.
     assert str(workflow.roadmap_path) in prompt
     assert "dormant-capability sweep" in prompt
+    assert ("## Per-layer theoretical performance model" in prompt) is kernel_coverage
+    if kernel_coverage:
+        assert str(ws / "rounds" / "round_1" / "analysis" / "profile_findings.md") in prompt
+        assert "report contract, including on replan/reuse turns" in prompt
+        assert "HTML anchor `per-layer-theoretical-performance-model-round-1`" in prompt
+        assert "prefix with `current-campaign-` if imported text already uses it" in prompt
+        assert "kernel_ledger.yaml" in prompt
+        assert "SOL correlation (measured vs ceiling)" not in prompt
 
 
 def test_reused_analyzer_prompt_omits_prior_roadmap_when_absent(tmp_path):
@@ -5102,10 +5129,22 @@ def test_replan_preserves_model_revisions_from_previous_replan(tmp_path, fake_gi
         assert state.stage == state_module.STAGE_ANALYZER
 
 
-def test_unified_model_is_analyzer_owned_and_judges_remain_measured(tmp_path):
-    prompts = _capture_driving_prompts(tmp_path, _KC_EXTRA)
+@pytest.mark.parametrize("sol_enabled", [False, True])
+def test_unified_model_is_analyzer_owned_and_judges_remain_measured(tmp_path, sol_enabled):
+    prompts = _capture_driving_prompts(tmp_path, {**_KC_EXTRA, "sol": {"enabled": sol_enabled}})
     assert "kernel_ledger.yaml" in prompts["analyzer"]
-    assert "Theoretical model vs silicon" in prompts["reporter"]
+    assert "## Per-layer theoretical performance model" in prompts["analyzer"]
+    assert "Ranked bottleneck hypotheses" in prompts["analyzer"]
+    assert "Theoretical model vs silicon" not in prompts["reporter"]
+    assert "Theoretical headroom summary" in prompts["reporter"]
+    assert "Per-layer theoretical performance model" in prompts["reporter"]
+    assert (
+        "Use a relative section link to its actual current-campaign round anchor"
+        in prompts["reporter"]
+    )
+    assert "not an imported section with the same heading" in prompts["reporter"]
+    assert "do not reproduce or re-derive them" in prompts["reporter"]
+    assert ("Projection vs Measured" in prompts["reporter"]) is sol_enabled
     assert "headroom_ledger.yaml" not in prompts["analyzer"]
     assert "headroom_ledger.yaml" not in prompts["reporter"]
     for role in ("evaluator", "qa"):
@@ -5155,6 +5194,8 @@ def test_profiler_driving_prompt_selects_effective_profiling_points(
 def test_default_driving_prompts_omit_the_performance_model_contract(tmp_path):
     prompts = _capture_driving_prompts(tmp_path)
     assert "kernel_ledger.yaml" not in prompts["analyzer"]
+    assert "## Per-layer theoretical performance model" not in prompts["analyzer"]
+    assert "Theoretical headroom summary" not in prompts["reporter"]
     assert "Theoretical model vs silicon" not in prompts["reporter"]
 
 

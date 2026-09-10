@@ -972,6 +972,12 @@ _OFFLINE_SOL_CORRELATION_METHOD = (
         "   Never run a GPU microbenchmark or invent missing constants.",
     )
     .replace("<workspace>/sol_work/peaks.json", "<campaign_workspace>/sol_work/peaks.json")
+    .replace(
+        "5. **Transcribe `sol.json` into the `## SOL correlation (measured vs\n"
+        "   ceiling)` section** of `profile_findings.md`: the joined per-op\n",
+        "5. **Present `sol.json` in the report's comparison section** (selected\n"
+        "   by the findings structure in your instructions): the joined per-op\n",
+    )
 )
 
 SOL_ANALYZER_CONTEXT = (
@@ -994,15 +1000,17 @@ column is the baseline snapshot.
   never justifies weakening a bound. Preserve the baseline projection as
   provenance while current predictions evolve.
 - Fresh measured evidence outranks the projection. In
-  `profile_findings.md`, state where each ranked hypothesis confirms or
-  contradicts it. Projected numbers must remain labeled as projections.
+  the report's comparison section, explain where it confirms or contradicts
+  the model; ranked hypotheses reference that explanation.
+  Projected numbers must remain labeled as projections.
 - When no actionable item remains despite meaningful projected headroom,
   include **## Remaining-gap attribution** in `profile_findings.md`.
   Derive it from the standing correlation and kernel ledger when present:
   name each kernel or logical region, its roadmap item or evidence-backed campaign constraint,
   and any `unexplained` remainder. Cite failed items' `evaluation.md`
   *Gap implication* evidence; preserve the ledger's unexplained discrepancies instead of inventing
-  an explanation for this table.
+  an explanation for this table. Keep this campaign-end accounting brief:
+  link to the existing gap explanations rather than repeating derivations.
 - If the projection is missing or unavailable, skip correlation and its
   use in ranking, and record the reason in *Caveats*.
 
@@ -1104,8 +1112,9 @@ Executive Summary.
 Weighing rules:
 - **SOL numbers come only from `sol_projection.md`** for this initial-
   projection comparison — never re-derive or extrapolate them. Label this
-  baseline projection clearly; the Kernel Coverage section shows the best
-  current model and its revisions from `kernel_ledger.yaml`. The baseline side comes from the projection's
+  baseline projection clearly; when kernel coverage is enabled, its section
+  summarizes and links to the latest analyzer's per-layer theoretical performance model.
+  The baseline side comes from the projection's
   own measured-vs-SOL table; the final side comes from the final
   verification's independent measurement, else the roadmap ledger
   (`current_best`) — say which. When the final verification did not run
@@ -1127,8 +1136,9 @@ Weighing rules:
   and their verdicts come from the failed items' `evaluation.md` (their
   *Gap implication* lines), the rounds' `profile_findings.md`
   (the *Remaining-gap attribution* section when the analyzer wrote
-  one, and the *SOL correlation* per-op table — its largest-gap
-  regions name the parts), and the projection's own caveats. A part
+  one, and the comparison in *Per-layer theoretical performance model*,
+  or *SOL correlation* when kernel coverage is disabled), and the
+  projection's own caveats. A part
   you cannot back with a citation is `unexplained` — writing a
   plausible-sounding justification for it is worse than reporting it
   unexplained.
@@ -1404,6 +1414,67 @@ the profiler/evaluator; never launch a GPU experiment as the Analyzer.
 The initial SOL projection, when available, is evidence for a model, not a
 requirement or a permanently frozen answer. Keep it intact as provenance.
 
+### Required analyzer report section: per-layer theoretical performance model
+
+Write **## Per-layer theoretical performance model** in this round's
+`profile_findings.md`, before **## Ranked bottleneck hypotheses** in full
+analyses. This section is required even when the SOL projector is disabled.
+Give it an explicit HTML anchor `per-layer-theoretical-performance-model-round-N`,
+where N is this campaign's round number, so the Reporter can link to it directly.
+Explain the best current on-paper performance using `models` and
+`model_revisions` as structured backing. The reader must be able to follow
+the arithmetic and evidence without opening the YAML.
+
+1. **Map the layers.** Identify logical layers from config/source and map
+   them to model IDs and kernel/region evidence. Group equivalent repeated
+   layers by index range/count, stating why their shapes, precision and
+   sharding match. Label per-layer, averaged and repeated-total timings;
+   do not present an aggregate kernel family as an individual layer.
+2. **Derive the bounds.** Show shapes/dtypes, FLOPs, necessary memory traffic,
+   collectives, hardware constants and their sources. Substitute numbers and
+   units into formulas; explain cache reuse, legal fusion/elimination and
+   which terms overlap or serialize. Justify implementation restrictions
+   included in a bound. Separate theoretical minimum latency from empirical
+   practical estimates. Label which kind `predicted_ms` represents in
+   `derivation`; record both calculations there when both are available.
+3. **Compare and explain.** Table columns: layer/model IDs, count, theoretical
+   minimum ms, practical estimate ms, measured ms, bound and gap. Match the
+   operating point and timing scope. Explain recoverable time, constraints,
+   unexplained residuals and the next discriminating test. Keep missing
+   predictions, measurements and layer attribution explicitly unknown.
+4. **Compose the iteration.** Include non-layer work (embedding, final
+   norm/head, sampling, scheduling). Derive the critical-path lower bound
+   respecting dependencies, overlap and shared resource limits; never double
+   count regions or alternative savings. Convert to throughput/latency using
+   the actual batch and accepted tokens per step where supported. Label
+   incomplete totals as partial. Explain model revisions separately from
+   implementation gains, following the evidence rules above.
+
+When SOL is enabled, include the `sol.json` comparison here once, with its
+calculator columns and region scopes intact. Reference those rows from the
+layer derivations; add layer totals only with an explicit mapping. Label any
+model correction separately from the calculator result. Keep `regions.json`,
+`sol.json` and `sol_recipes/` as artifacts. If correlation is unavailable,
+record the reason here and continue with the supported layer model.
+
+Keep equations, bounds, comparison tables and gap explanations in this section.
+The nsys/ncu sections own measured diagnostics; cite their evidence here.
+The kernel disposition ledger owns decisions; ranked hypotheses own prioritized
+experiments. Both reference the model's gaps instead of repeating them.
+Remaining-gap attribution is brief campaign-end accounting with links to these
+explanations, not another theory table.
+
+Include the full current section on **replan-only** turns as well: carry
+forward the derivations and standing measurements, name their source round,
+and update conclusions from new facts without collecting GPU evidence.
+For **reused analysis**, preserve the imported report verbatim and append a
+clearly labeled current-campaign section with this heading; identify which
+inherited conditions fit and which predictions or measurements remain unknown.
+Preserve imported anchors and give the appended section a unique anchor (prefix
+it with `current-campaign-` if its round anchor already exists in imported text).
+This section supplements the short replan/reuse note; it is not deferred to
+the final Reporter.
+
 ### The kernel ledger contract (`kernel_ledger.yaml`)
 
 This schema example enumerates two rows totaling 27.6%; it illustrates the
@@ -1594,16 +1665,20 @@ budget ran out — the untried tail a follow-up campaign starts from —
 and mirror those into Remaining Roadmap / Durable facts (`[alive]`).>
 ```
 
-After the four-question table, render a **Theoretical model vs silicon**
-table from the same ledger, one row per distinct model: scope/operating
-point, predicted ms, measured ms, unexplained residual, and next test.
-Explain what facts changed the model across rounds using `model_revisions`.
-Distinguish measured implementation improvements from model corrections;
-neither counts as the other. Mark unknown predictions explicitly and
-surface measurements below a predicted lower bound as a model discrepancy.
-Do not sum shared regions or overlapped durations. Convergence requires
-facts explaining the residual; never hide an open discrepancy because the
-campaign stopped or an attempted optimization failed.
+After the four-question table, give a concise **Theoretical headroom summary**
+and link directly to **Per-layer theoretical performance model** in the latest
+analyzer's `analysis/profile_findings.md` (use a relative link with its section
+anchor in both Markdown and HTML). Use the actual current-campaign anchor;
+an imported section with the same heading is historical evidence. That section owns the full
+derivations and layer comparison table; do not reproduce or re-derive them here.
+Summarize the latest supported iteration bound, measured performance under
+matching conditions, the main remaining headroom, and unresolved discrepancies.
+Distinguish theoretical bounds from empirical practical estimates and model
+corrections from measured implementation improvements. State which capture/build
+the model describes and which later accepted changes or final measurements it
+does not cover. A closed roadmap does not establish convergence. If the analyzer
+section is absent, report it as unavailable and link to the available ledger;
+do not manufacture the missing analysis in the final report.
 
 Rigor rules for this section:
 

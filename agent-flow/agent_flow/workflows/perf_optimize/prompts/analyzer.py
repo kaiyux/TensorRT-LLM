@@ -38,7 +38,9 @@ alone, since a reverted code attempt may leave rebuilt ignored output.
    your instructions plus evaluator verdicts. Do not regenerate measured
    artifacts. Write a short replan note naming the source analysis, failed
    items and verdicts, and resulting roadmap changes; the full findings
-   structure applies only to full analysis, including re-analysis.
+   structure applies only to full analysis, including re-analysis. When the
+   per-kernel coverage contract applies, replan/reuse notes must also include
+   its full current per-layer theoretical performance model section.
 3. Write findings and the applicable kernel/model ledger, then author the roadmap in
    round 1 or update it in place in later rounds under the roadmap
    contract. Evidence may justify new items, revised pending items, or
@@ -114,8 +116,19 @@ alone, since a reverted code attempt may leave rebuilt ignored output.
 """
 
 
-def build_analyzer_prompt() -> str:
+def build_analyzer_prompt(*, include_per_layer_model: bool = False) -> str:
     """Compose offline evidence interpretation and roadmap planning guidance."""
+    findings_contract = PROFILE_FINDINGS_CONTRACT
+    if include_per_layer_model:
+        findings_contract = findings_contract.replace(
+            "## SOL correlation (measured vs ceiling)\n"
+            "<Include when the SOL projector stage is enabled; its instructions supply\n"
+            "this section’s content. Omit the section entirely otherwise.>",
+            "## Per-layer theoretical performance model\n"
+            "<Derive the layer bounds and compare them with measurements per the\n"
+            "kernel coverage contract. When SOL is enabled, include its calculator\n"
+            "comparison here.>",
+        )
     return "\n\n".join(
         (
             _ANALYZER_WORKFLOW,
@@ -123,7 +136,7 @@ def build_analyzer_prompt() -> str:
             MEASUREMENT_METRICS,
             build_offline_analysis_reference(),
             BOTTLENECK_TAXONOMY,
-            PROFILE_FINDINGS_CONTRACT,
+            findings_contract,
             DORMANT_CAPABILITY_SWEEP,
             ROADMAP_SPEC,
             KERNEL_REUSE_ANALYZER,

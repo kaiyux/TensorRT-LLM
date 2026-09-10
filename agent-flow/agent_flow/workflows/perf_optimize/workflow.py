@@ -2069,6 +2069,11 @@ class PerfOptimizeWorkflow:
             f"in the findings. Maintain the **best current theoretical performance "
             f"model** in this same ledger, using shared region models where kernel "
             f"boundaries change through fusion or elimination. {history}"
+            f"Write `## Per-layer theoretical performance model` in "
+            f"`{self._analysis_dir(state) / 'profile_findings.md'}` following the "
+            f"report contract, including on replan/reuse turns. Give it the explicit "
+            f"HTML anchor `per-layer-theoretical-performance-model-round-{round_no}` "
+            f"(prefix with `current-campaign-` if imported text already uses it). "
             f"Compare predictions with measured silicon performance under matching "
             f"conditions; retain source capture/build identities and measurement "
             f"evidence. On replan-only turns, keep standing measurements and "
@@ -2666,7 +2671,8 @@ class PerfOptimizeWorkflow:
             f"append two sections: `## Reused analysis` (what you reused, "
             f"from where per the manifest, how well it fits this task, and "
             f"what it does not cover) and `## Dormant capabilities` (the "
-            f"sweep's outcome).\n\n"
+            f"sweep's outcome), plus the current-campaign model section when "
+            f"required by the per-kernel coverage contract above.\n\n"
             f"Before completing your turn, call `append_analyzer_progress` "
             f"with a `summary` naming the reuse source, which imported "
             f"artifacts you planned from, the fit check's outcome, and the "
@@ -2796,6 +2802,11 @@ class PerfOptimizeWorkflow:
                 f"history, `baseline`, `current_best`, or existing ids."
             )
         coverage_context = self._kernel_ledger_instruction(state)
+        comparison_section = (
+            "Per-layer theoretical performance model"
+            if coverage_context
+            else "SOL correlation (measured vs ceiling)"
+        )
         projection_context = ""
         if self._sol_enabled():
             projection_context = (
@@ -2818,15 +2829,16 @@ class PerfOptimizeWorkflow:
                 f"against the Projector's "
                 f"`{self.workspace}/sol_work/peaks.json`, write "
                 f"`{analysis_dir}/sol.json`, and transcribe the joined "
-                f"per-op table into the findings' **SOL correlation "
-                f"(measured vs ceiling)** section (or `Correlation "
+                f"per-op table into the findings' **{comparison_section}** "
+                f"section (or `Correlation "
                 f"unavailable: <reason>` when a precondition fails). If you "
                 f"leave the roadmap with no "
                 f"actionable pending item while projected headroom remains, "
                 f"close `profile_findings.md` with the **Remaining-gap "
                 f"attribution** section per your system prompt — every part "
                 f"of the gap gets a supported item, an evidence-backed constraint, "
-                f"or is marked unexplained, with the next evidence needed.\n\n"
+                f"or is marked unexplained. Keep it brief and link to the "
+                f"comparison's explanations and next tests.\n\n"
             )
         import_context = ""
         if state.reanalyze_pending:
@@ -2885,7 +2897,7 @@ class PerfOptimizeWorkflow:
             + coverage_context
             + f"Write `{analysis_dir / 'profile_findings.md'}` (Profiling "
             f"setup / nsys timeline / ncu kernel analysis / "
-            + ("SOL correlation / " if self._sol_enabled() else "")
+            + (f"{comparison_section} / " if coverage_context or self._sol_enabled() else "")
             + f"Ranked bottleneck hypotheses / Caveats), then write "
             f"`{self.roadmap_path}` with items ordered by expected benefit "
             f"and quantified `expected_gain_rationale` grounded across the "
@@ -2933,7 +2945,7 @@ class PerfOptimizeWorkflow:
                 f"with the **Remaining-gap attribution** section per your "
                 f"system prompt — every part of the gap gets a supported item, "
                 f"an evidence-backed constraint, or is marked unexplained, "
-                f"with the next evidence needed.\n\n"
+                f"with links to existing explanations and next tests.\n\n"
             )
         self.analyzer(
             self._disagg_directive() + f"Workspace: {self.workspace}\n"
@@ -2992,7 +3004,9 @@ class PerfOptimizeWorkflow:
             f"report: which analysis you planned from (`{profiled_dir}`), "
             f"each failed item with the verdict and reason category that "
             f"killed it, what you changed in the roadmap and why, and what "
-            f"remains actionable (or why nothing does).\n\n"
+            f"remains actionable (or why nothing does). Include the full current "
+            f"model section when required by the per-kernel coverage contract "
+            f"above, retaining standing measurement provenance.\n\n"
             f"Before completing your turn, call `append_analyzer_progress` "
             f"with a `summary` naming the round that accepted nothing, the "
             f"verdicts you planned from, and the items you marked obsolete / "
@@ -3509,10 +3523,17 @@ class PerfOptimizeWorkflow:
                 f"itemized as the untried tail),"
             )
             coverage_read += (
-                " Use the same ledger for the **Theoretical model vs silicon** table: "
-                "show each model's conditions, derivation, prediction, measured "
-                "time, unexplained residual, next test, and evidence-backed "
-                "revisions. Distinguish the last modeled capture from subsequent "
+                " Give a concise **Theoretical headroom summary** and link to "
+                "**Per-layer theoretical performance model** in the latest "
+                "analyzer's `analysis/profile_findings.md`, beside that ledger. "
+                "Use a relative section link to its actual current-campaign "
+                "round anchor in Markdown and HTML, not an imported section "
+                "with the same heading. The analyzer "
+                "owns the full derivations and layer table; do not reproduce or "
+                "re-derive them. Summarize the supported iteration bound, measured "
+                "performance, remaining headroom and unresolved gaps. If the "
+                "section is missing, say it is unavailable and link to the ledger. "
+                "Distinguish the last modeled capture from subsequent "
                 "accepted changes and final measurements; an unprofiled final "
                 "build has no validated model comparison. A closed roadmap "
                 "does not establish model/implementation convergence."
