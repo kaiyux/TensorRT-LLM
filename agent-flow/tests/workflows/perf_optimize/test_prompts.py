@@ -1658,6 +1658,27 @@ def test_kernel_model_converges_from_facts_and_preserves_unknowns():
 
 
 @pytest.mark.parametrize("include_sol", [False, True])
+def test_per_layer_report_keeps_absolute_and_relative_practical_gaps(include_sol: bool) -> None:
+    bundle = build_perf_optimize_prompts(
+        include_sol=include_sol,
+        kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
+    )
+    report = (
+        _norm(bundle.analyzer)
+        .split("### Required analyzer report section:", 1)[1]
+        .split("### The kernel ledger contract", 1)[0]
+    )
+    assert "**Gap vs practical (ms)** and **Gap vs practical (%)**" in report
+    assert "gap_ms = measured_ms - practical_ms" in report
+    assert "gap_pct = gap_ms / practical_ms * 100" in report
+    assert "Calculate before rounding" in report
+    assert "show signed percentages to one decimal place" in report
+    assert "Show `—` for percentages with missing or mismatched timings" in report
+    assert "practical_ms <= 0" in report
+    assert "Label gaps against theoretical estimates separately" in report
+
+
+@pytest.mark.parametrize("include_sol", [False, True])
 def test_unified_ledger_exposes_models_only_to_analyzer_and_reporter(include_sol):
     bundle = build_perf_optimize_prompts(
         include_sol=include_sol,

@@ -1438,8 +1438,14 @@ the arithmetic and evidence without opening the YAML.
    practical estimates. Label which kind `predicted_ms` represents in
    `derivation`; record both calculations there when both are available.
 3. **Compare and explain.** Table columns: layer/model IDs, count, theoretical
-   minimum ms, practical estimate ms, measured ms, bound and gap. Match the
-   operating point and timing scope. Explain recoverable time, constraints,
+   minimum ms, practical estimate ms, measured ms, bound, **Gap vs practical
+   (ms)** and **Gap vs practical (%)**. Match the operating point and timing scope.
+   Use `gap_ms = measured_ms - practical_ms` and
+   `gap_pct = gap_ms / practical_ms * 100`. Calculate before rounding;
+   show signed percentages to one decimal place. Show `—` for percentages
+   with missing or mismatched timings, or `practical_ms <= 0`.
+   Label gaps against theoretical estimates separately.
+   Explain recoverable time, constraints,
    unexplained residuals and the next discriminating test. Keep missing
    predictions, measurements and layer attribution explicitly unknown.
 4. **Compose the iteration.** Include non-layer work (embedding, final
