@@ -1,31 +1,33 @@
 """Performance-optimize workflow built on ``agent_flow.AgentLayer``.
 
-The applying counterpart to perf-analyze: benchmarks a
-``trtllm-serve`` baseline (an optional ``sol`` block in task.yaml then
-enables a one-shot projector stage deriving the analytical
-speed-of-light ceiling — ``sol_projection.md``, per the
-``internal-perf-sol-analysis`` skill — that the analyzer weighs and the
-reporter turns into a headroom-captured story), then iterates
-optimization rounds — a conditional profiler captures the current build,
-then an offline analyzer interprets saved evidence and ranks candidate optimizations
-into ``roadmap.yaml`` by expected perf benefit; isolated optimizer/evaluator
-pairs run the top pending items serially or concurrently; each evaluator gates attempts on code quality,
-functionality, and measured gain vs expectation with a three-way
-verdict (APPROVE / REJECT / PUSH_BACK), capturing an accept-evidence
-nsys profile on each candidate-ready result. Parallel mode uses an Integrator;
-serial mode accepts each approved candidate directly. The loop runs the configured round budget
-(no agent decides when to stop; the orchestrator breaks early only when
-the roadmap is exhausted or the optional improvement target is met),
-stateless QA independently re-measures the final accepted state once —
-and finally a reporter synthesizes the expected-vs-measured story into
-``optimization_report.md`` / ``.html``. All nine roles run on the
-Claude Code backend.
+The applying counterpart to perf-analyze. A baseline benchmark and optional
+one-shot SOL projection initialize the campaign. A conditional profiler writes
+``profiler_report.md`` and ``profile_manifest.json``; an offline analyzer writes
+``analysis.md``, updates the current ``performance_model.yaml``, and ranks
+``roadmap.yaml`` items. The model is updated every turn, including reuse and
+replan-only analysis, and connects measured performance to the current
+theoretical best on the same workload and timing basis.
+
+Isolated optimizer/evaluator pairs implement and measure selected items.
+Serial mode promotes approved candidates directly; parallel mode combines them
+through an integrator. Acceptance gates remain measured-versus-measured.
+The orchestrator stops at the configured budget, an exhausted roadmap with no
+outstanding measurement request, or an optional measured improvement target. A stop condition does not establish
+model convergence. Stateless QA verifies the final accepted state, then the same
+analyzer reconciles the current bounds and QA measurements in a checkpointed
+``final_analyzer`` stage. It writes nonempty ``analysis.md`` and a validated
+``performance_model.yaml`` under ``final_verification/analysis/``, using saved
+evidence without GPU work or roadmap changes. A reporter reads that final model
+and writes concise ``optimization_report.md`` / ``.html`` deliverables
+covering result, current model, remaining gap, and next actions. All nine roles
+run on the Claude Code backend.
 
 Public surface:
 
 - :class:`PerfOptimizeWorkflow` — the orchestrator for the
   benchmarker -> (projector) -> [(profiler) -> analyzer -> serial/parallel
-  (optimizer <-> evaluator) items -> optional integrator] x rounds -> qa -> reporter loop.
+  (optimizer <-> evaluator) items -> optional integrator] x rounds -> qa ->
+  final_analyzer -> reporter loop.
 - :class:`PromptBundle`, :data:`DEFAULT_PROMPTS`, and
   :func:`build_perf_optimize_prompts` — prompt bundle and helpers for
   the workflow's nine agents.
@@ -40,6 +42,7 @@ from .state import (
     STAGE_ANALYZER,
     STAGE_BENCHMARKER,
     STAGE_EVALUATOR,
+    STAGE_FINAL_ANALYZER,
     STAGE_INTEGRATOR,
     STAGE_OPTIMIZER,
     STAGE_OPTIMIZER_EVALUATOR,
@@ -56,6 +59,7 @@ __all__ = [
     "STAGE_ANALYZER",
     "STAGE_BENCHMARKER",
     "STAGE_EVALUATOR",
+    "STAGE_FINAL_ANALYZER",
     "STAGE_INTEGRATOR",
     "STAGE_OPTIMIZER",
     "STAGE_OPTIMIZER_EVALUATOR",

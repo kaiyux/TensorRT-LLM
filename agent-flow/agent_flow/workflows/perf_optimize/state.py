@@ -54,19 +54,23 @@ ITEM_EXECUTIONS = ("serial", "parallel")
 #                       baseline operating point, writes
 #                       ``baseline/benchmark_results.md``.
 #   - ``projector``   — one-shot, conditional: runs only when task.yaml
-#                       carries a ``sol`` block, between the baseline
+#                       enables SOL (the default), between the baseline
 #                       benchmark and round 1. Derives the analytical
 #                       speed-of-light (SOL) ceiling per the
 #                       internal-perf-sol-analysis skill and writes
 #                       ``sol_projection.md``; skipped (never marked
 #                       done) otherwise.
 #   - ``profiler``    — conditional capture of the current runtime, with a
-#                       validated manifest checkpointed before analysis.
-#   - ``analyzer``    — interprets saved captures offline and writes/updates
-#                       ``roadmap.yaml`` (items ordered by
+#                       ``profiler_report.md`` and a validated
+#                       ``profile_manifest.json`` checkpointed before analysis.
+#   - ``analyzer``    — interprets saved captures offline, writes
+#                       ``analysis.md``, and updates the current
+#                       ``performance_model.yaml`` and ``roadmap.yaml``
+#                       (items ordered by
 #                       expected perf benefit). Opens **replan-only** (no
 #                       server, no profiler) when the standing runtime
-#                       profile is known to remain current.
+#                       profile is known to remain current. Updates the
+#                       model in all modes, including reuse and replan.
 #   - ``optimizer_evaluator`` — batch of isolated per-item attempt loops,
 #                       sequential or parallel per ``item_execution``.
 #   - ``integrator``  — combines candidate-ready code/config and measures the
@@ -82,6 +86,8 @@ ITEM_EXECUTIONS = ("serial", "parallel")
 #                       final verification — independent benchmark,
 #                       sanity completions, and the optional accuracy
 #                       eval. Skipped when no item was accepted.
+#   - ``final_analyzer`` — reconciles the model offline against accepted
+#                       changes and QA measurements before final reporting.
 #   - ``reporter``    — one-shot: synthesizes ``optimization_report.md`` /
 #                       ``.html`` from every role's artifacts.
 STAGE_BENCHMARKER = "benchmarker"
@@ -96,6 +102,7 @@ STAGE_INTEGRATOR = "integrator"
 STAGE_OPTIMIZER = "optimizer"
 STAGE_EVALUATOR = "evaluator"
 STAGE_QA = "qa"
+STAGE_FINAL_ANALYZER = "final_analyzer"
 STAGE_REPORTER = "reporter"
 _VALID_STAGES = (
     STAGE_BENCHMARKER,
@@ -105,6 +112,7 @@ _VALID_STAGES = (
     STAGE_OPTIMIZER_EVALUATOR,
     STAGE_INTEGRATOR,
     STAGE_QA,
+    STAGE_FINAL_ANALYZER,
     STAGE_REPORTER,
 )
 

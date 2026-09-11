@@ -61,28 +61,13 @@ TRTLLM_TAXONOMY_PATH = Path(__file__).resolve().parent.parent / "assets" / "taxo
 _SERVER_LIFECYCLE_TEMPLATE = """\
 ## Running `trtllm-serve` (local default)
 
-You drive the whole server lifecycle yourself with `Bash`. One server at
-a time on the GPU(s) — the previous stage is *expected* to have torn its
-server down before you start, but never assume it did: step 1 verifies
-it, because an interrupted run leaves a detached server behind and the
-port is fixed.
+Use `Bash` to complete launch, readiness, workload, teardown and reporting
+in one turn. Wait with foreground polling; repeat the poll if loading needs
+more time. Ending the turn does not schedule another invocation.
+Run one server at a time and verify its identity before measuring.
 
-**You get a single turn — finish the work in it.** Launch, readiness
-poll, benchmark/profile, teardown, and writing your output `.md` file
-all happen in this one turn. Wait for slow steps (a checkpoint can take
-many minutes to load) with **foreground** blocking shell loops; if one
-poll window is not long enough, issue another blocking poll and stay in
-your turn. **Do not end your turn to wait for a background poll to wake
-you** — nothing re-invokes you, so the stage would advance with your
-output file still empty and the whole run is wasted.
-
-1. **Assert port 8000 is free — before launching anything.** The port is
-   fixed, and a `trtllm-serve` from an earlier stage or an interrupted run
-   is `setsid`-detached, so it *survives* a Ctrl-C and keeps answering on
-   :8000. If you skip this check, your own server dies with "address
-   already in use" while the **stale** one — serving an older config, or a
-   different checkpoint entirely — answers every health poll, and the whole
-   stage silently measures the wrong server:
+1. **Check port 8000 before launch.** An interrupted stage may leave a
+   detached server serving an old checkpoint/config:
    ```bash
    ss -ltn 'sport = :8000' | grep -q LISTEN && {
      echo "FATAL: port 8000 already in use — a stale server is still up"
@@ -90,20 +75,13 @@ output file still empty and the whole run is wasted.
      exit 1
    }
    ```
-   Do **not** work around a busy port by picking another one — the
-   benchmark and profiling commands all target :8000. Reap the stale
-   server by its PID with the teardown recipe in step 4 (identify it from
-   the `ss -ltnp` output above), confirm the port is free, then launch.
-   If `ss` is unavailable, `lsof -i :8000` or
-   `curl -fsS http://127.0.0.1:8000/health` works the same way — a health
-   response *before* you have launched anything is a stale server, not a
-   ready one.
+   Identify and tear down the stale server by PID, then confirm the port
+   is free. Do not switch ports. If `ss` is unavailable, use
+   `lsof -i :8000` or `curl -fsS http://127.0.0.1:8000/health`;
+   a pre-launch health response means a stale server.
 
-2. **Launch in the background, fully detached**, redirecting logs to a
-   file in the workspace, and capture the PID. `setsid` + `< /dev/null`
-   puts the server in its own session/process group so it survives across
-   your separate `Bash` calls (a plain `&` job can be reaped when the
-   launching shell exits):
+2. **Launch detached**, saving logs and PID. `setsid` and `< /dev/null`
+   preserve the process group across separate `Bash` calls:
    ```bash
    cd <trtllm_repo_path>
    setsid trtllm-serve <checkpoint_path> \\
@@ -115,12 +93,8 @@ output file still empty and the whole run is wasted.
    ```
    <serve_config_policy>
 
-3. **Poll readiness in the foreground** before sending any load. Large
-   checkpoints can take many minutes to load; poll on an interval with a
-   generous timeout, bail out early if the process dies, and `tail`
-   `serve.log` if it stalls. Check **liveness first and ownership before
-   declaring READY** — a `/health` response only proves *some* server is on
-   :8000, never that it is yours:
+3. **Poll readiness in the foreground.** Check liveness first and verify
+   the listener belongs to the recorded process group before declaring READY:
    ```bash
    PID=$(cat <workspace>/serve.pid)
    # setsid made the server a process-group leader, so its PGID == its PID
@@ -146,18 +120,11 @@ output file still empty and the whole run is wasted.
    ```
    <startup_failure_policy>
 
-   ⚠️ **A `FATAL: … not owned by PID` result is never something to work
-   around.** It means a foreign server holds :8000, so every number you
-   would produce belongs to a different config or checkpoint. Reap it
-   (step 4), confirm :8000 is free, relaunch, and only then benchmark.
-   The same applies when `owns_port` cannot resolve an owner at all: treat
-   "unverified" as "not ours" and resolve it by hand (`ss -ltnp` /
-   `lsof -i :8000` may need more privilege than the current shell has)
-   rather than benchmarking on the assumption it is yours.
+   An unverified or foreign port owner blocks measurement. Resolve it
+   with `ss -ltnp` / `lsof`, tear down the stale server, and relaunch.
 
-4. **Tear the server down — always**, even when a step failed, so the
-   GPU is free for the next stage. Kill by the **recorded PID and its
-   process group** (never by a name pattern), escalating to SIGKILL:
+4. **Always tear down**, including after failure. Signal the recorded PID
+   and process group, escalating to SIGKILL:
    ```bash
    PID=$(cat <workspace>/serve.pid)
    # Negative PID signals the whole process group (setsid made the server
@@ -169,22 +136,12 @@ output file still empty and the whole run is wasted.
    done
    kill -0 "$PID" 2>/dev/null && { kill -KILL -"$PID" 2>/dev/null; kill -KILL "$PID" 2>/dev/null; } || true
    ```
-   Then confirm the GPU memory actually freed with `nvidia-smi`, **and
-   that :8000 is free again** (`ss -ltn 'sport = :8000'` prints no
-   `LISTEN` row), before launching another server. If an MPI daemon
-   (`orted`) or other straggler survives, find it with a read-only
-   `ps`/`pgrep` and reap it by its **exact PID**.
-
-   ⚠️ **Never `pkill -f 'trtllm-serve'` (or any bare `trtllm-serve`
-   pattern).** The string `trtllm-serve` appears in *your own* agent
-   process and in the very shell running the teardown, so a name-based
-   kill can terminate this agent. Always target the recorded PID /
-   process group; if you must pattern-match a straggler you cannot reach
-   by PID, use a precise pattern that includes the checkpoint path and
-   confirm it with read-only `pgrep` before killing.
-
-`nvidia-smi` (read-only) is a useful sanity check for how many GPUs are
-visible and whether memory is free between runs.
+   Confirm memory is freed with `nvidia-smi` and port 8000 has no LISTEN
+   row before relaunch. Find surviving MPI daemons (`orted`) or workers
+   with read-only `ps`/`pgrep` and reap their exact PIDs.
+   Never `pkill -f 'trtllm-serve'`: it can match the agent or teardown shell.
+   If a straggler requires pattern matching, include the checkpoint path
+   and verify the match with read-only `pgrep` before killing.
 """
 
 
@@ -261,14 +218,8 @@ the LLM API reference in `<trtllm_repo_path>` if unsure of a field name.
 _BENCHMARK_FLAGS_TEMPLATE = """\
 ## Running the benchmark — `benchmark_serving.py`
 
-The load generator lives in the TensorRT-LLM checkout at
-`tensorrt_llm/serve/scripts/benchmark_serving.py`. Run it as a module
-(deps are importable wherever `trtllm-serve` works).
-
-**Start from this canonical command — do not improvise the flags.** Fill
-the `<...>` placeholders from `task.yaml` (`checkpoint_path` and the
-`benchmark` block) and the workspace path; keep every other flag exactly
-as shown:
+Run `tensorrt_llm/serve/scripts/benchmark_serving.py` as a module. Fill
+placeholders from `task.yaml` and the workspace; keep other flags as shown.
 
 ```bash
 cd <trtllm_repo_path>
@@ -317,15 +268,10 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \\
 
 
 _BENCHMARK_SWEEP_POLICY = """\
-- **One run per concurrency point.** `benchmark.concurrency` is a single
-  integer (one operating point) or a list of integers (Pareto-curve
-  mode; the resolved spec is sorted ascending). With a single integer,
-  run the command once with that value. With a list, launch the server
-  **once**, run the command once per point **sequentially in ascending
-  order** against the same server, and tear down after the last point —
-  never relaunch the server between points, never run points in
-  parallel, and never add, drop, or resize points beyond the configured
-  list. ISL / OSL stay fixed across points.
+- **One run per concurrency point.** A scalar `benchmark.concurrency`
+  runs once. For a list, launch one server and measure every configured
+  point sequentially in ascending order, then tear down. Do not relaunch
+  between points, run points in parallel, or change the point list/ISL/OSL.
 """
 
 
@@ -389,7 +335,7 @@ Use `rg` via `Bash` in `trtllm_repo_path` before profiling:
   `/start_profile` endpoint exists. Without it, capture is driven by
   the server env var; the benchmark client's `--profile` is a no-op.
 - If a required knob is absent, skip that profiler and record the
-  reason in `profile_findings.md`.
+  reason in `analysis.md`.
 """
 
 _PROFILING_RUNS_BEFORE_TARGETING = f"""\
@@ -403,7 +349,8 @@ teardown on every pass, including failures.
 
 1. Relaunch `trtllm-serve` with the Benchmarker’s flags and serving config.
    Start from this canonical invocation; change only
-   placeholders and the explicit compatibility/fallback options below:
+   placeholders, the explicit requested-point/phase overrides, and the
+   compatibility/fallback options below:
    ```bash
    cd <trtllm_repo_path>
    setsid env TLLM_PROFILE_START_STOP="<profile.nsys_iter_range>" \\
@@ -422,6 +369,18 @@ teardown on every pass, including failures.
      endpoints call `cudaProfilerStart/Stop`. Keep
      `--capture-range-end=stop` so collection stops without terminating
      the serving engine (`stop-shutdown` can crash it before report export).
+   - Default to the configured `profile.nsys_iter_range` and a usable
+     steady-state decode window. When the turn explicitly requests a
+     different operating point or phase to resolve missing model evidence,
+     the Profiler (or combined capture stage) may select a different
+     `TLLM_PROFILE_START_STOP` window to capture that request, including
+     early prefill or mixed prefill/decode iterations. Keep task and serving
+     config read-only. Record the request, configured and effective windows,
+     reason, exact command and observed phase in `profiler_report.md` and
+     the capture manifest when present. A requested window is not proof
+     that the intended phase was captured; verify its trace/phase markers.
+     These overrides authorize capture only; the offline Analyzer requests
+     evidence and never launches or adjusts a capture itself.
    - NVTX, Python-GIL tracing and graph-node expansion provide attribution;
      `--trace-fork-before-exec=true` follows fork-before-exec children.
      See the multi-GPU topology limits below before launching.
@@ -435,11 +394,16 @@ teardown on every pass, including failures.
 2. Poll readiness, then replay the canonical benchmark at the effective
    profiling operating point, with the same load and `--no-test-input`.
    The skipped test prompt would advance the iteration counter before
-   concurrent load arrives. Keep the benchmark's configured `num_prompts`.
+   concurrent load arrives. Keep the requested point's configured paired
+   `num_prompts` (the scalar value when not a list).
    If that load cannot reach `<stop>`, lower and document the iteration
-   window; if it cannot provide a steady-state window, report profiling
-   unavailable. Verify `serve.log` contains `Profiling started at iteration
-   <start>` and `... stopped at iteration <stop>`.
+   window. With no explicit phase request, require a usable steady-state
+   decode window or report profiling unavailable. With an explicit phase
+   request, judge coverage against that requested phase and operating point;
+   early-prefill evidence is not invalid solely because it lacks steady-state
+   decode. Record any uncaptured request as missing evidence. Verify
+   `serve.log` contains `Profiling started at iteration <start>` and
+   `... stopped at iteration <stop>`.
 
    For per-request prefill/decode data, pass `--save-request-time-breakdown`
    and retain `*perf_metrics*.json` only when `/perf_metrics` is enabled
@@ -739,32 +703,151 @@ PROFILING_RUNS_REFERENCE = build_profiling_runs_reference()
 
 # --------------------------------------------------------------------------- #
 # The findings contract (both workflows' analyzers): the required structure
-# of profile_findings.md. Path-neutral — perf-analyze writes it at the
+# of analysis.md. Path-neutral — perf-analyze writes it at the
 # workspace root, perf-optimize in the round's analysis/ directory; each
 # workflow's instructions name the exact path.
 # --------------------------------------------------------------------------- #
 
 PROFILE_FINDINGS_CONTRACT = """\
-## Required findings structure (`profile_findings.md`)
+## Current theoretical performance model and analysis report
 
-Write to the path named in your instructions. Keep these section headers
-and cite artifact paths plus numbers for every signal. For each effective
-profiling operating point, identify its trace/config and keep its metrics
-separate; use the task’s resolved profiling points, not an assumed maximum.
+Write `performance_model.yaml` and `analysis.md` in the assigned directory
+on every turn, including replan, reuse and SOL-disabled turns. This current
+model drives analysis, experiment priority and convergence. The initial
+`sol_projection.md`, `sol.json`, kernel ledger and exports support it.
+
+### Comparable basis and derivation
+
+Cover every configured concurrency (null in scalar mode). Identify build,
+hardware, precision/shapes, TP/EP, workload/context distribution, accepted
+tokens and timing basis. Match work, scope and statistic; a whole-run mean
+minus a short-window decode median is not measured prefill/host time.
+Unmatched differences stay `unexplained`. Mark unprofiled points unknown
+unless a supported scaling law and uncertainty justify an estimate; keep
+estimates distinct from measurements.
+
+Derive necessary FLOPs, bytes, resource rates, communication and dependencies,
+including prefill and non-layer serving work. Account for legal elimination,
+fusion and overlap once in disjoint critical-path components. Show conversion
+to the target metric using batch, accepted tokens, phase frequency and queueing.
+Partial kernel/decode models cannot establish complete serving ceilings;
+unprofiled time and sub-threshold tails are not zero-cost removable work.
+
+Distinguish physical constraints from implementation/scope limits. A token
+cap or rebuild issue is not a physical floor; achieved bandwidth is an
+empirical reference. Use collective-specific latency calibration. A failed
+lever closes that experiment, not its remaining gap. Revise assumptions
+from evidence, never to fit a failed attempt or an unexpected measurement.
+
+### Machine-readable contract (`performance_model.yaml`, version 1)
+
+```yaml
+version: 1
+model_id: round-1-current              # new identity when assumptions/bounds change
+target_metric: output_throughput      # optimize.target_metric, else output_throughput
+direction: higher                     # lower for target metrics ending in _ms, else higher
+points:
+  - concurrency: 64                   # null for a scalar benchmark
+    operating_point:
+      build: "recorded source/build identity"
+      hardware: "recorded GPU and parallel mapping"
+      workload: "ISL/OSL, precision, shapes, batch, context distribution"
+      timing_basis: "whole-run serving throughput; matched modeled workload"
+    measured_value: 10000.0            # use the actual benchmark; null if not available
+    theoretical_best_value: null      # never invent a complete ceiling from a partial model
+    derivation: "Decode-only evidence cannot yet price the complete serving workload."
+    assumptions: []
+    evidence: []                      # nonempty artifact citations for a known bound
+    measurement_evidence: ["baseline/concurrency_64/result.json: output_throughput"]
+    components: []                    # unknown decomposition, NOT zero work
+    status: measurement_limited
+    unexplained: "Representative prefill timing and frequency are missing."
+    next_test: "Capture mixed prefill/decode iterations at c=64 with phase markers."
+```
+
+Use actual benchmark values. Each point requires all fields shown above;
+metric values are positive numbers or null. Known predictions/measurements
+need nonempty evidence/measurement_evidence. Unknowns require `unexplained`
+and `next_test`; empty components mean unknown decomposition, not zero work.
+
+Comparable timing adds paired nullable `measured_ms`/`theoretical_best_ms`
+and `timing_derivation` (composition, overlap removal and metric conversion).
+Components require unique `id`, nullable nonnegative `measured_ms` and
+`theoretical_best_ms`, `gap_kind`, evidence and next_test for unresolved gaps.
+Known component sums must match point totals. Unknown bounds cannot become
+zero or a complete theoretical_best_ms. Reference supporting model/kernel IDs.
+
+`gap_kind`: `actionable`, `physical_limit`, `scope_limited`,
+`measurement_limited`, `unexplained`, `model_error`. Unknown, scope-limited,
+measurement-limited and model-error components need a concrete next_test.
+Physical necessary work belongs in the floor. `model_error` requires
+point status `model_invalid`.
+
+Point `status`: `open`, `converged`, `measurement_limited`, `scope_limited`,
+`model_invalid`. Mark a point/component `measurement_limited` when its next
+runtime measurement should trigger targeted profiling within remaining rounds.
+Use `open` for supported optimizations or model work using available facts.
+Measurements beating a predicted bound require `model_invalid`; retain the
+measurement and investigate. Numerical bound comparisons allow 0.1% rounding.
+
+Convergence requires known comparable metrics, reconciled numeric timing
+totals and timing_derivation, complete explained components, no unexplained
+residual, `convergence_tolerance_pct` (0–5), and `convergence_evidence` for
+that tolerance. Residual percentage is
+`abs(measured_value - theoretical_best_value) / theoretical_best_value * 100`,
+not throughput uplift. All scored points must converge (focus subset when
+configured). Benchmark noise, an empty roadmap, target gain attained or
+exhausted budgets do not prove convergence; report stop reasons separately.
+
+Replan/reuse preserves measurement provenance. Cite previous model_id,
+changed assumption, old/new prediction, reason and evidence; keep detailed
+history in linked artifacts. Old measurements do not describe a new build.
+Only the Profiler or combined capture stage collects new runtime evidence.
+
+### Required `analysis.md` structure
+
+Use these four sections, about 1,000 words plus two tables. Link commands,
+config, inventories, detailed counters/dispositions and derivations.
 
 ```
-# Profiling Findings: <model name>
+# Analysis: <model>
 
-## Profiling setup
-- Profiled concurrency points: effective ISL/OSL/concurrency and matching
-  benchmark row; serving config and profiling flags
-- nsys: command, TLLM_PROFILE_START_STOP window, trace, graph granularity,
-  captured/missing ranks, representatives, who chose them and survey basis
-- Run A2a: GPU metric devices/frequency and capture, or reason unavailable
-- Run A2b: backtrace flags, capture and graph-kernel share, or reason unavailable
-- ncu: command, stem → full kernel names, launch counts and report per pass
+## Result
+<One paragraph: measured state, current model_id, convergence status and
+most consequential uncertainty. Link profiler_report.md for capture scope.>
 
-## nsys timeline
+## Theoretical performance model
+<Operating basis and concise equations composing the best current model.>
+| Concurrency | Measured target metric | Theoretical best | % of best | Remaining gain | Status |
+<All configured points, scored subset marked; unknowns as —. Include a
+brief evidence-backed model revision only when assumptions changed.>
+
+## Gap analysis
+| Component / point | Measured ms | Best ms | Gap ms | Constraint or next test | Evidence |
+<Disjoint matching timing scopes, explicit unknown residual, floor plus
+gaps reconciled to measured total. Separate physical, scope, measurement
+constraints, actionable work and model error; uncertainty is not infeasibility.>
+
+## Next actions
+<Rank a short set of model-linked experiments or missing measurements.
+For each: predicted target-metric effect, evidence, and falsification test.
+Include only experiment outcomes that changed the model or next decision.>
+```
+
+For throughput use measured/best for % of best and best/measured - 1 for
+remaining gain; for latency use best/measured and 1 - best/measured for
+potential latency reduction. Name units and denominator. Do not mix mean
+per-point gain with ratio of means or serving throughput with kernel-sum
+utilization. Baseline and final must use the same current model when
+reporting gap closure; model revisions are not implementation gains.
+
+### Diagnostic evidence retained in supporting artifacts
+
+Keep these diagnostics in linked artifacts, not extra report sections.
+Record each unavailable reason beside its affected model once; capture
+setup belongs in profiler_report.md.
+
+### Supporting nsys timeline artifacts
 - Top kernels: name and % of GPU time
 - Per-iteration time: median/min/max, `n=` iterations and chosen anchor
 - Three busy rungs and idle complements: device busy, non-transfer busy,
@@ -812,7 +895,7 @@ separate; use the task’s resolved profiling points, not an assumed maximum.
 - If timeline analysis failed or was unavailable, retain available
   `nsys stats` numbers and `timeline analysis unavailable: <reason>`
 
-## ncu kernel analysis
+### Supporting ncu kernel analysis artifacts
 - Per-kernel table: kernel, duration, Compute (SM) SOL%, Memory SOL%,
   achieved occupancy, bound class per the loaded skill’s thresholds,
   dominant warp-stall reason, occupancy/launch limiters
@@ -822,29 +905,9 @@ separate; use the task’s resolved profiling points, not an assumed maximum.
   methodology skill is missing, retain raw metrics with ncu-derived
   classification unavailable
 
-## SOL correlation (measured vs ceiling)
-<Include when the SOL projector stage is enabled; its instructions supply
-this section’s content. Omit the section entirely otherwise.>
-
-## Ranked bottleneck hypotheses
-1. <hypothesis> — taxonomy category, trace + numerical evidence, matching
-   casebook bottleneck signal → candidate pattern row (if available), and
-   supporting/corroborating/contradicting/missing evidence pillars
-2. ...
-
-## Caveats
-<Unavailable profilers/skills, failed windows, partial coverage,
-measurement changes, multi-GPU tracing and attribution limits. Repeat
-unavailable reasons from the relevant evidence sections here.>
-```
-
-Synthesize the three evidence pillars: **nsys timeline**, **ncu kernel
-analysis**, and **SOL correlation** when enabled. Each hypothesis names
-which support it and whether the others corroborate, contradict or are
-silent; a pillar that did not run is missing, never silently skipped.
-At comparable impact, agreement across available pillars outranks a
-single-pillar hypothesis. Use casebook precedents as read-only references
-under the casebook consultation policy.
+For the largest gaps, reconcile **nsys timeline**, **ncu kernel analysis**,
+and **SOL correlation** when enabled. Name corroborating, contradicting and
+missing evidence; at comparable impact prefer agreement across pillars.
 """
 
 # --------------------------------------------------------------------------- #
@@ -852,15 +915,12 @@ under the casebook consultation policy.
 # --------------------------------------------------------------------------- #
 
 CASEBOOK_CONSULTATION = """\
-## Ground your analysis in the optimization casebook (load it early)
+## Optimization casebook
 
-After reading `task.yaml`, load `perf-optimization-casebook` with the
-`Skill` tool (`trtllm-agent-toolkit:perf-optimization-casebook` if the bare
-name is not found). Use its bottleneck signal → candidate pattern index
-and relevant case files as **read-only reference material only**.
-Do not apply optimizations, edit configs, or run extra experiments from
-it. If it is not available in this environment, note that in one line
-and proceed.
+After reading `task.yaml`, load `perf-optimization-casebook` with `Skill`
+(or `trtllm-agent-toolkit:perf-optimization-casebook`). Use its bottleneck
+signal → candidate pattern index and relevant cases as read-only references;
+do not apply changes or run extra experiments. Note unavailability once.
 """
 
 # --------------------------------------------------------------------------- #
@@ -886,142 +946,47 @@ or when another measurement is needed.
 # --------------------------------------------------------------------------- #
 
 EXECUTION_SLURM_BOOTSTRAP = """\
-## Slurm execution (this task has a `slurm-environment` block)
+## Slurm execution (`slurm-environment`)
 
-`task.yaml` contains a `slurm-environment` section, so the server and the
-benchmark must run **inside a Slurm-launched container**, not on the
-login node. Read these fields and use them verbatim:
+Run the server, readiness poll, workload and profilers inside one Slurm
+container. Use `slurm_partition`, `docker_image`, `trtllm_repo_path` and
+`checkpoint_path` from `task.yaml` verbatim. Bind repo, checkpoint and
+workspace at identical absolute host/container paths. Invalid inputs are
+blockers; do not substitute paths, partitions, images or local execution.
 
-1. `slurm_partition` — the partition to submit GPU jobs to.
-2. `docker_image` — the enroot/pyxis container image (typically a `.sqsh`).
-3. Top-level `trtllm_repo_path` and `checkpoint_path` — bind-mount both
-   into the container at the **same absolute path** they have on the host.
+Use one `sbatch` script for the entire stage: launch, readiness, workload,
+profiles, teardown. Interactive `salloc` / `srun --pty bash` allocations
+end with their `Bash` call and do not survive into subsequent calls.
+Write job output (`sbatch -o`) and artifacts inside `<workspace>`, not
+compute-node `/tmp`. Paths in the script are cluster paths.
 
-Do not invent a different partition, image, or path, and do not silently
-fall back to a local non-Slurm run when `slurm-environment` is present. If
-a value is unusable, stop and report it as a blocker.
+### MPI launch and network namespace
 
-Run the server, the readiness poll, the benchmark, and the profilers
-**within one allocation** (so the load generator can reach the server),
-e.g. an interactive `salloc`/`srun` shell or a single `sbatch` script:
-
-```bash
-# bind trtllm_repo_path, checkpoint_path, and workspace at identical
-# host:container paths (comma-separated in --container-mounts).
-srun --partition=<slurm_partition> \\
-     --container-image=<docker_image> \\
-     --container-mounts=<repo>:<repo>,<ckpt>:<ckpt>,<workspace>:<workspace> \\
-     --gres=gpu:<num_gpus> --pty bash
-# then, inside the container, follow the local launch / benchmark /
-# nsys / ncu steps exactly as described, writing all artifacts to
-# <workspace>.
-```
-
-The local launch, readiness-poll, teardown, and profiling steps are
-otherwise identical — they just run inside the container. All artifacts
-(`serve.log`, result JSON, `*.nsys-rep`, `*.ncu-rep`, the `.md`
-outputs) must land in `<workspace>` so later stages and the user can read
-them.
-
-### Under Slurm, `trtllm-serve` needs `trtllm-llmapi-launch`
-
-A bare `trtllm-serve` works from a login shell and **fails inside a Slurm
-step**, so this is a rule you cannot discover by testing the command
-locally. The LLM API creates its workers with `MPI.COMM_SELF.Spawn`, and
-dynamic MPI process spawning is not permitted inside an `srun` step. The
-symptom is not a clear rejection — the server simply never becomes ready
-while `serve.log` repeats:
-
-```
-mpi4py.MPI.Exception: MPI_ERR_SPAWN: could not spawn processes
-```
-
-and your readiness poll eventually times out, which reads as "the model is
-slow to load" rather than "this can never work".
-
-Three things are required together — one alone is not enough:
+Inside `srun`, bare `trtllm-serve` fails at `MPI.COMM_SELF.Spawn`
+(`MPI_ERR_SPAWN`). Launch with all three required pieces:
 
 ```bash
 srun --partition=<slurm_partition> \\
-     --mpi=pmix \\                      # 1. PMIx bootstrap for the ranks
-     --ntasks-per-node=<world_size> \\   # 2. one task PER RANK, not 1
+     --mpi=pmix \\
+     --ntasks-per-node=<world_size> \\
      --container-image=<docker_image> \\
      --container-mounts=<repo>:<repo>,<ckpt>:<ckpt>,<workspace>:<workspace> \\
      --container-workdir=<repo> \\
      --gres=gpu:<num_gpus> \\
   bash -c 'trtllm-llmapi-launch trtllm-serve <ckpt> ...'
-#          ^ 3. adopts the ranks srun already created instead of spawning
 ```
 
-`<world_size>` is the product of the parallel sizes in the tuning config
-(`tensor_parallel_size` × `pipeline_parallel_size` × …; `moe_expert_parallel_size`
-reuses the TP ranks and does **not** multiply it). It is a property of the
-config, so recompute it whenever you change one of those values — leaving
-`--ntasks-per-node=1` under a `tensor_parallel_size: 2` config is the
-common version of this mistake.
+`<world_size>` comes from the parallel mapping: TP × PP × applicable
+independent dimensions; `moe_expert_parallel_size` reuses TP ranks and
+**does not** multiply world size. Recompute after config changes.
+The `trtllm-llmapi-launch` wrapper adopts the ranks created by `srun`.
 
-Use `trtllm-llmapi-launch` even at world size 1: the restriction is on
-spawning inside a step, not on the number of ranks.
-
-`--gres=gpu:<num_gpus>` may exceed `<world_size>` when the cluster's QOS
-enforces a floor (this one requires `--gres=gpu:4`). Allocating more GPUs
-than ranks is allowed and simply leaves the extras idle; do NOT raise the
-parallel sizes just to consume them, because that changes the configuration
-under measurement.
-
-### One STEP, not merely one allocation — `127.0.0.1` is per-step
-
-The server and whatever talks to it (readiness poll, benchmark client) must
-run in the **same `srun` step**. One allocation is not enough. Under pyxis
-each `srun` gets its own container with its own network namespace, so
-`127.0.0.1` inside the client's step is NOT the loopback the server bound —
-the connection is refused even though both steps are on the same node and
-the server is perfectly healthy.
-
-This failure is a liar. The server log shows `Application startup complete`
-and `200 OK` for its own polls, `/v1/models` lists the model, the GPUs show
-memory in use — and the client still reports the server as unreachable, so
-the natural conclusion is "the server did not come up" when it plainly did.
-
-    sbatch script
-      └── srun (ONE step)
-            server &        # background, binds 127.0.0.1
-            poll /health    # same namespace — this works
-            benchmark       # same namespace — this works
-            teardown
-
-If you genuinely need a separate step, then the server must bind `0.0.0.0`
-and the client must address it by node name (`$SLURMD_NODENAME`), and that
-step needs `--overlap` to share the allocation. Prefer the single step: it
-has fewer ways to go wrong and needs no extra flags.
-
-### Use a batch script, not an interactive allocation
-
-Prefer the single `sbatch` script form. Do **not** use `srun --pty bash`
-or `salloc` and then issue further commands expecting the allocation to
-still be there.
-
-The reason is mechanical, not stylistic: each of your `Bash` calls is a
-separate process. An interactive allocation belongs to the call that
-created it and is gone when that call returns, so a server started in one
-call is not running in the next, `serve.pid` names a process that no
-longer exists, and the readiness poll on `127.0.0.1:8000` reaches a
-different machine's loopback. The failure looks like a server that would
-not start.
-
-One script that runs the whole stage — start the server, poll it, run the
-benchmark, capture the profiles, tear down — keeps all of that inside one
-allocation on one node, which is what the "within one allocation" rule
-above actually requires.
-
-Two consequences worth stating:
-
-- **Every path in the script is a CLUSTER path.** `<workspace>`,
-  `<trtllm_repo_path>` and `<checkpoint_path>` are already cluster paths,
-  so write them verbatim; do not try to translate them.
-- **Send the job's own output somewhere shared.** `sbatch -o /tmp/x.out`
-  writes to the compute node's local /tmp and disappears with the
-  allocation. Point `-o` inside `<workspace>`.
+Server, readiness poll and benchmark client must share the **same `srun`
+step**, not merely the allocation: pyxis steps have separate network
+namespaces, so `127.0.0.1` does not cross steps. Follow the normal lifecycle
+inside that step. If separate steps are necessary, bind the server to
+`0.0.0.0`, use `$SLURMD_NODENAME` from the client, and `--overlap` to share
+the allocation. Prefer the single-step script.
 """
 
 
@@ -1031,67 +996,41 @@ Two consequences worth stating:
 # --------------------------------------------------------------------------- #
 
 SOL_PROJECTOR_METHODOLOGY = """\
-## The methodology: the `internal-perf-sol-analysis` skill
+## The methodology: `internal-perf-sol-analysis`
 
-The skill is the single source of truth for SOL modeling — its α-β-u
-model, its per-op recipes, its peaks calculator and
-`measure_channels.py`, and the ground rules that come with them. Load
-it and follow it: the arithmetic you write down instantiates *its*
-formulas, not your own, and your report speaks its vocabulary — **% of
-SOL** as the headline (latencies: SOL ÷ measured; throughput: measured
-÷ SOL — both ≤ 100%), **MFU** / **MBU** as secondary utilizations,
-**gap-to-SOL**, and **bound** ∈ compute / memory / launch (plus comm on
-multi-GPU).
+Load the skill and use its α-β-u model, per-op recipes, peaks calculator
+and `measure_channels.py`. Report **% of SOL** (latency: SOL/measured;
+throughput: measured/SOL), secondary **MFU**/**MBU**, **gap-to-SOL**, and
+**bound** ∈ compute / memory / launch / comm. A ratio above 100% signals a
+model/measurement mismatch; do not clamp it. This projection seeds the
+Analyzer's current `performance_model.yaml`.
 
-What the skill cannot know is this stage's contract:
+- Use `task.yaml`'s `sol.gpu` as the `sol_calc.py peaks --part` hint.
+  The Skill load supplies the scripts' base directory.
+- When local GPUs are reachable and idle (`nvidia-smi`), measure latency
+  constants and merge them into the peaks file. On a Slurm login node,
+  leave launch α unmeasured; derive β/u and record the limitation in
+  *Projection setup* and *Open questions*. Never guess α.
+- No measured per-op timings exist before profiling. Instantiate the
+  skill's formulas/recipes in linked `sol_work/` derivations with actual
+  inputs and units. Do not invent measured_ms rows to run `sol_calc.py analyze`;
+  the Analyzer runs it against its selected profile. The report's
+  *Arithmetic* entry links these derivations and explains their composition.
+- Persist calculator output and any measured latencies in
+  `<workspace>/sol_work/peaks.json`; record its path in *Projection setup*.
+- Derive deployment quantities from checkpoint `config.json`, serving
+  precision and TP/PP/EP: weight bytes per GPU (active experts for MoE),
+  KV bytes per decoded token at mean context, FLOPs/token and per-layer
+  collectives. Recipes do not supply these inputs.
+- If the skill is unavailable, ground a labeled coarse ceiling in
+  `config.json` and sourced internal knowledge, or write *Projection
+  unavailable* when no defensible bound exists.
 
-- **`task.yaml`'s `sol.gpu` (when set) is the part-name hint** for
-  `sol_calc.py peaks --part`; the `Skill` load announces the base
-  directory its scripts live in.
-- **A GPU may not be reachable from here.** On local runs the GPUs sit
-  idle between stages (confirm with `nvidia-smi`), so measure the
-  latency constants and merge them into the peaks file. Under the
-  workflow's Slurm mode you run on a login node — do **not** guess α:
-  derive the β/u terms and record the launch-α term as unmeasured in
-  *Caveats*.
-- **Nothing measured exists yet.** `sol_calc.py analyze` correlates
-  *measured* per-op times with their ceilings, and no profiling stage
-  has run — do not invent `measured_ms` rows, and never fabricate an
-  input to force a script run. The **Analyzer** runs `analyze` after
-  you, against its fresh profile and the peaks file you persist. Your
-  job is the predictive end-to-end ceiling: instantiate the skill's
-  formulas and per-op recipes yourself, with **every formula's actual
-  numbers written down** — a projection whose arithmetic cannot be
-  re-checked from the report is worthless.
-- **Persist the machine-readable peaks file for the Analyzer** — the
-  peaks-calculator output, with the measured latency constants merged
-  in whenever you measured them — to
-  `<workspace>/sol_work/peaks.json`, and record that path in
-  *Projection setup*. The Analyzer's measured↔SOL correlation joins
-  against this exact file; a projection whose peaks live only in prose
-  starves that stage.
-- **The structural quantities are this deployment's, and the skill's
-  recipes do not supply them:** read them off the checkpoint's
-  `config.json` (a misread config silently corrupts every downstream
-  number — read it carefully) at the serving precision and the
-  parallel mapping (tp/pp/ep, from the config named under *Workspace*)
-  — weight bytes per GPU (count only active experts per token for
-  MoE), KV-cache bytes read per decoded token at the mean context
-  length, FLOPs per token, and on multi-GPU the per-layer collective
-  term.
-- **If the skill is not available in this environment** (neither name
-  resolves), say so in one line, ground what you can from `config.json`
-  + internal knowledge into a clearly marked coarse ceiling — and if
-  nothing defensible can be grounded, write the unavailable form.
-  Never fabricate.
-
-One limit the skill does not state and your report must: the ceiling
-models **kernel execution plus per-launch latency only** — no
-serving-stack scheduler/host prep, no request queueing, no
-dynamic-batching effects. A measured result far below even this α-aware
-ceiling therefore points at host/scheduling costs the model does not
-price; say so explicitly, it is a valuable signal for the downstream
-stages.
+Recipes model **kernel execution plus per-launch latency only**. Compose
+scheduler/host prep, queueing and dynamic-batching terms on a matching basis
+before claiming an end-to-end ceiling. Unmatched residuals remain unexplained;
+a large gap alone does not establish host overhead. Name missing phase
+measurements or derivations in *Open questions*.
 """
 
 
@@ -1101,34 +1040,23 @@ stages.
 # calculator; this names the skill that replaces it and the one artifact
 # that stops being writable.
 SOL_METHODOLOGY_FALLBACK = """\
-## Fallback: `internal-perf-sol-analysis` is not installed here
+## Fallback: `internal-perf-sol-analysis` unavailable
 
-This session does not have the skill above, so load the `perf-analysis`
-skill your driving message names instead and take its
-bottleneck-classification table as the methodology. There is no peaks
-calculator and no `measure_channels.py`, so follow the last bullet of
-*The methodology*: ground what you can from `config.json` + internal
-knowledge into a clearly marked coarse ceiling, and say in one line
-that the peaks are not calculator-resolved. Skip
-`sol_work/peaks.json` — `sol_calc.py` ships with the missing skill, so
-nothing downstream reads it. If nothing defensible can be grounded,
-write the *Projection unavailable* form. Never fabricate.
+Load the supplied `perf-analysis` skill and use its bottleneck classification.
+Ground a labeled coarse ceiling in `config.json` and sourced internal
+knowledge; state that peaks are not calculator-resolved. There is no peaks
+calculator or `measure_channels.py`: skip `sol_work/peaks.json`. If no
+defensible bound exists, write *Projection unavailable*. Never fabricate.
 """
 
 
 SOL_PROJECTOR_INTERNAL_KNOWLEDGE = """\
-## Consulting internal knowledge (reference only)
+## Internal knowledge (reference only)
 
-When the mapping is uncertain or a spec is missing — e.g. to
-characterize a model architecture or GPU part the skill's references
-leave uncertain — use the `internal-glean-search` skill or the
-`internal-glean-specialist` subagent for detailed internal knowledge
-(if that skill/subagent exists). **It is consultative** — every
-projected number in your report must be reproducible from the
-arithmetic you wrote down over named sources (the skill's calculator
-output, `config.json`, what you retrieved); never copy a number you
-cannot derive, and don't burn the turn searching when the derivation
-already stands on cited sources.
+For unresolved architecture/GPU specs, consult `internal-glean-search` or
+`internal-glean-specialist` if available. Every projected value must remain
+reproducible from named sources and recorded arithmetic. Stop searching
+once those sources support the derivation.
 """
 
 
@@ -1142,11 +1070,9 @@ already stands on cited sources.
 SOL_CORRELATION_METHOD = """\
 ### Correlate the fresh profile against the ceiling (`sol_calc.py analyze`)
 
-The projection alone is a predictive end-to-end ceiling; your profile
-just produced the measured per-op times the Projector did not have.
-Join the two with the skill's calculator — the correlation turns "the
-workload is at N% of SOL" into a per-op table naming *where* the gap
-physically sits:
+The selected profile supplies measured per-op times. Join structural work
+with the skill's calculator to support the current model. Kernel-sum ratios
+are diagnostics, not end-to-end % of theoretical best.
 
 1. **Load the `internal-perf-sol-analysis` skill** (via the `Skill`
    tool; fully-qualified
@@ -1165,10 +1091,10 @@ physically sits:
 3. **Build `regions.json` from your traces — structural facts only.**
    The rows come from the nsys per-kernel sums
    (`cuda_gpu_kern_sum`, NVTX ranges, the timeline's kernel-category
-   rollup), rolled up into the skill's region keys and schema. The
-   shapes come from `sol_projection.md`'s *Arithmetic* (the Projector already
-   derived them from `config.json`) — reuse them rather than
-   re-deriving. A region whose params you cannot ground stays in
+   rollup), rolled up into the skill's region keys and schema. Start with
+   the shapes in `sol_projection.md`'s *Arithmetic*,
+   then verify them against current source/runtime facts; correct stale
+   shapes with evidence. A region whose params you cannot ground stays in
    `other` with a note — **never invent params or `measured_ms` rows**.
 4. **Run the calculator** (never hand-compute a SOL number):
    ```bash
@@ -1181,106 +1107,65 @@ physically sits:
    An op family the built-in recipes do not cover is either given a
    recipe under `sol_recipes/` (the skill's `check-recipe` route) or
    left in `other` — those are the only two options.
-5. **Transcribe `sol.json` into the `## SOL correlation (measured vs
-   ceiling)` section** of `profile_findings.md`: the joined per-op
-   table verbatim (region, calls, measured ms, SOL ms, % of SOL,
-   MFU %, MBU %, gap ms, bound), the workload-level % of SOL line, and
-   one sentence naming the largest-`gap ms` regions — that is where
-   the headroom physically sits, and it is the sharpest signal the
-   downstream stages get from you.
+5. **Keep `sol.json` as a supporting artifact.** Cite its region/model IDs
+   from the current model's component derivations. Preserve calculator
+   columns, scope, % of SOL, MFU/MBU and corrections in the artifact; do not
+   paste the full table into `analysis.md` or make its kernel-sum ratio a
+   serving-performance headline. Unknown recipes are partial model coverage.
+
 
 Degrade honestly: when a precondition fails (projection unavailable,
 peaks file missing and the constants unmeasurable, nsys produced no
-usable per-kernel table), keep the section with a one-line
-`Correlation unavailable: <reason>`, record it in *Caveats*, and move
+usable per-kernel table), record `Correlation unavailable: <reason>` beside the affected model and move
 on — a fabricated correlation is worse than none.
 """
 
 
 SOL_ANALYZER_CONTEXT = (
     """\
-## SOL projection as context (the projector stage ran)
+## Update the current model from SOL evidence
 
-The Projector stage ran before you and left `sol_projection.md` — an
-analytical speed-of-light (SOL) ceiling for this model/hardware/
-operating point, derived with the `internal-perf-sol-analysis` skill,
-with a measured-vs-SOL gap analysis. `Read` it (or call
-`read_latest_progress` with `agent: "projector"`) after
-`benchmark_results.md` and use it as **context, not evidence**:
+Read `sol_projection.md` as the initial theoretical model and preserve it
+as provenance. It is context, not a measurement or a permanently fixed ceiling.
+Use its structural derivations as a starting point, checking shapes and
+runtime facts against the selected capture. Feed valid per-op results into
+`performance_model.yaml`, composing a current end-to-end model only where
+scope and timing allow it. Record changes in assumptions with evidence and
+keep kernel-level revisions in `kernel_ledger.yaml` when present.
 
-- Let the projected headroom (% of SOL) and the bound mix (compute /
-  memory / launch) inform which hypotheses you probe hardest and how
-  you rank them — e.g. a low % of SOL with a memory bound raises the
-  prior on memory-bandwidth causes; a gap far beyond what the ceiling
-  can explain points at host/scheduling overhead (the ceiling models
-  kernel execution plus per-launch latency only, so serving-stack
-  scheduler and queueing costs are invisible to it).
-- Measured trace evidence always outranks the projection: when they
-  disagree, trust the trace and note the disagreement.
-- In `profile_findings.md`, say where the profile **confirms or
-  contradicts** the projection (a sentence per ranked hypothesis is
-  enough).
-- Projected numbers are not measurements — never present a SOL number
-  as a measured one. If `sol_projection.md` declares itself
-  unavailable, ignore it for ranking, skip the correlation below, and
-  record that in *Caveats*.
-
+The model's remaining gaps drive experiment ranking. A failed optimization
+alone does not weaken a bound, and a large gap alone does not identify a
+host bottleneck. Missing facts stay unknown with next_test. The single
+Theoretical performance model and Gap analysis sections own this account;
+no extra SOL or remaining-gap section. Unavailable correlation is a one-line
+limitation beside the affected model, not a reason to omit the current model.
 """
     + SOL_CORRELATION_METHOD
-    + """
-Artifact placement in this workflow: `regions.json`, `sol.json`, and
-any `sol_recipes/` go under `<workspace>/sol_work/`, next to the
-Projector's `peaks.json`.
+    + """\
+Keep regions.json, sol.json and sol_recipes/ in <workspace>/sol_work/.
 """
 )
 
 
 SOL_REPORTER_GUIDANCE = """\
-## Projection vs Measured (the projector stage ran)
+## Use the current theoretical model
 
-The Projector left `sol_projection.md` — an analytical speed-of-light
-(SOL) ceiling derived with the `internal-perf-sol-analysis` skill, with
-% of SOL / MFU / MBU numbers and a measured-vs-SOL gap analysis. `Read`
-it with the other inputs and add one section to `performance_report.md`,
-placed **between "Profiling Findings" and "Main Bottleneck"** (the HTML
-companion mirrors it like every other section):
+Read `sol_projection.md` as initial provenance and the latest
+`performance_model.yaml` + `analysis.md` as the authoritative current model.
+Use the current model for the report's single per-point comparison and gap
+analysis. Do not add Projection vs Measured, SOL correlation or extra
+remaining-gap sections. If the initial projection has been superseded,
+mention the material correction once with its evidence and model_id.
+Do not mix its old ceiling with a current kernel floor or practical rate.
 
-```
-## Projection vs Measured
-
-<The measured-vs-SOL table lifted from sol_projection.md (throughput,
-TTFT, TPOT with % of SOL, plus measured MFU/MBU), the projected bound
-mix (compute / memory / launch), and what the gaps mean: % of SOL sizes
-the theoretical headroom, and the bound names which side it is on.
-When profile_findings.md carries a **SOL correlation (measured vs
-ceiling)** section, also lift its joined per-op table (region / calls /
-measured ms / SOL ms / % of SOL / gap ms / bound) — it localizes the
-same headroom per op — and name the largest-gap regions; when the
-correlation was unavailable, say so in one line rather than
-substituting. State explicitly how this projection moves (or does not
-move) the verdict.>
-```
-
-Weighing rules:
-- **Weigh the projection when deciding the Main Bottleneck and when
-  ranking Recommendations**: the SOL headroom sizes the win (a fix
-  cannot recover more than the ceiling says is available on that side),
-  and the projected bound mix corroborates or challenges the Analyzer's
-  ranked hypotheses — the per-op correlation table, when present, is
-  the sharpest tie-breaker (measured rows against their own ceilings).
-  State in the Main Bottleneck section how the projection was weighed.
-- The projection is a model, not a measurement — when it conflicts with
-  trace evidence, measured evidence wins, and the conflict is worth a
-  sentence.
-- The ceiling models kernel execution plus per-launch latency only — a
-  measured result far below it often indicates serving-stack
-  scheduler/queueing costs the model does not price; treat that as
-  supporting evidence for host-side bottleneck categories, not as a
-  contradiction.
-- If `sol_projection.md` is missing or declares itself unavailable,
-  the section must honestly say **"Projection unavailable (<reason>)"**
-  and the verdict falls back to measured evidence alone — never
-  fabricate projected numbers.
+Use `benchmark_results.md` and its raw result JSONs for measured values.
+Compare only compatible builds/workloads/timing scopes in `analysis.md`.
+A capture that does not represent the benchmark workload needs an explicit
+limitation and cannot establish convergence. If the current bound is unavailable, display unknown and
+the required next test; do not fall back to a superseded initial bound.
+Large model discrepancies do not establish host/scheduler overhead: require
+phase measurements. Distinguish physical limits, campaign scope, measurement
+limits and unresolved model error. Incomplete evidence cannot establish convergence.
 """
 
 
@@ -1291,118 +1176,47 @@ Weighing rules:
 BOTTLENECK_TAXONOMY = """\
 ## Bottleneck taxonomy
 
-Classify the **single dominant** bottleneck into exactly one primary
-category (note secondary factors separately). Tie the verdict to concrete
-evidence rows from the benchmark + profile findings — never assert a
-category without the signal that supports it.
+Choose one dominant category from measured evidence; rank close secondary
+factors. If evidence cannot distinguish causes, say so.
 
-- **Compute-bound** — GPU math units saturated. Signal: high GPU busy %,
-  GEMM/attention/tensor-core kernels dominate kernel time, near-roofline
-  FLOPs, throughput scales with batch up to a compute ceiling. Common in
-  prefill / large-batch decode.
-- **Memory-bandwidth-bound** — HBM bandwidth saturated. Signal: memory-bound
-  kernels dominate (elementwise, norms, KV gather/scatter, dequant),
-  high DRAM throughput at modest FLOPs, decode-phase TPOT dominated by
-  weight/KV reads. Common in low-batch decode.
-- **KV-cache-capacity-bound** — serving throughput limited by how many
-  requests fit in KV cache. Signal: low KV-cache free-block headroom /
-  high utilization, requests queued / preempted, concurrency capped below
-  the requested level, throughput rises if `kv_cache_free_gpu_memory_fraction`
-  or quantization increases.
-- **Kernel-launch / host-overhead-bound** — GPU starved by the host. Two
-  distinct sub-causes share this bucket; identify **which one** dominates
-  before prescribing a fix, because the fixes differ:
-  - *Kernel-launch overhead* — launching/dispatching the model forward
-    dominates. Signal: many tiny kernels, launch calls dominate CUDA-API
-    time, eager (non-CUDA-graph) execution, idle made of short per-launch
-    gaps. This is what **CUDA graphs / overlap scheduler** collapse: graph
-    replay wraps the model forward, removing the per-kernel launch cost
-    inside it.
-  - *Host-prep / scheduler exposed* — a host phase (input preparation,
-    block-table/index math, host-device `.item()` syncs, request
-    scheduling) runs on the timeline and is not hidden by GPU work.
-    Signal: a named host phase (e.g. `_prepare_inputs`) whose wall time
-    rivals or exceeds the GPU forward, high `.item()` /
-    `cudaStreamSynchronize` counts, long (>100 µs) idle gaps. **CUDA graphs
-    do not remove this** — the host prep runs before/around the replayed
-    forward, not inside it; the fix is cutting host work and removing
-    host-device syncs from the hot path (and when it also blocks graph
-    capture, fix it first). Low GPU busy % at low batch is common to both.
-- **Communication-bound (multi-GPU)** — collectives dominate. Signal:
-  NCCL/all-reduce/all-gather kernels are a large share of time, GPUs wait
-  on communication, scaling efficiency drops with TP/PP/EP size.
-
-If two categories are close, say so and rank them; the Executive Summary
-still names one headline bottleneck.
+- **Compute-bound:** high GPU busy, near-roofline FLOPs and GEMM/attention
+  dominance; throughput scales with batch to a compute ceiling.
+- **Memory-bandwidth-bound:** high DRAM throughput at modest FLOPs;
+  elementwise/norm/KV/dequant kernels or weight/KV reads dominate TPOT.
+- **KV-cache-capacity-bound:** low free-block headroom, queued/preempted
+  requests and concurrency below target; more KV capacity raises throughput.
+- **Kernel-launch / host-overhead-bound:** distinguish two mechanisms:
+  - *Kernel-launch overhead:* many tiny eager kernels, launch-heavy CUDA
+    API time and short idle gaps. CUDA graphs / overlap scheduler amortize
+    forward launches.
+  - *Host-prep / scheduler exposed:* a named host phase such as
+    `_prepare_inputs`, `.item()`/`cudaStreamSynchronize`, or >100 µs gaps
+    rivals GPU time. CUDA graphs do not remove host prep outside replay;
+    reduce host work/synchronization. Low GPU busy alone cannot distinguish
+    these two causes.
+- **Communication-bound (multi-GPU):** exposed NCCL/all-reduce/all-gather
+  and waiting dominate; scaling efficiency falls with TP/PP/EP.
 """
 
 
 HTML_COMPANION = """\
 ## HTML companion (`performance_report.html`)
 
-Produce a **single self-contained** HTML file alongside the markdown — all
-CSS/JS inline, **no external CDN, font, or asset URLs** so it opens
-offline. It presents the *same content* as `performance_report.md` (same
-sections, same numbers, same verdict) in a clean, interactive form.
+Write one self-contained offline HTML file with the same four sections,
+tables, numbers, model_id and conclusions as the Markdown. Use inline CSS,
+no external CDN/fonts/assets, accessible headings and real tables, readable
+light/dark styles, and print-friendly layout. Keep navigation small; do not
+add mandatory interactive widgets or extra report sections.
 
-**Required structure (top-down):**
-
-1. `<!DOCTYPE html>` with `<html lang="en">`, a `<title>` matching the
-   report's H1, and `<meta name="viewport">`.
-2. Inline `<style>`: clean readable font stack, generous line-height,
-   ~800–900 px max content width, and light/dark mode via
-   `@media (prefers-color-scheme: dark)`.
-3. A **sticky table-of-contents nav** listing every H2, each linking to
-   the section's slugified anchor id (`#executive-summary`, etc.).
-4. The main `<article>` body, sections in the same order as the markdown
-   (Executive Summary, Configuration, Benchmark Results, Pareto Curve —
-   Pareto-curve mode only, Profiling Findings, Main Bottleneck,
-   Recommendations), each heading carrying a stable id.
-5. Metric tables are real HTML `<table>`s (same columns/values as the
-   markdown). The **Main Bottleneck** verdict is visually prominent
-   (e.g. a callout box).
-6. Inline `<script>` at the end of `<body>`.
-
-**Required charts (self-contained — no chart library, no CDN):** embed
-each chart's data as a JSON array in the inline script and render it to
-inline SVG with your own small renderer. Style via CSS variables so both
-color schemes stay readable, and never plot a value that differs from
-the section's table — the table is the source of truth.
-
-- **Top-kernel share bars** — at the top of *Profiling Findings*: one
-  horizontal bar per row of the top-kernels table (GPU-time share,
-  sorted descending), each labeled with the kernel name — abbreviate
-  template-heavy names to a distinctive stem — and its share, with a
-  hover tooltip (an SVG `<title>` is enough) carrying the full name and
-  exact value. Render it only when the findings carry a top-kernels
-  table (nsys ran); with no table, omit the chart rather than plotting
-  invented numbers. Further charts (e.g. top operators) are welcome
-  under the same self-contained rules.
-- **Pareto curve** — at the top of *Pareto Curve*, only in Pareto-curve
-  mode (`benchmark.concurrency` is a list): **x = tok/s/user,
-  y = tok/s/gpu**, the measured curve as one polyline with a marked
-  point per concurrency, each labeled `c=<n>` and carrying an SVG
-  `<title>` tooltip with the exact x/y values. Pad both axis domains
-  around the data (do not force zero) and put the axis names + units on
-  both axes. When the report also carries per-point SOL-projected
-  values (the projector ran in curve mode), overlay the projected curve
-  as a second polyline distinguished by more than hue alone (e.g.
-  dashed) plus a legend. In scalar mode, or when the curve summary
-  table is absent, omit the chart and the section.
-
-**Required interactivity:**
-
-- **TOC scroll-spy** — the entry for the section in view gets an `active`
-  class as the reader scrolls.
-- **Collapsible H2 sections** — clicking a heading toggles a `collapsed`
-  class on its body; default expanded.
-- **Print-friendly** — hide the TOC and force-expand all sections in
-  `@media print`.
-
-**Faithfulness rule:** the HTML is not a remix — same sections, same
-tables, same bottleneck verdict and evidence as the markdown, and charts
-that plot exactly the numbers in the tables they sit above. If you
-revise the markdown, revise the HTML in the same turn.
+The current model comparison is the primary visual. An optional inline SVG
+chart may plot its exact per-point values, distinguishing measured values
+from theoretical estimates and omitting unknown points. In curve mode keep
+one compact Pareto chart (x = tok/s/user, y = tok/s/gpu) when the measured
+curve is available; optimization reports compare baseline and final only.
+A theoretical overlay is allowed only with a supported conversion from the
+CURRENT model to both axes; never substitute the initial projection. Label
+concurrency and series clearly. No separate trajectory or top-kernel charts.
+All charts must use exactly the table data and name the model revision.
 """
 
 
@@ -1413,14 +1227,9 @@ revise the markdown, revise the HTML in the same turn.
 EVIDENCE_DISCIPLINE = """\
 ## Evidence discipline
 
-- **Never fabricate numbers.** Every metric, kernel name, or percentage
-  you report must come from a file you actually produced (the benchmark
-  JSON, `nsys stats` output, the ncu report, server logs). If a run
-  failed or a tool was unavailable, say so plainly — do not invent
-  plausible-looking results.
-- **Record exact commands.** Anyone reading the workspace must be able to
-  reproduce your run from the commands you wrote down.
-- **No conversational filler.** Jump straight into the work.
+Cite the files supporting every metric, kernel and claim. Record exact
+commands for reproducibility. Report failures/unavailable tools; never
+fabricate numbers. Keep prose direct and free of conversational filler.
 """
 
 

@@ -12,7 +12,7 @@ Both workflow layouts and legacy combined analysis directories are supported::
     perf-analyze            perf-optimize
     ------------            -------------
     benchmark_results.md    baseline/benchmark_results.md
-    profile_findings.md     rounds/round_<n>/analysis/profile_findings.md
+    analysis.md             rounds/round_<n>/analysis/analysis.md
     *.nsys-rep, *.ncu-rep   rounds/round_<n>/profile/profile_manifest.json
     sol_projection.md       sol_projection.md
     sol_work/               sol_work/
@@ -34,10 +34,18 @@ from pathlib import Path
 
 import yaml
 
-from .profile import PROFILE_MANIFEST_NAME, ProfileError, validate_profile_manifest
+from agent_flow.workflows.perf_analyze.performance_model import MODEL_FILENAME
+
+from .profile import (
+    PROFILE_MANIFEST_NAME,
+    PROFILE_REPORT_NAME,
+    ProfileError,
+    validate_profile_manifest,
+)
 
 BASELINE_REPORT_NAME = "benchmark_results.md"
-FINDINGS_NAME = "profile_findings.md"
+FINDINGS_NAME = "analysis.md"
+LEGACY_FINDINGS_NAME = "profile_findings.md"
 SOL_PROJECTION_NAME = "sol_projection.md"
 SOL_WORK_DIRNAME = "sol_work"
 ROADMAP_NAME = "roadmap.yaml"
@@ -49,6 +57,7 @@ REUSE_DIRNAME = "reused_analysis"
 MANIFEST_NAME = "manifest.md"
 PRIOR_ROADMAP_NAME = "prior_roadmap.yaml"
 PRIOR_KERNEL_LEDGER_NAME = "kernel_ledger.yaml"
+PRIOR_PERFORMANCE_MODEL_NAME = "prior_performance_model.yaml"
 PRIOR_ANALYSIS_DIRNAME = "prior_analysis"
 
 # Sibling artifacts copied alongside the baseline report: the result
@@ -164,9 +173,10 @@ def _profile_for_findings(source: Path, findings: Path) -> Path | None:
 
 def _round_findings(source: Path) -> list[tuple[int, Path]]:
     candidates: list[tuple[int, Path]] = []
-    for path in source.glob(f"rounds/round_*/analysis/{FINDINGS_NAME}"):
-        match = _ROUND_DIR_RE.fullmatch(path.parent.parent.name)
-        if match and _nonempty_file(path):
+    for directory in source.glob("rounds/round_*/analysis"):
+        match = _ROUND_DIR_RE.fullmatch(directory.parent.name)
+        path = _first_existing(directory / FINDINGS_NAME, directory / LEGACY_FINDINGS_NAME)
+        if match and path is not None:
             candidates.append((int(match.group(1)), path))
     return candidates
 
@@ -203,7 +213,7 @@ def _has_raw_capture(profile_dir: Path) -> bool:
 
 
 def latest_round_findings(source: Path) -> Path | None:
-    """Newest *profiling* ``rounds/round_<n>/analysis/profile_findings.md``.
+    """Newest *profiling* ``rounds/round_<n>/analysis/analysis.md``.
 
     Rounds are ranked numerically so ``round_10`` outranks ``round_9``
     (mirroring the reporter's kernel-ledger lookup), and the newest round
@@ -289,6 +299,121 @@ def _latest_kernel_ledger(
     return max(candidates)[1] if candidates else sibling
 
 
+def _model_builds(path: Path) -> dict[int | None, str] | None:
+    """Read explicit per-point build identities without adopting a prior model."""
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        points = data.get("points") if isinstance(data, dict) else None
+        if not isinstance(points, list) or not points:
+            return None
+        builds = {}
+        for point in points:
+            conditions = point.get("operating_point") if isinstance(point, dict) else None
+            build = conditions.get("build") if isinstance(conditions, dict) else None
+            if not (isinstance(build, str) and build.strip() or isinstance(build, dict) and build):
+                return None
+            concurrency = point.get("concurrency")
+            if concurrency is not None and (type(concurrency) is not int or concurrency <= 0):
+                return None
+            if concurrency in builds:
+                return None
+            builds[concurrency] = json.dumps(build, sort_keys=True, separators=(",", ":"))
+        return builds
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError, ValueError):
+        return None
+
+
+def _latest_performance_model(
+    source: Path, findings: Path | None, profile_dir: Path | None
+) -> tuple[Path | None, str]:
+    """Select a corrected model only within the chosen analysis/capture scope.
+
+    A newer replan can supersede the selected analysis only when its capture
+    provenance resolves to the same directory and its build identities match.
+    Without both proofs, retain the selected analysis's model as prior art.
+    """
+    sibling = _first_existing(findings.parent / MODEL_FILENAME) if findings else None
+    final_model = source / "final_verification" / "analysis" / MODEL_FILENAME
+    if _nonempty_file(final_model):
+        try:
+            identity = yaml.safe_load(
+                (final_model.parent / "analysis_manifest.yaml").read_text(encoding="utf-8")
+            )
+            if (
+                isinstance(identity, dict)
+                and identity.get("mode") == "final_reconciliation"
+                and identity.get("capture_id") is None
+                and identity.get("profile_dir") is None
+                and identity.get("capture_unavailable")
+            ):
+                return final_model, (
+                    "Final reconciled model without reusable capture provenance. "
+                    "Final measurements come from QA; inherited findings retain their "
+                    "source scope. Import as prior reference, not a captured model."
+                )
+        except (OSError, UnicodeError, yaml.YAMLError):
+            pass
+    scope = (
+        "Selected analysis's model; source capture/build conditions must be checked "
+        "against the new campaign before adopting any bound."
+        if sibling is not None
+        else ""
+    )
+    if profile_dir is None:
+        return sibling, scope
+    builds = _model_builds(sibling) if sibling is not None else None
+    capture_build = None
+    if builds is None:
+        try:
+            capture = validate_profile_manifest(profile_dir)
+            capture_build = json.dumps(capture["runtime"]["build"], sort_keys=True)
+        except ProfileError:
+            return sibling, scope
+
+    def matching_builds(path: Path) -> bool:
+        candidate_builds = _model_builds(path)
+        if candidate_builds is None:
+            return False
+        if builds is not None:
+            return candidate_builds == builds
+        return all(build == capture_build for build in candidate_builds.values())
+
+    candidates = []
+    for path in source.glob(f"rounds/round_*/analysis/{MODEL_FILENAME}"):
+        match = _ROUND_DIR_RE.fullmatch(path.parent.parent.name)
+        if not match or not _nonempty_file(path):
+            continue
+        profile = _profile_for_ledger(source, path)
+        if path == sibling or (
+            profile is not None
+            and profile.resolve() == profile_dir.resolve()
+            and matching_builds(path)
+        ):
+            candidates.append((int(match.group(1)), path))
+    selected = max(candidates)[1] if candidates else sibling
+    if selected is not None and selected != sibling:
+        scope = (
+            "Latest model with provenance matching the selected capture and explicit "
+            "build identities; source operating conditions still require a campaign fit check."
+        )
+    if (
+        _nonempty_file(final_model)
+        and (final_model.parent / "analysis_manifest.yaml").is_file()
+        and _profile_for_ledger(source, final_model) == profile_dir
+    ):
+        selected = final_model
+        scope = (
+            "Final reconciled model with matching selected capture and build identities; "
+            "source workload and timing conditions still require a campaign fit check."
+            if matching_builds(final_model)
+            else "Final reconciled model: final build differs from the selected capture "
+            "or its build identity is unproven. Inherited capture measurements describe "
+            "the earlier build; import this as scoped prior reference, not a captured "
+            "model of the final runtime."
+        )
+    return selected, scope
+
+
 @dataclass(frozen=True)
 class DiscoveredAnalysis:
     """What a ``--reuse-analysis`` source actually offers.
@@ -304,6 +429,8 @@ class DiscoveredAnalysis:
     sol_work: Path | None = None
     prior_roadmap: Path | None = None
     profile_dir: Path | None = None
+    performance_model: Path | None = None
+    performance_model_scope: str = ""
 
     @property
     def kernel_ledger(self) -> Path | None:
@@ -330,12 +457,14 @@ def discover(source: str | Path, *, reanalyze: bool = False) -> DiscoveredAnalys
     root = Path(source).expanduser()
     if not root.is_dir():
         raise ReuseError(f"--reuse-analysis source is not a directory: {root}")
-    findings = latest_round_findings(root) or _first_existing(root / FINDINGS_NAME)
+    findings = latest_round_findings(root) or _first_existing(
+        root / FINDINGS_NAME, root / LEGACY_FINDINGS_NAME
+    )
     profile_dir = _profile_for_findings(root, findings) if findings is not None else None
     if reanalyze:
         profile_dir = _latest_profile(root, require_raw=True)
         candidates = _round_findings(root)
-        flat_findings = _first_existing(root / FINDINGS_NAME)
+        flat_findings = _first_existing(root / FINDINGS_NAME, root / LEGACY_FINDINGS_NAME)
         if flat_findings is not None:
             candidates.append((0, flat_findings))
         matching = [
@@ -347,6 +476,7 @@ def discover(source: str | Path, *, reanalyze: bool = False) -> DiscoveredAnalys
     elif findings is None:
         profile_dir = _latest_profile(root)
     sol_work = root / SOL_WORK_DIRNAME
+    prior_model, model_scope = _latest_performance_model(root, findings, profile_dir)
     return DiscoveredAnalysis(
         source=root,
         baseline_report=_first_existing(
@@ -357,6 +487,8 @@ def discover(source: str | Path, *, reanalyze: bool = False) -> DiscoveredAnalys
         sol_work=sol_work if sol_work.is_dir() and any(sol_work.iterdir()) else None,
         prior_roadmap=_first_existing(root / ROADMAP_NAME),
         profile_dir=profile_dir,
+        performance_model=prior_model,
+        performance_model_scope=model_scope,
     )
 
 
@@ -370,6 +502,8 @@ class ImportedAnalysis:
     sol_projection: bool = False
     sol_work: bool = False
     kernel_ledger: bool = False
+    performance_model: bool = False
+    performance_model_scope: str = ""
     prior_roadmap: bool = False
     profile: bool = False
     reanalyze: bool = False
@@ -387,6 +521,7 @@ class ImportedAnalysis:
                 ("profile captures", self.profile),
                 ("SOL projection", self.sol_projection),
                 ("kernel ledger (as reference)", self.kernel_ledger),
+                ("performance model (as reference)", self.performance_model),
                 ("prior roadmap (as reference)", self.prior_roadmap),
             )
             if present
@@ -440,6 +575,9 @@ def _copy_profile(src: Path, dst: Path, imported: ImportedAnalysis) -> None:
             for reference in result.get("artifacts", [])
         }
         references.update(manifest.get("artifacts", []))
+        if _nonempty_file(src / PROFILE_REPORT_NAME):
+            validate_profile_manifest(src, require_report=True)
+            references.add(PROFILE_REPORT_NAME)
         for reference in sorted(references):
             _copy_file(src / reference, dst / reference, imported)
         _copy_file(manifest_path, dst / PROFILE_MANIFEST_NAME, imported)
@@ -491,6 +629,11 @@ def _copy_profile(src: Path, dst: Path, imported: ImportedAnalysis) -> None:
         (dst / PROFILE_MANIFEST_NAME).write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
+        report = src / PROFILE_REPORT_NAME
+        if _nonempty_file(report):
+            if not report.resolve().is_relative_to(src.resolve()):
+                raise ReuseError(f"Profiler report escapes its directory: {report}")
+            _copy_file(report, dst / PROFILE_REPORT_NAME, imported)
     validate_profile_manifest(dst)
     imported.profile = True
 
@@ -517,6 +660,14 @@ def _render_manifest(imported: ImportedAnalysis, workspace: Path) -> str:
         "art only. Resolve its evidence relative to its original source",
         "directory below. The analyzer writes a fresh kernel ledger with",
         "this campaign's roadmap references and model revision history.",
+        "",
+        "The prior performance model is read-only reference, never the new campaign's",
+        "current performance_model.yaml. Preserve its corrected assumptions rather than",
+        "silently reverting to the original SOL projection. Resolve cited evidence in the",
+        "source workspace; the analyzer must write and validate a fresh current model.",
+        imported.performance_model_scope
+        if imported.performance_model
+        else "No prior performance model was available in the selected source analysis.",
         "",
         "| artifact | source | destination |",
         "| --- | --- | --- |",
@@ -617,6 +768,15 @@ def import_analysis(
         _copy_file(prior_ledger, reuse_dir / PRIOR_KERNEL_LEDGER_NAME, imported)
         imported.kernel_ledger = True
 
+    if discovered.performance_model is not None:
+        _copy_file(
+            discovered.performance_model,
+            reuse_dir / PRIOR_PERFORMANCE_MODEL_NAME,
+            imported,
+        )
+        imported.performance_model = True
+        imported.performance_model_scope = discovered.performance_model_scope
+
     if discovered.profile_dir is not None:
         target = profile_dir or analysis_dir
         has_manifest = (discovered.profile_dir / PROFILE_MANIFEST_NAME).exists()
@@ -670,6 +830,7 @@ __all__ = [
     "MANIFEST_NAME",
     "PRIOR_ROADMAP_NAME",
     "PRIOR_KERNEL_LEDGER_NAME",
+    "PRIOR_PERFORMANCE_MODEL_NAME",
     "PRIOR_ANALYSIS_DIRNAME",
     "REUSE_DIRNAME",
     "DiscoveredAnalysis",

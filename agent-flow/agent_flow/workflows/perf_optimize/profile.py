@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 PROFILE_MANIFEST_NAME = "profile_manifest.json"
+PROFILE_REPORT_NAME = "profiler_report.md"
 PROFILE_SCHEMA_VERSION = 1
 _METHOD_REPORT_SUFFIXES = {"nsys": (".nsys-rep", ".sqlite"), "ncu": (".ncu-rep", ".csv")}
 _RUNTIME_FIELDS = ("serve_command", "benchmark_command", "config", "build", "import_path")
@@ -47,6 +48,7 @@ def validate_profile_manifest(
     *,
     required_methods: Sequence[str] | None = None,
     require_raw: bool = False,
+    require_report: bool = False,
 ) -> dict[str, Any]:
     """Read and validate a completed profiler manifest and its artifacts.
 
@@ -54,6 +56,8 @@ def validate_profile_manifest(
         profile_dir: Directory containing the manifest and capture artifacts.
         required_methods: Configured methods, each of which must record a result.
         require_raw: Require at least one reusable report or offline export.
+        require_report: Require the new profiler's human-readable capture report.
+            Disabled by default so legacy captures remain reusable.
 
     Returns:
         The parsed manifest, including any additional provenance or coverage fields.
@@ -125,11 +129,19 @@ def validate_profile_manifest(
         raise ProfileError(f"Cannot inspect profile artifacts in {profile_dir}: {exc}") from exc
     if require_raw and not captured:
         raise ProfileError("Reanalysis requires usable raw captures; all methods are unavailable")
+    if require_report:
+        try:
+            report = _artifact_path(profile_dir, PROFILE_REPORT_NAME)
+            if not (profile_dir / report).read_text(encoding="utf-8").strip():
+                raise ProfileError(f"Profile report is empty: {PROFILE_REPORT_NAME}")
+        except (OSError, UnicodeError) as exc:
+            raise ProfileError(f"Cannot read {PROFILE_REPORT_NAME}: {exc}") from exc
     return manifest
 
 
 __all__ = [
     "PROFILE_MANIFEST_NAME",
+    "PROFILE_REPORT_NAME",
     "PROFILE_SCHEMA_VERSION",
     "ProfileError",
     "validate_profile_manifest",

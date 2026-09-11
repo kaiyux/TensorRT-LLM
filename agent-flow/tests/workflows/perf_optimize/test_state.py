@@ -223,6 +223,7 @@ def test_valid_stages_expose_one_parallel_pair_stage_and_integrator():
         state_module.STAGE_OPTIMIZER_EVALUATOR,
         state_module.STAGE_INTEGRATOR,
         state_module.STAGE_QA,
+        state_module.STAGE_FINAL_ANALYZER,
         state_module.STAGE_REPORTER,
     )
 

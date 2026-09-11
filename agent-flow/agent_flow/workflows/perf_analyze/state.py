@@ -41,7 +41,8 @@ SCHEMA_VERSION = 1
 #                       marked done) otherwise.
 #   - ``analyzer``    — relaunches the server under nsys and ncu,
 #                       replays the same load, writes
-#                       ``profile_findings.md`` + trace artifacts (and,
+#                       ``profiler_report.md``, ``analysis.md``, and
+#                       ``performance_model.yaml`` + trace artifacts (and,
 #                       with a ``sol`` block, the measured↔SOL
 #                       correlation). Named like perf-optimize's
 #                       diagnosis stage — perf-optimize's analyzer is

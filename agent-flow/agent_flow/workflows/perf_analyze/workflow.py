@@ -17,6 +17,7 @@ from agent_flow import (
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 
+from . import performance_model
 from .progress import (
     ANALYSIS_STAGE,
     ProgressContext,
@@ -182,7 +183,9 @@ class PerfAnalyzeWorkflow:
         self.task_path = workspace / "task.yaml"
         self.benchmark_results_path = workspace / "benchmark_results.md"
         self.sol_projection_path = workspace / "sol_projection.md"
-        self.profile_findings_path = workspace / "profile_findings.md"
+        self.profile_findings_path = workspace / "analysis.md"
+        self.profiler_report_path = workspace / "profiler_report.md"
+        self.performance_model_path = workspace / performance_model.MODEL_FILENAME
         self.report_path = workspace / "performance_report.md"
         self.report_html_path = workspace / "performance_report.html"
         self.progress_path = workspace / "progress.yaml"
@@ -198,6 +201,9 @@ class PerfAnalyzeWorkflow:
                 self.benchmark_results_path,
                 self.sol_projection_path,
                 self.profile_findings_path,
+                self.profiler_report_path,
+                self.performance_model_path,
+                workspace / "profile_findings.md",
                 self.report_path,
                 self.report_html_path,
                 self.progress_path,
@@ -217,6 +223,9 @@ class PerfAnalyzeWorkflow:
                 self.benchmark_results_path,
                 self.sol_projection_path,
                 self.profile_findings_path,
+                self.profiler_report_path,
+                self.performance_model_path,
+                workspace / "profile_findings.md",
                 self.report_path,
                 self.report_html_path,
             ]
@@ -333,13 +342,22 @@ class PerfAnalyzeWorkflow:
             if state.stage == STAGE_ANALYZER:
                 print_rule("[bold cyan]Analyzer[/bold cyan]", log)
                 self._run_analyzer()
-                self._require_stage_outputs(STAGE_ANALYZER, [self.profile_findings_path])
+                self._require_stage_outputs(
+                    STAGE_ANALYZER,
+                    [
+                        self.profile_findings_path,
+                        self.profiler_report_path,
+                        self.performance_model_path,
+                    ],
+                )
+                self._validate_performance_model()
                 state.analyzer_done = True
                 state.stage = STAGE_REPORTER
                 self._checkpoint(state)
 
             if state.stage == STAGE_REPORTER:
                 print_rule("[bold cyan]Reporter[/bold cyan]", log)
+                self._validate_performance_model()
                 self._run_reporter()
                 self._require_stage_outputs(
                     STAGE_REPORTER, [self.report_path, self.report_html_path]
@@ -405,7 +423,7 @@ class PerfAnalyzeWorkflow:
         deliverable. Without this gate the workflow would mark the stage
         ``*_done`` and advance to a downstream stage that has nothing to
         work with (the Reporter once synthesized a verdict against an empty
-        ``profile_findings.md``). Raising here leaves the checkpoint
+        ``analysis.md``). Raising here leaves the checkpoint
         un-advanced (``stage`` still names this role), so simply re-running
         the workflow retries the same stage; ``--clean`` starts over.
         """
@@ -507,19 +525,15 @@ class PerfAnalyzeWorkflow:
             )
         projection_context = ""
         correlation_instruction = ""
-        findings_sections = (
-            "Profiling setup / nsys timeline / ncu kernel analysis / "
-            "Ranked bottleneck hypotheses / Caveats"
-        )
+        findings_sections = "Result / Theoretical performance model / Gap analysis / Next actions"
         if self._sol_enabled():
             projection_context = (
                 f"Also read `{self.sol_projection_path}` (or call "
                 f'`read_latest_progress` with `agent: "projector"`) as '
-                f"**optional context**: the projected SOL ceiling, % of SOL "
-                f"headroom, and compute/memory/launch bound mix can inform "
-                f"how you rank hypotheses, but measured trace evidence always "
-                f"outranks the projection — note where the profile confirms "
-                f"or contradicts it.\n\n"
+                f"the initial theoretical model. Reconcile its assumptions with "
+                f"measured evidence into `performance_model.yaml`, the single "
+                f"current model for every headroom claim and ranked hypothesis. "
+                f"Preserve the original projection as provenance.\n\n"
             )
             correlation_instruction = (
                 f"Then run the **measured↔SOL correlation** per your system "
@@ -533,13 +547,9 @@ class PerfAnalyzeWorkflow:
                 f"against the Projector's "
                 f"`{self.workspace}/sol_work/peaks.json`, writing "
                 f"`{self.workspace}/sol_work/sol.json`. Transcribe the "
-                f"joined per-op table into the findings' **SOL correlation "
-                f"(measured vs ceiling)** section; if a precondition fails, "
+                f"joined per-op evidence into linked derivations supporting "
+                f"**Theoretical performance model**; if a precondition fails, "
                 f"record `Correlation unavailable: <reason>` there instead.\n\n"
-            )
-            findings_sections = (
-                "Profiling setup / nsys timeline / ncu kernel analysis / "
-                "SOL correlation / Ranked bottleneck hypotheses / Caveats"
             )
         self.analyzer(
             f"Workspace: {self.workspace}\n\n"
@@ -579,7 +589,7 @@ class PerfAnalyzeWorkflow:
             f"export the report with `nsys export --type sqlite`, run the "
             f"skill's `run_all.py` single-variant into "
             f"`{self.workspace}/nsys_analysis`, and report the *nsys "
-            f"timeline* section from what it produces — per-iteration time, "
+            f"timeline* evidence from what it produces — per-iteration time, "
             f"the busy/idle rungs, and the compute-absent split "
             f"(launch-starved / blocking / dependency-stalled) — not from "
             f"the `nsys stats` table alone. After that "
@@ -588,7 +598,7 @@ class PerfAnalyzeWorkflow:
             f"`--gpu-metrics-frequency` for per-operator utilization, and the "
             f"backtrace flags for call sites — as separate captures, never "
             f"folded into the timing pass; skip either one gracefully (record "
-            f"the reason under *Caveats*) rather than fabricating it. When "
+            f"the reason in `profiler_report.md`) rather than fabricating it. When "
             f"A2a lands, re-run the skill's `run_all.py` with "
             f"`--metrics-profile` pointed at its sqlite so the utilization "
             f"bullet comes from the pipeline too (it re-reads files only — no "
@@ -616,11 +626,17 @@ class PerfAnalyzeWorkflow:
             + correlation_instruction
             + f"Do **all** of this within this single turn — poll readiness in "
             f"the foreground and do not yield to a background poll; the stage "
-            f"only counts as done once `profile_findings.md` is written.\n\n"
-            f"`Write` your findings to `{self.profile_findings_path}` using "
-            f"the required structure ({findings_sections}), citing the "
-            f"trace files. **Do not** issue the final verdict — rank "
-            f"hypotheses.\n\n"
+            f"only counts as done once all three artifacts below are written.\n\n"
+            f"`Write` `{self.profiler_report_path}` with a short capture summary, "
+            f"runtime identity, operating points, coverage and limitations, and "
+            f"links to raw evidence. `Write` `{self.performance_model_path}` as "
+            f"the single current theoretical best model for `output_throughput` "
+            f"at every configured concurrency (null in scalar mode), even when "
+            f"SOL is disabled. Match workload, runtime and timing scope; record "
+            f"unknown bounds explicitly with the missing evidence and next test. "
+            f"`Write` `{self.profile_findings_path}` with only these four sections "
+            f"({findings_sections}), citing model and trace files. Link detailed "
+            f"derivations and capture notes instead of duplicating them.\n\n"
             f"Before completing your turn, call `append_analyzer_progress` "
             f"with a `summary` of which profilers ran, the trace files "
             f"produced, and your ranked hypotheses with key evidence."
@@ -628,62 +644,48 @@ class PerfAnalyzeWorkflow:
 
     def _run_reporter(self) -> None:
         self._progress_ctx.current_step = 4
-        pareto_section = "Pareto Curve / " if self._curve_mode() else ""
-        if self._sol_enabled():
-            reads = (
-                f"Read `{self.task_path}`, `{self.benchmark_results_path}`, "
-                f"`{self.profile_findings_path}`, and "
-                f"`{self.sol_projection_path}` in full."
-            )
-            weighing = (
-                "weighing the Analyzer's ranked hypotheses against the "
-                "benchmark numbers, the ncu per-kernel analysis (each hot "
-                "kernel's bound class), and the SOL projection (plus the "
-                "per-op correlation table in the findings, when present) — "
-                "the projected headroom sizes the win; if the projection "
-                "declares itself unavailable, say so in the report and "
-                "weigh measured evidence only. Ground each recommendation "
-                "in the nsys timeline + ncu kernel analysis + SOL "
-                "correlation per your system prompt"
-            )
-            sections = (
-                f"(Executive Summary / Configuration / Benchmark Results / "
-                f"{pareto_section}Profiling Findings / Projection vs Measured "
-                f"/ Main Bottleneck / Recommendations)"
-            )
-        else:
-            reads = (
-                f"Read `{self.task_path}`, `{self.benchmark_results_path}`, "
-                f"and `{self.profile_findings_path}` in full."
-            )
-            weighing = (
-                "weighing the Analyzer's ranked hypotheses against the "
-                "benchmark numbers and the ncu per-kernel analysis (each "
-                "hot kernel's bound class); ground each recommendation in "
-                "the nsys timeline + ncu kernel analysis per your system "
-                "prompt"
-            )
-            sections = (
-                f"(Executive Summary / Configuration / Benchmark Results / "
-                f"{pareto_section}Profiling Findings / Main Bottleneck / "
-                f"Recommendations)"
-            )
+        projection_read = (
+            f" Read `{self.sol_projection_path}` as the original model provenance."
+            if self._sol_enabled()
+            else ""
+        )
         self.reporter(
             f"Workspace: {self.workspace}\n\n"
-            f"{reads} Decide the **single "
-            f"dominant** bottleneck using the taxonomy in your system prompt, "
-            f"{weighing}.\n\n"
-            f"`Write` `{self.report_path}` with every required section "
-            f"{sections}, then "
-            f"`Write` `{self.report_html_path}` mirroring it 1:1 "
-            f"(self-contained, interactive, with the required top-kernel "
-            f"share bars — see your system prompt). The "
-            f"Executive Summary and Main Bottleneck must name **exactly one** "
-            f"headline category.\n\n"
+            f"Read `{self.task_path}`, `{self.benchmark_results_path}`, "
+            f"`{self.profiler_report_path}`, `{self.profile_findings_path}`, and "
+            f"`{self.performance_model_path}`. The current theoretical best model "
+            f"is the common basis for every headline and gap claim.{projection_read}\n\n"
+            f"Write `{self.report_path}` with only `## Result`, "
+            f"`## Theoretical performance model`, `## Gap analysis`, and "
+            f"`## Next actions`. Show measured and theoretical best performance, "
+            f"remaining gap, and convergence status for every operating point in "
+            f"one table; state the workload and measurement basis beside it. "
+            f"Explain the dominant supported gap, distinguish hardware limits, "
+            f"scope limits, measurement limits, and unexplained time, and rank "
+            f"next actions by their modeled end-to-end benefit. Link detailed "
+            f"capture reports, derivations and tables instead of repeating them. "
+            f"Write `{self.report_html_path}` mirroring the same content 1:1, "
+            f"self-contained, with charts only when they clarify the model or gap.\n\n"
             f"Before completing your turn, call `append_reporter_progress` "
-            f"with a `summary` of the main bottleneck, the evidence backing "
-            f"it, and confirmation that both files were written."
+            f"with a summary of the model status, largest remaining gap, next "
+            f"action, and confirmation that both files were written."
         )
+
+    def _validate_performance_model(self) -> None:
+        try:
+            model = performance_model.load_model(self.performance_model_path)
+            problems = performance_model.validate_task_model(
+                model,
+                metric="output_throughput",
+                concurrencies=self._curve_points() if self._curve_mode() else [None],
+            )
+            if problems:
+                raise performance_model.ModelError("; ".join(problems))
+        except performance_model.ModelError as exc:
+            raise RuntimeError(
+                f"analyzer stage finished but {self.performance_model_path} "
+                f"failed validation: {exc}"
+            ) from exc
 
     def _task_data(self) -> dict[str, Any]:
         """Parse the resolved ``task.yaml`` on disk, or ``{}`` if unreadable.

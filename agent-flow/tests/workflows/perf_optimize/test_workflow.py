@@ -16,6 +16,7 @@ from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
 from agent_flow.workflows.perf_optimize import (
     kernel_ledger,
     nsys_items,
+    reuse,
     roadmap_schema,
     task_schema,
 )
@@ -167,6 +168,43 @@ def _write_baseline_result_json(baseline_dir, value: float = 100.0) -> None:
     )
 
 
+def _write_unknown_model(path: Path, *, concurrencies, metric="output_throughput") -> None:
+    """A valid incomplete model must never imply convergence in orchestration tests."""
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "model_id": "test-model",
+                "target_metric": metric,
+                "direction": "lower" if metric.endswith("_ms") else "higher",
+                "points": [
+                    {
+                        "concurrency": point,
+                        "operating_point": {
+                            "build": "test-build",
+                            "hardware": "test-gpu",
+                            "workload": "test-load",
+                            "timing_basis": "serving wall time",
+                        },
+                        "measured_value": 100.0,
+                        "theoretical_best_value": None,
+                        "derivation": "Missing production profile prevents a supported bound.",
+                        "assumptions": [],
+                        "evidence": [],
+                        "measurement_evidence": ["baseline/result.json"],
+                        "components": [],
+                        "status": "open",
+                        "unexplained": "Production profile is unavailable.",
+                        "next_test": "Capture the production workload.",
+                    }
+                    for point in concurrencies
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_profile_capture(
     profile_dir: Path,
     *,
@@ -197,6 +235,7 @@ def _write_profile_capture(
         },
         "methods": method_records,
     }
+    (profile_dir / "profiler_report.md").write_text("# Capture summary\n", encoding="utf-8")
     (profile_dir / "profile_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
@@ -272,8 +311,13 @@ def _stub_agents(
 
     def analyzer(state):
         trace.append("analyzer")
-        findings = workflow._analysis_dir(state) / "profile_findings.md"
+        findings = workflow._analysis_dir(state) / "analysis.md"
         findings.write_text("# findings\n", encoding="utf-8")
+        _write_unknown_model(
+            findings.parent / "performance_model.yaml",
+            concurrencies=workflow._curve_points() if workflow._curve_mode() else [None],
+            metric=workflow._optimize_block()["target_metric"],
+        )
         try:
             data = roadmap_schema.load_roadmap(workflow.roadmap_path)
         except roadmap_schema.RoadmapError:
@@ -395,6 +439,17 @@ def _stub_agents(
         workflow.report_html_path.write_text("<html></html>", encoding="utf-8")
         _append({"step": 1, "agent": "reporter", "summary": "r"})
 
+    def final_analyzer(state):
+        workflow.final_analysis_dir.mkdir(parents=True, exist_ok=True)
+        (workflow.final_analysis_dir / "analysis.md").write_text(
+            "# Final model reconciliation\n", encoding="utf-8"
+        )
+        _write_unknown_model(
+            workflow.final_analysis_dir / "performance_model.yaml",
+            concurrencies=workflow._curve_points() if workflow._curve_mode() else [None],
+            metric=workflow._optimize_block()["target_metric"],
+        )
+
     workflow._run_benchmarker = benchmarker
     workflow._run_projector = projector
     workflow._run_profiler = profiler
@@ -403,6 +458,7 @@ def _stub_agents(
     workflow._run_evaluator = evaluator
     workflow.integrator = integrator
     workflow._run_qa = qa
+    workflow._run_final_analyzer = final_analyzer
     workflow._run_reporter = reporter
     return trace
 
@@ -457,7 +513,7 @@ def test_analyzer_failure_resumes_from_preserved_capture(tmp_path, fake_git, fai
             raise RuntimeError("analysis interrupted")
 
     workflow._run_analyzer = broken_analyzer
-    expected = "analysis interrupted" if failure == "exception" else "profile_findings.md"
+    expected = "analysis interrupted" if failure == "exception" else "analysis.md"
     try:
         with pytest.raises(RuntimeError, match=expected):
             workflow.run(str(task))
@@ -1975,8 +2031,13 @@ def test_invalid_roadmap_blocks_advance(tmp_path, fake_git):
 
     def analyzer_with_bad_roadmap(state):
         trace.append("analyzer")
-        findings = workflow._analysis_dir(state) / "profile_findings.md"
+        findings = workflow._analysis_dir(state) / "analysis.md"
         findings.write_text("# findings\n", encoding="utf-8")
+        _write_unknown_model(
+            findings.parent / "performance_model.yaml",
+            concurrencies=workflow._curve_points() if workflow._curve_mode() else [None],
+            metric=workflow._optimize_block()["target_metric"],
+        )
         workflow.roadmap_path.write_text("- not\n- a\n- roadmap\n", encoding="utf-8")
 
     workflow._run_analyzer = analyzer_with_bad_roadmap
@@ -3448,14 +3509,14 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "Projection vs Measured" not in without["reporter"]
     assert "sol_calc.py analyze" not in without["analyzer"]
     assert "SOL correlation" not in without["analyzer"]
-    assert ("## Per-layer theoretical performance model" in without["analyzer"]) is kernel_coverage
+    assert "## Theoretical performance model" in without["analyzer"]
 
     with_sol = _capture_driving_prompts(tmp_path, {**coverage, **_sol_extra(tmp_path)})
     analyzer = with_sol["analyzer"]
     assert "sol_projection.md" in analyzer
     # Context, not evidence: the trace outranks the projection.
-    assert "optional context" in analyzer
-    assert "measured trace evidence always outranks the projection" in analyzer
+    assert "initial theoretical model" in analyzer
+    assert "Reconcile its assumptions with the measured evidence" in analyzer
     # The measured↔SOL correlation runs after profiling: regions from
     # this round's traces, joined against the projector's peaks file,
     # into the findings' dedicated section.
@@ -3463,14 +3524,14 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "internal-perf-sol-analysis" in analyzer
     assert "regions.json" in analyzer
     assert "sol_work/peaks.json" in analyzer
-    assert ("SOL correlation (measured vs ceiling)" in analyzer) is not kernel_coverage
-    assert ("## Per-layer theoretical performance model" in analyzer) is kernel_coverage
+    assert "SOL correlation (measured vs ceiling)" not in analyzer
+    assert "## Theoretical performance model" in analyzer
     assert "sol.json" in analyzer
     if kernel_coverage:
         assert "SOL correlation / " not in analyzer
     assert "Correlation unavailable" in analyzer
     # An exhausted roadmap owes the remaining-gap attribution.
-    assert "Remaining-gap attribution" in analyzer
+    assert "**Gap analysis**" in analyzer
     assert "marked unexplained" in analyzer
     assert "Keep it brief and link to the comparison's explanations and next tests" in analyzer
     optimizer = with_sol["optimizer"]
@@ -3484,8 +3545,9 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "sol_projection.md" in reporter
     # The section slots between Final Verification and the diff summary,
     # and closes with the remaining-gap accountability breakdown.
-    assert "Final Verification / Projection vs Measured / Config & Code Diff" in reporter
-    assert "remaining-gap accountability" in reporter
+    assert "Final Verification / Projection vs Measured / Config & Code Diff" not in reporter
+    assert "## Theoretical performance model" in reporter
+    assert "remaining-gap arithmetic" in reporter
 
     # The evaluator and QA judge on measurements alone — no projection
     # pointer even when the sol block is set.
@@ -3518,14 +3580,15 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
         assert "perf-nsight-compute-analysis" in prompt
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
         assert "server_ncu.ncu-rep" in prompt
-        assert "ncu kernel analysis" in prompt
+        assert "SOL%, bound class, occupancy, and stalls" in prompt
         # Roadmap items are grounded across the analyses, not the
         # timeline alone.
-        assert "nsys timeline / ncu kernel analysis" in prompt
+        assert "nsys timeline / ncu kernel analysis" not in prompt
+        assert "## Gap analysis" in prompt
     # The SOL correlation joins the grounding list only when the
     # projector stage ran.
     assert "nsys timeline / ncu kernel analysis / SOL correlation" not in without
-    assert "nsys timeline / ncu kernel analysis / SOL correlation" in with_sol
+    assert "sol_calc.py analyze" in with_sol
 
 
 def test_optimizer_retry_prompt_distinguishes_auto_reject_from_evaluator_reject(tmp_path):
@@ -3895,7 +3958,8 @@ def test_kernel_coverage_driving_prompts_name_ledger_and_section(tmp_path):
     # The default bounded top-kernel wording is superseded, not repeated.
     assert "on the top nsys kernels: keep the canonical ncu flags" not in analyzer
     reporter = captured["reporter"]
-    assert "Kernel-Level Comparison / Kernel Coverage / Failed Attempts" in reporter
+    assert "`## Theoretical performance model`" in reporter
+    assert "Kernel-Level Comparison / Kernel Coverage / Failed Attempts" not in reporter
     # No round produced a ledger in this bare workspace — the reporter is
     # told to report it unavailable rather than hunt for one.
     assert "none was written" in reporter
@@ -3932,8 +3996,8 @@ def test_reporter_prompt_names_the_highest_round_ledger(tmp_path, fake_git):
         # Numeric round ordering: round_10 outranks round_2.
         assert str(ws / "rounds" / "round_10" / "analysis" / "kernel_ledger.yaml") in prompt
         assert "none was written" not in prompt
-        assert "analysis/profile_findings.md`, beside that ledger" in prompt
-        assert "Theoretical headroom summary" in prompt
+        assert "analysis/analysis.md`, beside that ledger" in prompt
+        assert "Theoretical performance model" in prompt
         assert "If the section is missing, say it is unavailable and link to the ledger" in prompt
     finally:
         workflow.close()
@@ -3969,9 +4033,9 @@ def test_analyzer_receives_latest_numeric_prior_ledger(tmp_path, profile_require
         assert str(previous) in prompt
         assert str(destination) in prompt
         assert "model_revisions" in prompt
-        assert "## Per-layer theoretical performance model" in prompt
-        assert "HTML anchor `per-layer-theoretical-performance-model-round-11`" in prompt
-        assert str(destination.with_name("profile_findings.md")) in prompt
+        assert "## Theoretical performance model" in prompt
+        assert "HTML anchor `theoretical-performance-model-round-11`" in prompt
+        assert str(destination.with_name("analysis.md")) in prompt
         assert "report contract, including on replan/reuse turns" in prompt
         assert "keep standing measurements" in prompt
         assert "SOL correlation (measured vs ceiling)" not in prompt
@@ -4068,7 +4132,7 @@ def test_item_budget_reprofiles_remaining_items(tmp_path, fake_git):
     assert (round_1 / "item_1_opt-001").is_dir()
     assert (round_1 / "item_2_opt-002").is_dir()
     assert (round_1 / "item_3_opt-003").is_dir()
-    assert (ws / "rounds" / "round_2" / "analysis" / "profile_findings.md").is_file()
+    assert (ws / "rounds" / "round_2" / "analysis" / "analysis.md").is_file()
     assert (ws / "rounds" / "round_2" / "item_1_opt-004").is_dir()
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.round_index == 3
@@ -4137,7 +4201,7 @@ def _analyze_workspace(root: Path, *, baseline: bool = True, findings: bool = Tr
             json.dumps({"output_throughput": 100.0, "completed": 1}), encoding="utf-8"
         )
     if findings:
-        (root / "profile_findings.md").write_text("# findings\n", encoding="utf-8")
+        (root / "analysis.md").write_text("# findings\n", encoding="utf-8")
         (root / "nsys_stats.txt").write_text("kern_sum\n", encoding="utf-8")
     return root
 
@@ -4159,7 +4223,7 @@ def test_reanalyze_rebuilds_findings_from_imported_capture_without_profiling(tmp
     def analyze_imported_capture(state):
         modes.append((state.reanalyze_pending, workflow._replan_only(state)))
         original_analyzer(state)
-        (workflow._analysis_dir(state) / "profile_findings.md").write_text(
+        (workflow._analysis_dir(state) / "analysis.md").write_text(
             "# Reanalyzed findings\n", encoding="utf-8"
         )
 
@@ -4183,9 +4247,7 @@ def test_reanalyze_rebuilds_findings_from_imported_capture_without_profiling(tmp
         0
     ]
     analysis_dir = ws / "rounds" / "round_1" / "analysis"
-    assert (analysis_dir / "profile_findings.md").read_text(
-        encoding="utf-8"
-    ) == "# Reanalyzed findings\n"
+    assert (analysis_dir / "analysis.md").read_text(encoding="utf-8") == "# Reanalyzed findings\n"
     analysis_manifest = yaml.safe_load((analysis_dir / "analysis_manifest.yaml").read_text())
     assert analysis_manifest["capture_id"] == "original-capture"
     assert analysis_manifest["imported"] is True
@@ -4429,7 +4491,7 @@ def test_reuse_without_findings_profiles_normally(tmp_path, fake_git):
         "reporter",
     ]
     # The analyzer ran for real (it wrote round 1's findings itself).
-    assert (ws / "rounds" / "round_1" / "analysis" / "profile_findings.md").is_file()
+    assert (ws / "rounds" / "round_1" / "analysis" / "analysis.md").is_file()
 
 
 def test_reuse_of_an_imported_projection_skips_the_projector(tmp_path, fake_git):
@@ -4525,6 +4587,16 @@ def test_reused_analysis_requires_analyzer_owned_kernel_ledger(tmp_path, fake_gi
     if write_ledger:
         assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
         assert state.done is True
+        identity = yaml.safe_load(
+            (workflow.final_analysis_dir / "analysis_manifest.yaml").read_text()
+        )
+        assert identity["capture_id"] is None
+        assert identity["capture_unavailable"]
+        discovered = reuse.discover(ws)
+        assert discovered.performance_model == (
+            workflow.final_analysis_dir / "performance_model.yaml"
+        )
+        assert "without reusable capture provenance" in discovered.performance_model_scope
         ledger = kernel_ledger.load_ledger(
             ws / "rounds" / "round_1" / "analysis" / "kernel_ledger.yaml"
         )
@@ -4568,11 +4640,11 @@ def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path,
     # It still owes the roadmap and the fit check.
     assert str(workflow.roadmap_path) in prompt
     assert "dormant-capability sweep" in prompt
-    assert ("## Per-layer theoretical performance model" in prompt) is kernel_coverage
+    assert "## Theoretical performance model" in prompt
     if kernel_coverage:
-        assert str(ws / "rounds" / "round_1" / "analysis" / "profile_findings.md") in prompt
+        assert str(ws / "rounds" / "round_1" / "analysis" / "analysis.md") in prompt
         assert "report contract, including on replan/reuse turns" in prompt
-        assert "HTML anchor `per-layer-theoretical-performance-model-round-1`" in prompt
+        assert "HTML anchor `theoretical-performance-model-round-1`" in prompt
         assert "prefix with `current-campaign-` if imported text already uses it" in prompt
         assert "kernel_ledger.yaml" in prompt
         assert "SOL correlation (measured vs ceiling)" not in prompt
@@ -5143,18 +5215,18 @@ def test_replan_preserves_model_revisions_from_previous_replan(tmp_path, fake_gi
 def test_unified_model_is_analyzer_owned_and_judges_remain_measured(tmp_path, sol_enabled):
     prompts = _capture_driving_prompts(tmp_path, {**_KC_EXTRA, "sol": {"enabled": sol_enabled}})
     assert "kernel_ledger.yaml" in prompts["analyzer"]
-    assert "## Per-layer theoretical performance model" in prompts["analyzer"]
-    assert "Ranked bottleneck hypotheses" in prompts["analyzer"]
+    assert "## Theoretical performance model" in prompts["analyzer"]
+    assert "## Next actions" in prompts["analyzer"]
     assert "Theoretical model vs silicon" not in prompts["reporter"]
-    assert "Theoretical headroom summary" in prompts["reporter"]
-    assert "Per-layer theoretical performance model" in prompts["reporter"]
+    assert "Theoretical performance model" in prompts["reporter"]
+    assert "Theoretical performance model" in prompts["reporter"]
     assert (
         "Use a relative section link to its actual current-campaign round anchor"
         in prompts["reporter"]
     )
     assert "not an imported section with the same heading" in prompts["reporter"]
     assert "do not reproduce or re-derive them" in prompts["reporter"]
-    assert ("Projection vs Measured" in prompts["reporter"]) is sol_enabled
+    assert "performance_model.yaml" in prompts["reporter"]
     assert "headroom_ledger.yaml" not in prompts["analyzer"]
     assert "headroom_ledger.yaml" not in prompts["reporter"]
     for role in ("evaluator", "qa"):
@@ -5201,11 +5273,12 @@ def test_profiler_driving_prompt_selects_effective_profiling_points(
         assert "otherwise use the scalar prompt count" in replay
 
 
-def test_default_driving_prompts_omit_the_performance_model_contract(tmp_path):
+def test_default_driving_prompts_require_the_performance_model_contract(tmp_path):
     prompts = _capture_driving_prompts(tmp_path)
     assert "kernel_ledger.yaml" not in prompts["analyzer"]
-    assert "## Per-layer theoretical performance model" not in prompts["analyzer"]
-    assert "Theoretical headroom summary" not in prompts["reporter"]
+    assert "## Theoretical performance model" in prompts["analyzer"]
+    assert "performance_model.yaml" in prompts["analyzer"]
+    assert "Theoretical performance model" in prompts["reporter"]
     assert "Theoretical model vs silicon" not in prompts["reporter"]
 
 
@@ -5352,3 +5425,386 @@ def test_unsorted_accepted_curve_cannot_reach_promotion(tmp_path, fake_git, role
     assert fake_git.count("fast_forward") == 0
     assert fake_git.count("commit_all") == (1 if role == "integrator" else 0)
     assert roadmap_schema.load_roadmap(workflow.roadmap_path)["current_best"]["value"] == 100.0
+
+
+@pytest.mark.parametrize("content", [None, " \n"])
+def test_missing_profiler_report_blocks_profiler_checkpoint(tmp_path, fake_git, content):
+    task = _write_task(tmp_path)
+    workflow = Workflow(workspace=tmp_path / "ws")
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+    capture = workflow._run_profiler
+
+    def omit_report(state):
+        capture(state)
+        path = workflow._profile_dir(state) / "profiler_report.md"
+        path.unlink() if content is None else path.write_text(content)
+
+    workflow._run_profiler = omit_report
+    try:
+        with pytest.raises(RuntimeError, match="profiler_report.md"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace == ["benchmarker", "projector", "profiler"]
+    assert state_module.load_state(workflow.state_path).stage == state_module.STAGE_PROFILER
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "wrong_points", "wrong_metric"])
+def test_canonical_model_gate_blocks_analyzer_even_without_sol_or_kernel_coverage(
+    tmp_path, fake_git, fault
+):
+    task = _write_task(tmp_path, {"sol": {"enabled": False}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+    analyze = workflow._run_analyzer
+
+    def invalid_model(state):
+        analyze(state)
+        path = workflow._analysis_dir(state) / "performance_model.yaml"
+        if fault == "missing":
+            path.unlink()
+        elif fault == "malformed":
+            path.write_text("points: invalid\n")
+        else:
+            model = yaml.safe_load(path.read_text())
+            if fault == "wrong_points":
+                model["points"][0]["concurrency"] = 999
+            else:
+                model["target_metric"] = "wrong_metric"
+            path.write_text(yaml.safe_dump(model))
+
+    workflow._run_analyzer = invalid_model
+    try:
+        with pytest.raises(RuntimeError, match="performance_model.yaml"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace == ["benchmarker", "profiler", "analyzer"]
+    state = state_module.load_state(workflow.state_path)
+    assert state.stage == state_module.STAGE_ANALYZER
+    assert state.last_profiled_analysis_dir == ""
+
+
+@pytest.mark.parametrize("budget", [1, 2])
+def test_measurement_limited_empty_roadmap_requests_capture_until_round_budget(
+    tmp_path, fake_git, budget
+):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": budget}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    trace = _stub_agents(workflow, analyzer_items=[[]])
+    analyze = workflow._run_analyzer
+    stop_reasons = []
+    conclude = workflow._conclude_round_loop
+
+    def unresolved_model(state):
+        analyze(state)
+        path = workflow._analysis_dir(state) / "performance_model.yaml"
+        model = yaml.safe_load(path.read_text())
+        model["points"][0]["status"] = "measurement_limited"
+        path.write_text(yaml.safe_dump(model))
+
+    def record_stop(state, reason, log):
+        stop_reasons.append(reason)
+        conclude(state, reason, log)
+
+    workflow._run_analyzer = unresolved_model
+    workflow._conclude_round_loop = record_stop
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace.count("profiler") == budget
+    assert trace.count("analyzer") == budget
+    assert "optimizer" not in trace
+    assert "measurement_limited" in stop_reasons[-1]
+    assert "round budget exhausted" in stop_reasons[-1]
+    assert "converged" not in stop_reasons[-1]
+    assert state_module.load_state(workflow.state_path).done
+
+
+def test_measurement_followup_only_considers_scored_points(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    try:
+        task = _write_task(
+            tmp_path,
+            {"benchmark": {"concurrency": [8, 64]}, "optimize": {"focus_concurrencies": [8]}},
+        )
+        validated = task_schema.load_and_validate_task_yaml(str(task))
+        workflow.task_path.write_text(task_schema.dump_task_yaml(validated))
+        path = tmp_path / "model.yaml"
+        _write_unknown_model(path, concurrencies=[8, 64])
+        model = yaml.safe_load(path.read_text())
+        model["points"][1]["status"] = "measurement_limited"
+        assert not workflow._model_needs_measurement(model)
+        model["points"][0]["status"] = "measurement_limited"
+        assert workflow._model_needs_measurement(model)
+    finally:
+        workflow.close()
+
+
+def test_profiler_uses_latest_model_to_target_missing_measurements(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    recorder = _RecordingAgent()
+    workflow.profiler = recorder
+    try:
+        task = _write_task(tmp_path)
+        validated = task_schema.load_and_validate_task_yaml(str(task))
+        workflow.task_path.write_text(task_schema.dump_task_yaml(validated))
+        previous = workflow.rounds_dir / "round_1/analysis/performance_model.yaml"
+        previous.parent.mkdir(parents=True)
+        _write_unknown_model(previous, concurrencies=[None])
+        model = yaml.safe_load(previous.read_text())
+        model["points"][0]["status"] = "measurement_limited"
+        previous.write_text(yaml.safe_dump(model))
+        workflow._run_profiler(_analyzer_state(workflow.workspace, round_index=1))
+        prompt = recorder.messages[0]
+        assert str(previous) in prompt
+        assert "follow each `next_test`" in prompt
+        assert "even when the build is unchanged" in prompt
+        assert "largest concurrency point" not in prompt
+        assert "profiler_report.md" in prompt
+    finally:
+        workflow.close()
+
+
+@pytest.mark.parametrize("mode", ["serial", "parallel"])
+def test_rejected_pending_item_preserves_model_capture_request(tmp_path, fake_git, mode):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 2, "item_execution": mode}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item()], []],
+        evaluator_verdicts=[("REJECT", "perf_shortfall", -1.0, 99.0)],
+    )
+    analyze = workflow._run_analyzer
+
+    def model_requests_measurement(state):
+        analyze(state)
+        path = workflow._analysis_dir(state) / "performance_model.yaml"
+        model = yaml.safe_load(path.read_text())
+        model["points"][0]["status"] = "measurement_limited"
+        path.write_text(yaml.safe_dump(model))
+
+    workflow._run_analyzer = model_requests_measurement
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace.count("profiler") == 2
+    assert trace.count("analyzer") == 2
+    assert trace.count("evaluator") == 1
+    assert "qa" not in trace
+
+
+def test_final_model_failure_resumes_reconciliation_without_repeating_qa(tmp_path, fake_git):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    workspace = tmp_path / "ws"
+    workflow = Workflow(workspace=workspace)
+    trace = _stub_agents(workflow)
+
+    def missing_final_model(state):
+        trace.append("final_analyzer")
+        (workflow.final_analysis_dir / "analysis.md").write_text("# Incomplete reconciliation\n")
+
+    workflow._run_final_analyzer = missing_final_model
+    try:
+        with pytest.raises(RuntimeError, match="performance_model.yaml"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-2:] == ["qa", "final_analyzer"]
+    assert state_module.load_state(workflow.state_path).stage == state_module.STAGE_FINAL_ANALYZER
+    qa_bytes = workflow.verification_report_path.read_bytes()
+
+    resumed = Workflow(workspace=workspace)
+    resumed_trace = _stub_agents(resumed)
+    reconcile = resumed._run_final_analyzer
+
+    def final_model(state):
+        resumed_trace.append("final_analyzer")
+        reconcile(state)
+
+    resumed._run_final_analyzer = final_model
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert resumed_trace == ["final_analyzer", "reporter"]
+    assert resumed.verification_report_path.read_bytes() == qa_bytes
+    assert resumed._report_performance_model() == (
+        resumed.final_analysis_dir / "performance_model.yaml"
+    )
+    assert state_module.load_state(resumed.state_path).done
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_reporter_resume_revalidates_selected_model(tmp_path, fake_git, accepted):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    workspace = tmp_path / "ws"
+    workflow = Workflow(workspace=workspace)
+    _stub_agents(workflow, analyzer_items=[[_item()] if accepted else []])
+
+    def interrupted_reporter(state):
+        raise RuntimeError("reporter interrupted")
+
+    workflow._run_reporter = interrupted_reporter
+    try:
+        with pytest.raises(RuntimeError, match="reporter interrupted"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    selected = workflow._report_performance_model()
+    assert selected is not None
+    selected.write_text("invalid: model\n")
+    resumed = Workflow(workspace=workspace)
+    trace = _stub_agents(resumed)
+    try:
+        with pytest.raises(RuntimeError, match="performance_model.yaml.*failed validation"):
+            resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert trace == []
+    assert state_module.load_state(resumed.state_path).stage == state_module.STAGE_REPORTER
+
+
+def test_old_reporter_checkpoint_gets_final_model_without_repeating_qa(tmp_path, fake_git):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    workspace = tmp_path / "ws"
+    workflow = Workflow(workspace=workspace)
+    _stub_agents(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(workflow.state_path)
+    state.done = False
+    state.reporter_done = False
+    state_module.save_state(workflow.state_path, state)
+    (workflow.final_analysis_dir / "performance_model.yaml").unlink()
+    resumed = Workflow(workspace=workspace)
+    trace = _stub_agents(resumed)
+    reconcile = resumed._run_final_analyzer
+
+    def final_model(state):
+        trace.append("final_analyzer")
+        reconcile(state)
+
+    resumed._run_final_analyzer = final_model
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert trace == ["final_analyzer", "reporter"]
+
+
+def test_final_analyzer_prompt_reconciles_only_final_evidence_and_reporter_uses_it(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    analyzer = _RecordingAgent()
+    reporter = _RecordingAgent()
+    workflow.analyzer = analyzer
+    workflow.reporter = reporter
+    try:
+        task = _write_task(tmp_path)
+        validated = task_schema.load_and_validate_task_yaml(str(task))
+        workflow.task_path.write_text(task_schema.dump_task_yaml(validated))
+        prior = workflow.rounds_dir / "round_1/analysis/performance_model.yaml"
+        prior.parent.mkdir(parents=True)
+        _write_unknown_model(prior, concurrencies=[None])
+        state = _analyzer_state(workflow.workspace, round_index=1)
+        workflow._run_final_analyzer(state)
+        prompt = analyzer.messages[0]
+        assert str(prior) in prompt
+        assert str(workflow.verification_report_path) in prompt
+        assert "do not edit the roadmap" in prompt
+        assert "do not launch servers, benchmarks, profilers" in prompt
+        assert "never relabel them as final-build captures" in prompt
+        assert "unsupported bounds unknown" in prompt
+        workflow.final_analysis_dir.mkdir(parents=True)
+        final_model = workflow.final_analysis_dir / "performance_model.yaml"
+        _write_unknown_model(final_model, concurrencies=[None])
+        workflow._run_reporter(state)
+        assert str(final_model) in reporter.messages[0]
+        assert str(final_model.with_name("analysis.md")) in reporter.messages[0]
+    finally:
+        workflow.close()
+
+
+def test_imported_model_is_prior_art_and_cannot_satisfy_fresh_analyzer_gate(tmp_path, fake_git):
+    source = _analyze_workspace(tmp_path / "source")
+    _write_unknown_model(source / "performance_model.yaml", concurrencies=[None])
+    task = _write_task(tmp_path, {"sol": {"enabled": False}})
+    workflow = Workflow(workspace=tmp_path / "ws", reuse_analysis=source)
+    _stub_agents(workflow, analyzer_items=[[]])
+    analyze = workflow._run_analyzer
+
+    def omit_current_model(state):
+        analyze(state)
+        (workflow._analysis_dir(state) / "performance_model.yaml").unlink()
+
+    workflow._run_analyzer = omit_current_model
+    try:
+        with pytest.raises(RuntimeError, match="performance_model.yaml"):
+            workflow.run(str(task))
+        prior = workflow.reuse_dir / "prior_performance_model.yaml"
+        assert prior.read_bytes() == (source / "performance_model.yaml").read_bytes()
+        prompt = workflow._performance_model_instruction(
+            _analyzer_state(workflow.workspace, reuse_pending=True)
+        )
+        assert str(prior) in prompt
+        assert "read-only prior art" in prompt
+        assert "capture, build, hardware, workload and timing conditions match" in prompt
+        assert "do not silently replace them with the original SOL projection" in prompt
+    finally:
+        workflow.close()
+
+
+def test_successful_replan_records_standing_capture_provenance_for_future_reuse(tmp_path, fake_git):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 2}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item()], []],
+        evaluator_verdicts=[("REJECT", "perf_shortfall", -1.0, 99.0)],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace.count("profiler") == 1
+    replan = workflow.rounds_dir / "round_2/analysis"
+    identity = yaml.safe_load((replan / "analysis_manifest.yaml").read_text())
+    assert identity["mode"] == "replan"
+    assert identity["new_capture"] is False
+    assert identity["profile_dir"] == "rounds/round_1/profile"
+    found = reuse.discover(workflow.workspace)
+    assert found.performance_model == replan / "performance_model.yaml"
+    assert found.profile_dir == workflow.rounds_dir / "round_1/profile"
+
+
+def test_final_model_records_inherited_capture_and_reuses_corrected_final_scope(tmp_path, fake_git):
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    _stub_agents(workflow)
+    reconcile = workflow._run_final_analyzer
+
+    def final_build_model(state):
+        reconcile(state)
+        path = workflow.final_analysis_dir / "performance_model.yaml"
+        model = yaml.safe_load(path.read_text())
+        model["model_id"] = "final-corrected"
+        model["points"][0]["operating_point"]["build"] = "accepted-final-build"
+        path.write_text(yaml.safe_dump(model))
+
+    workflow._run_final_analyzer = final_build_model
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    identity = yaml.safe_load((workflow.final_analysis_dir / "analysis_manifest.yaml").read_text())
+    assert identity["mode"] == "final_reconciliation"
+    assert identity["new_capture"] is False
+    assert identity["capture_matches_model_build"] is False
+    found = reuse.discover(workflow.workspace)
+    assert found.performance_model == workflow.final_analysis_dir / "performance_model.yaml"
+    assert "final build differs" in found.performance_model_scope
+    assert "earlier build" in found.performance_model_scope

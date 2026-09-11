@@ -9,6 +9,7 @@ import pytest
 
 from agent_flow.workflows.perf_optimize.profile import (
     PROFILE_MANIFEST_NAME,
+    PROFILE_REPORT_NAME,
     ProfileError,
     validate_profile_manifest,
 )
@@ -50,6 +51,34 @@ def test_complete_capture_allows_justified_partial_tool_availability(tmp_path):
         validate_profile_manifest(tmp_path, required_methods=["nsys", "ncu"], require_raw=True)
         == manifest
     )
+
+
+@pytest.mark.parametrize("content", [None, "", " \n\t"])
+def test_fresh_capture_requires_nonempty_profiler_report_but_legacy_reuse_does_not(
+    tmp_path, content
+):
+    manifest = _manifest(tmp_path)
+    _save(tmp_path, manifest)
+    if content is not None:
+        (tmp_path / PROFILE_REPORT_NAME).write_text(content, encoding="utf-8")
+
+    validate_profile_manifest(tmp_path, require_raw=True)
+    with pytest.raises(ProfileError, match="profiler_report.md"):
+        validate_profile_manifest(tmp_path, require_report=True)
+
+
+def test_fresh_capture_accepts_report_and_rejects_report_symlink_escape(tmp_path):
+    root = tmp_path / "profile"
+    manifest = _manifest(root)
+    _save(root, manifest)
+    report = root / PROFILE_REPORT_NAME
+    report.write_text("# Capture coverage\n", encoding="utf-8")
+    validate_profile_manifest(root, require_report=True)
+
+    report.rename(tmp_path / "external.md")
+    report.symlink_to(tmp_path / "external.md")
+    with pytest.raises(ProfileError, match="escapes the capture directory"):
+        validate_profile_manifest(root, require_report=True)
 
 
 def test_all_unavailable_completes_stage_but_cannot_be_reanalyzed(tmp_path):

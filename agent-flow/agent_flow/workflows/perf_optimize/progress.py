@@ -443,15 +443,18 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     append_profiler_progress = _make_summary_tool(
         "profiler",
         "Short human-readable summary: which profilers you ran, the trace "
-        "files and profile_manifest.json produced, runtime provenance, "
+        "files, profiler_report.md and profile_manifest.json produced, runtime provenance, "
         "capture coverage and unavailable passes, and server cleanup.",
     )
     append_analyzer_progress = _make_summary_tool(
         "analyzer",
         "Short human-readable summary: the source capture or standing "
-        "analysis, offline analyses performed, findings and kernel ledger written, "
+        "analysis, offline analyses performed, analysis.md and performance_model.yaml "
+        "updated, current measured-to-theoretical gap and unresolved residual, "
         "and roadmap items added / reordered / marked obsolete with expected "
-        "gains. Name missing evidence that needs a profiler capture.",
+        "gains during planning. In final_analyzer mode, summarize the reconciled "
+        "QA measurements, corrected assumptions and final model status instead; "
+        "do not edit the roadmap. Name missing evidence that needs a profiler capture.",
     )
     append_optimizer_progress = _make_summary_tool(
         "optimizer",
@@ -462,7 +465,9 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     append_reporter_progress = _make_summary_tool(
         "reporter",
         "Short human-readable summary: the cumulative improvement headline, "
-        "the accepted/failed item counts, and confirmation that both "
+        "the reconciled final model used (or latest round model if no changes "
+        "were accepted), current theoretical-best gap and convergence status, consequential "
+        "changes and next actions, and confirmation that both "
         "optimization_report.md and optimization_report.html were written.",
     )
 

@@ -1,6 +1,6 @@
 ---
 name: perf-optimize
-description: Launch and operate this repo's perf-optimize workflow, which iteratively APPLIES TensorRT-LLM serving optimizations — baseline benchmark at one concurrency or a Pareto curve of them (tok/s/user vs tok/s/gpu), analytical SOL projection on by default (via the internal-perf-sol-analysis skill) sizing the headroom the campaign chases, profile-ranked roadmap.yaml (nsys + ncu per-kernel analysis via the perf-nsight-compute-analysis skill), a fixed budget of rounds applying items one at a time gated on measured gain (curve mode uses a Pareto gate; the evaluator accepts, rejects, or pushes back each attempt and nsys-profiles every accept), one final-verification QA benchmark, expected-vs-measured report with Pareto improvement results. Use when the user wants to optimize / improve / speed up a trtllm-serve deployment (throughput, TTFT, TPOT, ITL, e2e latency) or says "run perf-optimize". For diagnosis WITHOUT applying changes, use the perf-analyze workflow instead.
+description: Launch and operate this repo's perf-optimize workflow to apply and verify TensorRT-LLM serving optimizations. Benchmarks configured operating points, maintains performance_model.yaml as the current theoretical-best model and convergence basis, captures nsys/ncu evidence, and evaluates roadmap items against measured gain. Use when the user wants to optimize or speed up trtllm-serve throughput or latency, or says "run perf-optimize". Use perf-analyze for diagnosis without applying changes.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -14,21 +14,36 @@ analytical speed-of-light ceiling; on unless task.yaml sets
 `sol.enabled: false`) → a fixed budget of rounds of
 [(profiler, when fresh captures are needed) → analyzer (offline analysis
 or replan-only) → (optimizer ⇄ evaluator) per roadmap item] → one
-final-verification QA pass → reporter. Every change is gated on code
+final-verification QA pass → final_analyzer → reporter. Every change is gated on code
 quality, functionality, and measured gain vs the last accepted
 measurement — the evaluator's verdict is three-way (APPROVE / REJECT
 terminally / PUSH_BACK for a bounded retry), and every accept is
 profiled under nsys (accept-evidence capture). No agent decides when to
 stop: the loop runs `optimize.max_rounds` rounds unless the roadmap
-runs out of actionable items or the optional improvement target is met.
-The deliverable is `<workspace>/optimization_report.md` (+ `.html`).
+runs out of actionable items with no outstanding measurement request,
+or the optional improvement target is met.
+These stop conditions do not establish convergence. The deliverable is
+`<workspace>/optimization_report.md` (+ `.html`), organized around the
+current `analysis/performance_model.yaml` from the latest completed
+round or final reconciliation.
 
 The profiler owns server lifecycle, nsys/ncu capture, exports, capture
-coverage, and provenance. The analyzer interprets saved evidence and
-authors findings, ledgers, and the roadmap without launching a server or
-GPU profiler. Capture and analysis have separate checkpoints, so a failed
-analysis can resume from a completed capture. Each successful full
+coverage, and provenance, summarized in `profile/profiler_report.md`
+alongside `profile_manifest.json`. The analyzer interprets saved evidence
+and writes `analysis/analysis.md`, updates `performance_model.yaml`, and
+authors the roadmap without launching a server or GPU profiler. The model
+is required with or without the projector or kernel-coverage option, and
+is updated on every turn, including reuse and replan-only turns. Capture
+and analysis have separate checkpoints, so a failed analysis can resume
+from a completed capture. Each successful full
 analysis records its source capture in `analysis/analysis_manifest.yaml`.
+When changes were accepted, independent QA is followed by a checkpointed
+`final_analyzer` stage using the same offline analyzer. It reconciles the
+final measurements and runtime against current theoretical bounds, writes
+`final_verification/analysis/{analysis.md,performance_model.yaml}`, and
+leaves the roadmap unchanged. It uses no GPUs; retrying it does not repeat
+QA. Both outputs must be nonempty and the model must pass validation
+before reporting. The reporter prefers this reconciled final model.
 Use
 `--reuse-analysis <dir> --reanalyze` to reinterpret existing captures in
 round 1 of a fresh campaign;
@@ -121,8 +136,8 @@ than inventing values:
   (baseline, each evaluator attempt, each QA round) runs once per point,
   and the evaluator applies the Pareto gate (mean per-point gain must
   pass the thresholds AND no point may regress beyond the noise floor);
-  the report gains a Pareto Improvement section (x = tok/s/user,
-  y = tok/s/gpu). Benchmark cost multiplies by the point count — keep
+  the report includes the per-point comparison in **Result**, with a
+  Pareto chart when useful (x = tok/s/user, y = tok/s/gpu). Benchmark cost multiplies by the point count — keep
   the list short (~3-5 points), or pair it with a `num_prompts` **list**
   (same length, each entry ≥ its point) so low-concurrency points run
   far fewer prompts than high-concurrency ones; that is what makes a
@@ -145,7 +160,8 @@ than inventing values:
   `max_items_per_round: 3`, `max_attempts_per_item: 3`,
   `accept_fraction: 0.5`, `noise_floor_pct: 1.0` — are sensible. The
   loop **runs the full round budget** (it only ends early when the
-  target is met, or an analyzer turn finds no actionable item), so
+  target is met, or an analyzer turn finds no actionable item and has no
+  outstanding measurement request), so
   `max_rounds × max_items_per_round`
   is what bounds the items a campaign can attempt — 15 with the defaults.
   `optimize.item_execution` defaults to `parallel`; set it to `serial`
@@ -155,7 +171,9 @@ than inventing values:
     after an accept, after a reverted code attempt may have changed
     gitignored build output, or when an older checkpoint cannot prove its
     profile is current. The profiler captures first and the analyzer
-    interprets those saved artifacts. Otherwise it opens replan-only —
+    interprets those saved artifacts. A targeted measurement request also
+    schedules fresh profiling while rounds remain, even with no pending
+    item. Otherwise it opens replan-only —
     the analyzer plans from the standing profile and the round's verdicts without
     touching the GPU. On a config-only plateau `max_rounds` costs almost
     nothing beyond the per-attempt benchmarks; a productive or
@@ -174,104 +192,43 @@ than inventing values:
   `perf-nsight-compute-analysis` skill; drop
   entries to trim the cost of the rounds that pay it) and
   `nsys_iter_range` (default `"100-150"`).
-- `profile.kernel_coverage`: include (an empty mapping enables the
-  defaults `min_share_pct: 0.5`, `coverage_target_pct: 95`) when the
-  user wants the **per-kernel coverage contract** — ncu SOL analysis on
-  every kernel above the share bar (multi-pass capture) and, per
-  kernel, an explicit answer to *can it be eliminated?*, *can it be
-  made faster?*, *can it be fused with its neighbors?* and *can it be
-  overlapped with independent work on another stream?* recorded in a
-  schema-validated
-  `kernel_ledger.yaml` for each fresh analysis, including `--reanalyze`
-  (a roadmap item or an evidence-backed dismissal per question; the orchestrator aborts the
-  round on an incomplete ledger — replan-only rounds run no ncu and are
-  waived — and the report gains a Kernel Coverage accountability section
-  resolving every disposition to its outcome). The four are ordered by
-  how much they presuppose. *Elimination* comes first because it assumes
-  only that the kernel runs today, and a `yes` recovers its whole share
-  rather than a fraction — redundant work, work over padded/masked data,
-  per-step recompute of an invariant, or a fallback kernel firing
-  because a gated fast path did not. *Overlap* catches what faster and
-  fusion structurally cannot: both presuppose the kernel runs *alone*,
-  so a kernel at its bound-class ceiling whose neighbors move only
-  mandatory bytes is legitimately closed on both and can still give back
-  most of its share on an aux stream (it needs CUDA graphs enabled —
-  multi-stream no-ops without them, so mention that if the user is
-  running graphs off). The ledger also records the profiled
-  window's `gpu_busy_pct`, because a kernel's share of GPU time is not
-  its share of wall clock and only the latter can move the target
-  metric. This is the "every kernel elimination/optimization/fusion/
-  overlap possibility considered before done" guarantee; it needs `nsys` +
-  `ncu` in `profile.methods` and adds profiling wall-clock to every
-  round that profiles.
-- `profile.headroom_ledger`: include (an empty mapping enables the
-  defaults `enforcement: warn`, `target_layer: ranking`,
-  `tolerance_pct: 1.0`, `min_share_pct: 0.5`) when the user wants the
-  **headroom ledger** — the campaign's per-part gap accounting at
-  `<workspace>/headroom_ledger.yaml`. Without it, a failed optimization's
-  entire durable payload is `status: failed` plus a number, and the
-  finding it paid a full benchmark for ("the remaining gap is a
-  mapping/layout problem, not a launch-geometry one — do not author
-  launch tuning against these kernels again") survives only as prose in a
-  round directory, so a later round is free to re-propose exactly what
-  was disproved. With it, every round records per part where the gap
-  sits at **both** bracketing focus concurrencies (so a
-  concurrency-localized win is not ranked identically everywhere), which
-  kernels the part is made of, how its gap splits into
-  closed/attributed/open/unexplained, and — the target layer — what a
-  named, buildable implementation would achieve, giving
-  `sol_ms <= target_ms <= measured_ms` and letting `expected_gain_pct` be
-  sized against a real implementation instead of a floor no kernel
-  reaches. Requires the SOL projector and `profile.kernel_coverage`.
-  Two things to tell the user up front: it **warns rather than aborts**
-  by default (raise to `enforcement: error` only once a campaign has run
-  the contract, since a second round-aborting gate over a rich schema is
-  how a campaign dies on bookkeeping), and the target layer is the part
-  most likely to produce confident fiction — offer
-  `target_layer: report_only` if they would rather score its predictions
-  for a campaign before letting them steer GPU time. It costs analyst
-  attention per round plus a second profiled concurrency point.
+- `profile.kernel_coverage`: an empty mapping enables defaults
+  `min_share_pct: 0.5`, `coverage_target_pct: 95`. It requires nsys+ncu
+  coverage of every kernel above the share threshold and evidence-backed
+  answers to elimination, faster execution, fusion and overlap in each
+  round's `analysis/kernel_ledger.yaml`. The ledger is validated after
+  every analyzer turn, including reuse, re-analysis and replan-only turns.
+  Replan uses standing measurements without another capture. Kernel and
+  region models support the central `performance_model.yaml`; full tables
+  remain linked artifacts rather than another report section. GPU-time
+  shares convert through `coverage.gpu_busy_pct` before comparing with
+  wall-clock gain thresholds.
 - `accuracy`: include only if the user has an eval command they want the
   final verification to run at campaign end; omit the block otherwise.
 - `extra_llm_api_options`: starting server tuning YAML, if they have one.
   It seeds `<workspace>/tuning/extra_llm_api_options.yaml`, which the
   optimizer then evolves — the workflow always passes the workspace copy
   to `trtllm-serve`.
-- `sol`: **the analytical SOL-projection stage is on by default**, so
-  omit this block unless the user wants to turn it off or hand the
-  skill a hint. Enabled, it produces `sol_projection.md` +
-  `sol_work/peaks.json` after the
-  baseline; the analyzer ranks roadmap items against the projected
-  headroom, correlates each round's per-op measurements against the
-  ceiling via the skill's `sol_calc.py analyze` into the findings'
-  *SOL correlation* section, and owes a remaining-gap attribution
-  whenever it exhausts
-  the roadmap with headroom left, the optimizer aims each item's
-  realization at the binding ceiling, and the report gains a
-  Projection vs Measured headroom-captured section closed by a
-  remaining-gap accountability breakdown. Write `sol: {enabled: false}`
-  when the user explicitly does not want it — e.g. to save the extra
-  stage's wall-clock, or when the SOL skill is unavailable. The
-  projector follows the
-  `internal-perf-sol-analysis` skill (from the `trtllm-agent-toolkit`
-  plugin — an `internal-` skill, so open-source builds strip it;
-  install a build that has it for the full methodology). Without it the
-  projector falls back to `perf-analysis` and degrades honestly: a
-  coarse ceiling grounded on named sources rather than the peaks
-  calculator, no peaks file, and no per-round correlation.
-  It never recalls a hardware peak. Every field is
-  optional — `enabled` gates the stage (default `true`) and `gpu` is
-  the part-name hint for the skill's peaks calculator. The stage needs no
-  GPU (with local GPUs it additionally measures the skill's latency
-  constants) and runs once per campaign — the ceiling is a property of
-  hardware + model + operating point, not of the applied optimizations.
-  Where a spec or a mapping stays uncertain, the projector is pointed at
-  the `internal-glean-search` skill / `internal-glean-specialist`
-  subagent as read-only reference, used only if that skill or subagent is
-  installed in the session. The hosted-MCP wiring this skill used to
-  document (`--glean-mcp-url`, `$PERF_OPTIMIZE_GLEAN_MCP_URL`) is gone: the
-  workflow ships from TensorRT-LLM now, and upstream replaced the MCP
-  server with that skill. Passing the flag would be a CLI error.
+- `sol`: the initial SOL projection runs by default. Set
+  `sol: {enabled: false}` to skip the projector or use `gpu` as a hardware
+  part-name hint. The projector writes `sol_projection.md` and available
+  `sol_work/peaks.json` inputs once. These preserve the initial derivation;
+  subsequent comparisons and ranking use the analyzer's current
+  `performance_model.yaml`. The projector follows
+  `internal-perf-sol-analysis` when installed, otherwise `perf-analysis`
+  with named hardware sources. Missing peaks or latency measurements
+  remain explicit. Disabling the projector does not disable the model.
+
+The current model pairs measured and theoretical performance at every
+benchmark point on the same workload, runtime, timing window and statistic.
+It explains physical costs, recoverable implementation costs, scope
+constraints, measurement limitations and unresolved residual separately.
+Unknown theory stays explicit with a next measurement. Kernel sums,
+decode critical paths and serving throughput need an explicit derivation
+before comparison. A failed experiment cannot alone relax the theoretical
+bound, and a below-noise-floor gain cannot prove a hardware limit.
+Convergence concerns all focus points (all points when no subset is set),
+while every configured point remains represented in the model.
 
 ## 3. Launch (long-running — background it)
 
@@ -299,10 +256,15 @@ monitor.
 - `--reuse-analysis <dir>` starts a fresh run **at the optimize stage**
   by importing a previous `perf-analyze` workspace or `perf-optimize`
   campaign workspace: its baseline report (+ result JSONs), SOL
-  projection (+ `sol_work/`), and newest profile findings (+ traces,
+  projection (+ `sol_work/`), current model, and newest analysis (+ traces,
   `kernel_ledger.yaml`) are copied in, the benchmarker/projector are
   skipped, and round 1's analyzer plans from the imported evidence
-  without launching a server or a profiler. Rounds 2+ profile normally.
+  without launching a server or a profiler. It writes the local current
+  model and `analysis.md`; legacy `profile_findings.md` remains readable
+  as import provenance. The latest corrected source model is kept as
+  `reused_analysis/prior_performance_model.yaml`, preserving revisions
+  and source measurement identity. It is read-only prior evidence; round 1
+  must still write a new current model. Rounds 2+ profile normally.
   Reach for this when the user has *just* run `perf-analyze` on the same
   deployment, or is starting a follow-up campaign on a machine whose
   baseline has not changed — it saves the two most expensive stages.
@@ -336,22 +298,24 @@ Poll the workspace (and the launch log) rather than waiting silently:
 - `roadmap.yaml` — the ranked plan; watch item `status` and measured
   gains vs `expected_gain_pct`; `current_best` tracks the last accepted
   measurement.
-- `headroom_ledger.yaml` (with a `profile.headroom_ledger` block) — the
-  per-part accounting. Ranking its parts by `unexplained_ms` is the
-  campaign's real work queue: it is where you see headroom nothing has
-  attacked, and the spent levers accumulating against the parts that
-  have been.
+- The latest `rounds/round_<n>/analysis/performance_model.yaml` — the
+  current measured-to-theoretical comparison, model revisions,
+  evidence-backed costs and unresolved residual per point. Status is `open`, `converged`,
+  `measurement_limited`, `scope_limited` or `model_invalid`. Outstanding
+  targeted measurement requests persist across rejected optimization
+  items and cause another profiler turn while rounds remain.
 - `baseline/benchmark_results.md` (and `sol_projection.md` right after
   it unless `sol.enabled: false`), then per-round
-  `rounds/round_<n>/` (`profile/profile_manifest.json` and raw captures,
+  `rounds/round_<n>/` (`profile/profiler_report.md`,
+  `profile/profile_manifest.json` and raw captures,
   `analysis/analysis_manifest.yaml` linking the source capture,
-  `analysis/profile_findings.md` and offline derivations/ledgers,
+  `analysis/analysis.md` and offline derivations/ledgers,
   `item_<j>_<id>/attempt_<k>/` — accepted attempts also grow a
   `profile/` nsys capture), and at the end
-  `final_verification/verification_report.md`. A round whose standing
-  runtime profile is still current writes a short replan note in place
-  of a profiling report, and no traces — that is the replan-only mode,
-  not a stalled analyzer.
+  `final_verification/verification_report.md` followed by
+  `final_verification/analysis/{analysis.md,performance_model.yaml}` when
+  changes were accepted. A round with current evidence and no outstanding
+  capture request updates analysis and its model without new traces.
 - `git -C <trtllm_repo_path> log --oneline` on the `perf-optimize/*`
   branch — one commit per accepted item.
 
@@ -360,33 +324,33 @@ and re-run the command to resume (omit `--reanalyze` on resume).
 
 ## 5. Wrap up
 
-When the run finishes (round budget spent, roadmap exhausted, or the
-improvement target met), report to the user from
-`optimization_report.md` / `.html`:
+Use the four sections of `optimization_report.md` / `.html`:
 
-- the verified cumulative improvement vs baseline on the target metric
-  (from the final verification's independent benchmark),
-- the optimization trajectory (baseline → each accepted item → final
-  verification; the HTML renders it as a line chart),
-- expected-vs-measured per applied item, failed attempts with reasons,
-- the kernel-level before/after comparison — the "after" side comes from
-  the **last accepted attempt's `profile/`** (the accept-evidence nsys
-  capture the evaluator takes on every APPROVE; rejects are reverted, so
-  it always reflects the final accepted state), else the last round's
-  profile,
-- final config (`tuning/extra_llm_api_options.accepted.yaml`) and the
-  code diff on the `perf-optimize/*` branch,
-- when the projector ran: the Projection vs Measured section — baseline
-  vs final % of SOL, i.e. how much of the analytically projected
-  headroom the campaign captured, which bound class the remaining gap
-  sits in, and the remaining-gap accountability breakdown (every part
-  of the gap `closed` / `infeasible: <constraint>` / `untried` /
-  `unexplained`, each verdict citing evidence — relay this to the user:
-  it is the answer to "why does the campaign end here?"),
-- remaining roadmap items as future work.
+1. **Result** — final verified gain, benchmark provenance, workflow stop
+   reason and model convergence status.
+2. **Theoretical performance model** — current measured versus theoretical
+   best at every point, the common timing basis and essential assumptions.
+3. **Gap analysis** — the largest remaining costs, evidence for physical
+   or scope limits, measurement limitations and explicit unresolved residual.
+4. **Changes and next actions** — consequential accepted changes or failed
+   experiments and the highest-value next optimization or measurement.
 
-Point the user at the branch + accepted config for productionizing
-(cherry-pick / PR is theirs to drive — the workflow never pushes).
+Analyzer `analysis.md` files, including final reconciliation, use the
+same first three sections and end with **Next actions**.
+
+Keep commands, full configurations, kernel tables, detailed arithmetic and
+attempt histories in linked artifacts. Use the current model for the
+remaining-gap headline, preferring
+`final_verification/analysis/performance_model.yaml` after reconciliation;
+the initial `sol_projection.md` is provenance. Only a capture matching the final accepted runtime can explain final-state
+behavior. The final analyzer must reconcile QA measurements before the
+reporter runs. Any missing evidence or unresolved incompatibility stays
+explicit in the final model and prevents an unsupported convergence claim.
+An empty roadmap or spent budget alone cannot establish convergence.
+
+Point the user at the accepted branch and
+`tuning/extra_llm_api_options.accepted.yaml` for the resulting changes.
+The workflow never pushes.
 
 ## Pitfalls
 

@@ -297,37 +297,36 @@ def test_ncu_run_targets_top_nsys_kernels_with_bounded_capture():
     assert "not measurements" in prompt
 
 
-def test_findings_contract_carries_the_ncu_section():
+def test_findings_contract_preserves_ncu_diagnostics_in_supporting_artifacts():
     block = _norm(PROFILE_FINDINGS_CONTRACT)
-    assert "## ncu kernel analysis" in block
-    # Per-kernel classification per the skill's thresholds, degrading
-    # honestly when ncu did not run.
+    assert "Supporting ncu kernel analysis artifacts" in block
     assert "bound class" in block
     assert "ncu unavailable" in block
+    assert "## ncu kernel analysis" not in block
 
 
-def test_findings_contract_synthesizes_the_three_analyses():
+def test_findings_contract_synthesizes_available_and_missing_evidence():
     block = _norm(PROFILE_FINDINGS_CONTRACT)
-    assert "three evidence pillars" in block
-    for pillar in ("nsys timeline", "ncu kernel analysis", "SOL correlation"):
-        assert pillar in block, pillar
-    # A pillar that did not run is named as missing, never skipped.
-    assert "never silently skipped" in block
+    assert "reconcile **nsys timeline**, **ncu kernel analysis**, and **SOL correlation**" in block
+    assert "For the largest gaps" in block
+    assert "corroborating, contradicting and missing evidence" in block
+    assert "ncu unavailable: <reason>" in block
+    assert "timeline analysis unavailable: <reason>" in block
 
 
 def test_reporter_grounds_recommendations_in_all_three_analyses():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Ground every recommendation in the three analyses" in prompt
-    assert "ncu kernel analysis" in prompt
-    # The fix must match the targeted kernel's measured bound class.
-    assert "bound class" in prompt
+    assert "nsys timeline, ncu kernel and current-model/SOL evidence" in prompt
+    assert "support each action" in prompt
+    assert "including missing or contradictory evidence" in prompt
+    assert "Memory-bandwidth-bound" in prompt
 
 
 def test_prompts_tell_agents_not_to_improvise_flags():
     # Both serving roles are steered to the canonical template rather than
     # figuring the command out on their own.
-    assert "do not improvise" in BENCHMARKER_SYSTEM_PROMPT
-    assert "do not improvise" in ANALYZER_SYSTEM_PROMPT
+    for prompt in (BENCHMARKER_SYSTEM_PROMPT, ANALYZER_SYSTEM_PROMPT):
+        assert "keep other flags as shown" in prompt
 
 
 def test_no_prompt_references_removed_builtin_tools():
@@ -372,27 +371,23 @@ def test_taxonomy_drops_blanket_cuda_graph_prescription():
 
 def test_taxonomy_warns_cuda_graphs_do_not_remove_host_prep():
     taxonomy = _norm(BOTTLENECK_TAXONOMY)
-    assert "CUDA graphs do not remove this" in taxonomy
+    assert "CUDA graphs do not remove host prep outside replay" in taxonomy
     # The host-prep sub-cause is anchored to a concrete named phase.
     assert "_prepare_inputs" in taxonomy
 
 
 def test_reporter_ranks_recommendations_by_bottleneck_share():
-    # Recommendations must be ranked by how much of the measured dominant
-    # cost each fix removes, not by ease of implementation.
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "share of the measured bottleneck" in prompt
-    assert "#1 recommendation must attack" in prompt
+    assert "modeled excess removed or uncertainty resolved" in prompt
+    assert "first action targets the dominant supported cost" in prompt
+    assert "or measures its unresolved cause" in prompt
 
 
 def test_reporter_warns_cuda_graphs_are_not_the_top_host_prep_fix():
-    # A cheaper config fix (CUDA graphs) that only touches a smaller
-    # component must not be ranked #1 when host prep is the dominant cost.
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "remove host input-prep" in prompt
-    assert "does not belong at #1" in prompt
-    # And the rigor rules reinforce impact-based ranking.
-    assert "Rank recommendations by impact on the dominant cost" in prompt
+    assert "CUDA graphs do not remove host prep outside replay" in prompt
+    assert "_prepare_inputs" in prompt
+    assert "modeled excess removed or uncertainty resolved" in prompt
 
 
 def test_slurm_bundle_preserves_canonical_templates():
@@ -462,8 +457,8 @@ def test_projector_prompt_builds_on_sol_skill():
     # and graceful degradation when the skill is not installed.
     assert "internal-perf-sol-analysis" in prompt
     assert "trtllm-agent-toolkit:internal-perf-sol-analysis" in prompt
-    assert "`Skill` tool" in prompt
-    assert "not available in this environment" in prompt
+    assert "with `Skill`" in prompt
+    assert "If the skill is unavailable" in prompt
 
 
 # --------------------------------------------------------------------------- #
@@ -487,12 +482,12 @@ def test_projection_setup_template_states_no_methodology_as_fact():
         ("full", PROJECTOR_SYSTEM_PROMPT),
         ("reduced", build_projector_prompt("reduced")),
     ):
-        assert "- Method: <" in prompt, label
-        assert "- Peaks file: <" in prompt, label
+        assert "- Method/sources: <" in prompt, label
+        assert "- Peaks/latencies: <" in prompt, label
         assert "- Method: internal-perf-sol-analysis" not in prompt, label
         assert "- Peaks file: sol_work/peaks.json" not in prompt, label
         # The environment without a calculator has something to write.
-        assert "not written: no peaks" in prompt, label
+        assert "or reason unavailable" in prompt, label
 
 
 def test_full_methodology_leaves_the_projector_prompt_untouched():
@@ -527,7 +522,7 @@ def test_fallback_block_names_perf_analysis_and_withholds_the_peaks_file():
     """
     block = _norm(SOL_METHODOLOGY_FALLBACK)
     assert "`perf-analysis`" in block
-    assert "Skip `sol_work/peaks.json`" in block
+    assert "skip `sol_work/peaks.json`" in block
     # It degrades the projection; it never invents one.
     assert "not calculator-resolved" in block
     assert "Never fabricate." in block
@@ -545,7 +540,7 @@ def test_projector_prompt_resolves_peaks_and_latencies_via_skill():
     # recorded as unmeasured (never guessed) when one is not — this
     # stage may run on a login node, which the skill cannot know.
     assert "measure_channels.py" in prompt
-    assert "do **not** guess" in prompt
+    assert "Never guess α" in prompt
     assert "unmeasured" in prompt
 
 
@@ -559,7 +554,7 @@ def test_projector_prompt_derives_sol_ceiling_via_skill_model():
     assert "proj (realistic)" not in prompt
     assert "derate" not in prompt.lower()
     # The arithmetic must still be reproducible from the report.
-    assert "numbers substituted" in prompt
+    assert "linked reproducible formulas/commands" in prompt
 
 
 def test_projector_prompt_never_fabricates_measured_inputs():
@@ -567,7 +562,7 @@ def test_projector_prompt_never_fabricates_measured_inputs():
     # ``sol_calc.py analyze`` correlates measured per-op times; the
     # Analyzer has not run yet, so there are none — and script inputs
     # are never invented to force a run.
-    assert "never fabricate an input" in prompt
+    assert "Do not invent measured_ms rows" in prompt
     assert "measured_ms" in prompt
 
 
@@ -580,7 +575,7 @@ def test_projector_prompt_speaks_skill_vocabulary():
     # The ceiling models kernel execution + per-launch latency only — a
     # gap beyond it points at host/scheduling costs it does not price.
     assert "kernel execution plus per-launch latency only" in prompt
-    assert "request queueing" in prompt
+    assert "scheduler/host prep, queueing and dynamic-batching" in prompt
 
 
 def test_projector_prompt_names_the_internal_knowledge_route():
@@ -588,7 +583,7 @@ def test_projector_prompt_names_the_internal_knowledge_route():
     assert "internal-glean-search" in prompt
     assert "internal-glean-specialist" in prompt
     # Named as optional -- the session may not have either.
-    assert "if that skill/subagent exists" in _norm(prompt)
+    assert "`internal-glean-specialist` if available" in _norm(prompt)
 
 
 def test_projector_prompt_ships_no_hosted_endpoint():
@@ -600,9 +595,9 @@ def test_projector_prompt_ships_no_hosted_endpoint():
 
 def test_projector_prompt_keeps_internal_knowledge_consultative():
     prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
-    assert "consultative" in prompt
+    assert "Internal knowledge (reference only)" in prompt
     # Projected numbers must be reproducible from written-down arithmetic.
-    assert "reproducible from the arithmetic" in prompt
+    assert "reproducible from named sources and recorded arithmetic" in prompt
 
 
 def test_projector_prompt_degrades_honestly():
@@ -613,48 +608,46 @@ def test_projector_prompt_degrades_honestly():
 
 def test_projector_prompt_template_sections():
     for header in (
+        "## Result",
         "## Projection setup",
-        "## Projected SOL ceiling",
-        "## Measured vs SOL",
-        "## Headroom & bound mix",
-        "## Guidance for optimization",
-        "## Caveats",
+        "## Initial theoretical performance model",
+        "## Open questions",
     ):
         assert header in PROJECTOR_SYSTEM_PROMPT, header
+    assert "## Measured vs SOL" not in PROJECTOR_SYSTEM_PROMPT
+    assert "## Headroom & bound mix" not in PROJECTOR_SYSTEM_PROMPT
 
 
 def test_sol_bundle_extends_analyzer_and_reporter_only():
     base = build_perf_analyze_prompts(include_sol=False)
     sol = build_perf_analyze_prompts(include_sol=True)
-    assert "SOL projection as context" in sol.analyzer
-    assert "Projection vs Measured" in sol.reporter
+    assert "Update the current model from SOL evidence" in sol.analyzer
+    assert "Use the current theoretical model" in sol.reporter
     # The projection guidance never leaks into the other roles or the
     # un-augmented bundle.
     assert sol.benchmarker == base.benchmarker
     assert sol.projector == base.projector
-    assert "SOL projection as context" not in base.analyzer
-    assert "Projection vs Measured" not in base.reporter
+    assert "Update the current model from SOL evidence" not in base.analyzer
+    assert "Use the current theoretical model" not in base.reporter
 
 
-def test_sol_reporter_guidance_weighs_and_degrades():
+def test_sol_reporter_guidance_uses_current_scope_and_preserves_unknowns():
     block = _norm(SOL_REPORTER_GUIDANCE)
-    # The projection must be weighed in the verdict and recommendations.
-    assert "Main Bottleneck" in block
-    assert "Recommendations" in block
-    # The section speaks the skill's vocabulary.
-    assert "% of SOL" in block
-    # Measured evidence wins conflicts; unavailability is stated honestly.
-    assert "measured evidence wins" in block
-    assert "Projection unavailable" in block
-    assert "never fabricate" in block
+    assert "single per-point comparison" in block
+    assert "compatible builds/workloads/timing scopes" in block
+    assert "current bound is unavailable, display unknown" in block
+    assert "required next test" in block
+    assert "do not fall back to a superseded initial bound" in block
+    assert "Large model discrepancies do not establish host/scheduler overhead" in block
 
 
 def test_sol_analyzer_context_is_context_not_evidence():
     block = _norm(SOL_ANALYZER_CONTEXT)
-    assert "context, not evidence" in block
-    assert "outranks the projection" in block
-    # Hypothesis ranking keys off the skill's metrics.
-    assert "% of SOL" in block
+    assert "context, not a measurement or a permanently fixed ceiling" in block
+    assert "checking shapes and runtime facts against the selected capture" in block
+    assert "Record changes in assumptions with evidence" in block
+    assert "A failed optimization alone does not weaken a bound" in block
+    assert "Missing facts stay unknown with next_test" in block
 
 
 # --------------------------------------------------------------------------- #
@@ -668,28 +661,32 @@ def test_sol_analyzer_context_is_context_not_evidence():
 
 def test_projector_prompt_persists_peaks_for_the_analyzer():
     prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
-    assert "Persist the machine-readable peaks file" in prompt
+    assert "Persist calculator output and any measured latencies" in prompt
     assert "sol_work/peaks.json" in prompt
     # And the required-output template records the path — as the
     # placeholder it is, so a run without a calculator does not assert a
     # file it never wrote (see the template guard above).
-    assert "Peaks file: <sol_work/peaks.json" in prompt
+    assert "Peaks/latencies: <sol_work/peaks.json" in prompt
 
 
-def test_findings_contract_reserves_the_sol_correlation_section():
+def test_findings_contract_requires_current_model_even_without_sol():
     block = _norm(PROFILE_FINDINGS_CONTRACT)
-    assert "## SOL correlation (measured vs ceiling)" in block
-    # Reserved, not required: without a sol block the section is omitted.
-    assert "Omit the section entirely otherwise" in block
+    assert "replan, reuse and SOL-disabled turns" in block
+    assert "`performance_model.yaml`" in block
+    assert "model drives analysis, experiment priority and convergence" in block
+    assert "kernel ledger and exports support it" in block
+    assert "## SOL correlation (measured vs ceiling)" not in block
 
 
 def test_analyzer_composes_shared_findings_contract_and_taxonomy():
-    # The perf-analyze analyzer is perf-optimize's analyzer minus the
-    # roadmap: both compose the same findings contract and taxonomy.
-    assert "Required findings structure" in ANALYZER_SYSTEM_PROMPT
+    assert "Current theoretical performance model and analysis report" in ANALYZER_SYSTEM_PROMPT
     assert "## Bottleneck taxonomy" in ANALYZER_SYSTEM_PROMPT
-    # The verdict still belongs to the Reporter.
-    assert "do not** issue the final verdict" in ANALYZER_SYSTEM_PROMPT
+    assert "Apply no optimizations" in ANALYZER_SYSTEM_PROMPT
+    assert "this workflow has no roadmap" in ANALYZER_SYSTEM_PROMPT
+    assert "Capture record (`profiler_report.md`)" in ANALYZER_SYSTEM_PROMPT
+    assert (
+        "Keep model tables, rankings and recommendations in `analysis.md`" in ANALYZER_SYSTEM_PROMPT
+    )
 
 
 def test_sol_correlation_runs_the_skill_calculator_on_structural_facts():
@@ -710,15 +707,15 @@ def test_sol_correlation_runs_the_skill_calculator_on_structural_facts():
     assert "never invent params or `measured_ms` rows" in block
     assert "check-recipe" in block
     # The joined table lands in the findings section, degrading honestly.
-    assert "## SOL correlation (measured vs ceiling)" in block
+    assert "Keep `sol.json` as a supporting artifact" in block
+    assert "do not paste the full table into `analysis.md`" in block
     assert "Correlation unavailable" in block
 
 
 def test_sol_analyzer_context_carries_correlation_and_workspace_paths():
     block = _norm(SOL_ANALYZER_CONTEXT)
     assert "sol_calc.py analyze" in block
-    # perf-analyze placement: artifacts sit next to the projector's peaks.
-    assert "under `<workspace>/sol_work/`" in block
+    assert "Keep regions.json, sol.json and sol_recipes/ in <workspace>/sol_work/" in block
 
 
 def test_correlation_is_gated_on_the_sol_block():
@@ -728,11 +725,11 @@ def test_correlation_is_gated_on_the_sol_block():
     assert "sol_calc.py analyze" in sol.analyzer
 
 
-def test_sol_reporter_guidance_lifts_the_correlation_table():
+def test_sol_reporter_guidance_links_correlation_without_a_second_comparison():
     block = _norm(SOL_REPORTER_GUIDANCE)
-    assert "SOL correlation (measured vs ceiling)" in block
-    assert "per-op table" in block
-    # Absence degrades honestly rather than substituting.
+    assert "latest `performance_model.yaml` + `analysis.md`" in block
+    assert "Do not add Projection vs Measured, SOL correlation" in block
+    assert "Do not mix its old ceiling with a current kernel floor or practical rate" in block
     assert "unavailable" in block
 
 
@@ -743,8 +740,8 @@ def test_slurm_and_sol_bundles_compose():
     for flag in (*_BENCHMARK_CANONICAL_FLAGS, *_NSYS_CANONICAL_FLAGS, *_NCU_CANONICAL_FLAGS):
         assert flag in both.analyzer, flag
     # Both SOL extensions land on top.
-    assert "SOL projection as context" in both.analyzer
-    assert "Projection vs Measured" in both.reporter
+    assert "Update the current model from SOL evidence" in both.analyzer
+    assert "Use the current theoretical model" in both.reporter
     # The projector stays un-augmented (no server work; under Slurm it
     # runs on the login node and notes unmeasured latency constants).
     assert "slurm-environment" not in both.projector
@@ -765,25 +762,25 @@ def test_serving_prompts_load_optimization_casebook():
         ("analyzer", ANALYZER_SYSTEM_PROMPT),
     ):
         assert "perf-optimization-casebook" in prompt, name
-        assert "`Skill` tool" in prompt, name
+        assert "with `Skill`" in prompt, name
 
 
 def test_reporter_prompt_does_not_own_casebook_consultation():
     # The user scoped this to the two serving roles; the reporter is
     # unchanged (it does not load servers or the casebook consultation
     # block). Guards against the shared block leaking into the reporter.
-    assert "Ground your analysis in the optimization casebook" not in REPORTER_SYSTEM_PROMPT
+    assert CASEBOOK_CONSULTATION not in REPORTER_SYSTEM_PROMPT
 
 
 def test_casebook_consultation_is_read_only_and_degrades_gracefully():
     block = _norm(CASEBOOK_CONSULTATION)
     # Consulted as read-only reference, never applied at this stage.
-    assert "read-only reference material only" in block
-    assert "apply optimizations" in block  # part of the "do not apply ..." constraint
+    assert "read-only references" in block
+    assert "do not apply changes or run extra experiments" in block
     # Names the fully-qualified skill so a plugin-namespaced install resolves.
     assert "trtllm-agent-toolkit:perf-optimization-casebook" in block
     # No hard dependency: a missing skill must not block the run.
-    assert "not available in this environment" in block
+    assert "Note unavailability once" in block
 
 
 def test_slurm_prompts_keep_casebook_consultation():
@@ -801,27 +798,27 @@ def test_slurm_prompts_keep_casebook_consultation():
 # --------------------------------------------------------------------------- #
 
 
-def test_html_companion_chart_is_self_contained():
+def test_html_companion_preserves_compact_offline_content():
     block = _norm(HTML_COMPANION)
-    assert "Top-kernel share bars" in block
-    # No chart library: data embedded inline, rendered to inline SVG.
-    assert "no chart library" in block
-    assert "inline SVG" in block
-    # The chart never diverges from the table it plots.
-    assert "the table is the source of truth" in block
-    assert "charts that plot exactly the numbers in the tables" in block
+    assert "self-contained offline HTML" in block
+    assert "same four sections" in block
+    assert "inline CSS" in block
+    assert "no external CDN/fonts/assets" in block
+    assert "optional inline SVG" in block
+    assert "exactly the table data" in block
 
 
-def test_html_companion_chart_degrades_without_nsys_table():
-    # nsys can be skipped (profile.methods, missing knob) — the chart is
-    # then omitted, never charted from invented numbers.
+def test_html_companion_omits_unknown_model_points():
     block = _norm(HTML_COMPANION)
-    assert "omit the chart" in block
+    assert "omitting unknown points" in block
+    assert "when the measured curve is available" in block
+    assert "never substitute the initial projection" in block
 
 
-def test_reporter_prompt_carries_the_chart_contract():
+def test_reporter_prompt_carries_the_compact_chart_contract():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Top-kernel share bars" in prompt
+    assert "The current model comparison is the primary visual" in prompt
+    assert "No separate trajectory or top-kernel charts" in prompt
 
 
 # --------------------------------------------------------------------------- #
@@ -852,33 +849,36 @@ def test_benchmarker_carries_the_derived_metrics_reference():
     assert "num_gpus" in prompt
 
 
-def test_analyzer_profiles_the_largest_concurrency_point():
+def test_analyzer_discloses_the_limits_of_largest_point_profiling():
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    assert "the largest concurrency" in prompt
-    assert "Do not profile the other points" in prompt
-    assert "Profiled concurrency point" in prompt
+    assert "profile only the **largest concurrency**" in prompt
+    assert "mark unprofiled points as evidence gaps" in prompt
+    assert "rather than transferring the largest point's attribution" in prompt
+    assert "profiler_report.md" in prompt
 
 
 def test_projector_projects_per_point_in_curve_mode():
     prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
-    assert "once per concurrency point" in prompt
+    assert "at every configured concurrency" in prompt
     # The measured-vs-projected tables pair up point by point.
-    assert "point by point" in prompt
+    assert "Cover every configured point in ascending order" in prompt
 
 
-def test_html_companion_carries_the_pareto_curve_chart():
+def test_html_companion_carries_one_supported_pareto_chart():
     block = _norm(HTML_COMPANION)
-    assert "Pareto curve" in block
+    assert "one compact Pareto chart" in block
     assert "x = tok/s/user, y = tok/s/gpu" in block
-    assert "`c=<n>`" in block
-    # Scalar runs or a missing table drop the chart and the section.
-    assert "In scalar mode, or when the curve summary table is absent" in block
+    assert "Label concurrency and series clearly" in block
+    assert "when the measured curve is available" in block
+    assert "supported conversion from the CURRENT model to both axes" in block
 
 
-def test_reporter_carries_the_pareto_curve_section():
+def test_reporter_uses_one_per_point_model_table_instead_of_repeating_pareto():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Pareto Curve" in prompt
-    assert "omit this section entirely in scalar mode" in prompt
+    assert "One row per configured operating point" in prompt
+    assert "one compact Pareto chart" in prompt
+    assert "## Pareto Curve" not in prompt
+    assert "supported conversion from the CURRENT model to both axes" in prompt
 
 
 # --------------------------------------------------------------------------- #
@@ -903,7 +903,7 @@ def test_lifecycle_asserts_the_port_is_free_before_launching():
     assert "port 8000 already in use" in block
     # Sidestepping onto a free port would silently decouple the server from
     # the benchmark/profiling commands, which all target :8000.
-    assert "Do **not** work around a busy port by picking another one" in block
+    assert "Do not switch ports" in block
 
 
 def test_lifecycle_checks_liveness_before_health():
@@ -933,12 +933,12 @@ def test_lifecycle_verifies_the_listener_belongs_to_our_process_group():
     assert "not owned by PID" in block
     # An unresolvable owner must fail closed, never be assumed to be ours.
     assert "could not resolve — do NOT assume ours" in block
-    assert 'treat "unverified" as "not ours"' in block
+    assert "An unverified or foreign port owner blocks measurement" in block
 
 
 def test_lifecycle_confirms_the_port_freed_after_teardown():
     block = _norm(SERVER_LIFECYCLE)
-    assert "that :8000 is free again" in block
+    assert "port 8000 has no LISTEN row before relaunch" in block
 
 
 # --------------------------------------------------------------------------- #

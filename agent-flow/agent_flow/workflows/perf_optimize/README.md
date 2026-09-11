@@ -6,8 +6,8 @@ counterpart to `perf-analyze` (which only diagnoses). Measures a
 machine-readable `roadmap.yaml`, evaluates a round's selected items in
 serial or parallel worktrees, integrates parallel candidate-ready results, gates every
 change on code quality / functionality / measured gain, runs the configured number of rounds,
-independently verifies the final state, and reports expected-vs-measured
-results.
+independently verifies the final state, and reports measured performance
+against the best current theoretical performance model.
 
 `--reuse-analysis <dir>` imports a previous perf-analyze / perf-optimize
 run's baseline, SOL projection and findings, starting the campaign at the
@@ -16,8 +16,10 @@ Add `--reanalyze` to reinterpret that run's saved captures before planning,
 without profiling again in round 1.
 
 ```
-benchmarker → (projector) → [round loop × max_rounds] → qa → reporter
- (baseline)  (SOL ceiling)                        (final verification)
+benchmarker → (projector) → [round loop × max_rounds]
+                                     ↓
+                         qa → final_analyzer → reporter
+                     (verification) (reconciliation)
 
 round loop:
   (profiler) → analyzer → optimizer ⇄ evaluator item pairs
@@ -28,176 +30,147 @@ round loop:
                           (combine, benchmark, verdict)
 ```
 
-- **benchmarker** — serves the checkpoint, runs the canonical
-  `benchmark_serving.py` at the configured operating point(s) (a
-  `benchmark.concurrency` list means one run per point — Pareto-curve
-  mode), writes `baseline/benchmark_results.md`. This anchors
-  `roadmap.yaml`'s `baseline.value` (and `baseline.curve` in curve
-  mode).
-- **projector** *(on by default — skipped only when `task.yaml` sets
-  `sol.enabled: false`)* — runs
-  **once per campaign**, between the baseline and round 1: derives the
-  analytical speed-of-light (SOL) ceiling for this model/hardware/
-  operating point per the `internal-perf-sol-analysis` skill (hardware
-  peaks from the skill's calculator, latency constants measured when a
-  GPU is reachable, the α-β-u arithmetic written out, the model
-  architecture read from the checkpoint's `config.json`), and writes
-  `sol_projection.md` with a
-  baseline-vs-SOL gap analysis (curve mode: per point), plus the
-  machine-readable `sol_work/peaks.json` the analyzer's per-round
-  correlation joins against. The ceiling is
-  a property of the hardware + model + operating point — later rounds
-  compare against the same projection rather than re-deriving it.
-- **profiler** — runs before the analyzer when the current runtime needs
-  fresh evidence. Owns server launch and cleanup, nsys/ncu captures,
-  exports, capture quality and coverage checks, and runtime/configuration
-  provenance. It preprocesses the nsys timeline with the
-  `internal-perf-nsight-system-analysis` skill to choose ncu targets
-  (ranked by in-window union time, not capture-wide `kern_sum`) over the
-  same iteration window. Raw captures and capture-local targeting
-  derivations live in `rounds/round_<n>/profile/`, identified by
-  `profile_manifest.json`. The profiler authors no roadmap or findings.
-  A separate successful checkpoint preserves these captures if the
-  analyzer fails; retrying analysis does not repeat the GPU capture.
-- **analyzer** — runs once per round, interpreting saved evidence and
-  writing analysis artifacts under `rounds/round_<n>/analysis/`. It
-  leaves the capture unchanged; after a successful full analysis, the
-  orchestrator writes `analysis_manifest.yaml` linking that analysis to
-  the source `profile_dir` and `capture_id`. It
-  launches no server or GPU profiler. It can regenerate the nsys
-  decomposition, classify per-iteration busy/idle and compute-absent
-  time (launch-starved / blocking / dependency-stalled), and interpret
-  saved ncu results with `perf-nsight-compute-analysis` (per-kernel SOL%,
-  occupancy, warp stalls → bound class). With `--reuse-analysis` it
-  plans from imported findings; with `--reuse-analysis --reanalyze` it
-  first recomputes the analysis from imported captures. After a round
-  that accepted nothing, it runs **replan-only** from the standing findings and
-  evaluator verdicts — see *What a round costs*. It writes/updates
-  `roadmap.yaml` — items ordered by `expected_gain_pct` (bottleneck share
-  removed, casebook-grounded), never by fix ease, each item's evidence
-  drawn across the analyses (nsys timeline, ncu kernel analysis, SOL
-  correlation when the projector ran) rather than the timeline alone,
-  and each kernel-speedup item bounded by the operator's measured
-  headroom rather than its cost. The timeline analysis's own
-  `items.json` is accounted for row by row in `roadmap.yaml`'s
-  `nsys_items` block — every opportunity it found becomes an item or a
-  dismissal with evidence, and the orchestrator validates that the
-  moment the turn ends (see *The nsys opportunity-coverage gate*).
-  After fresh captures, the analyzer updates statuses /
-  ordering without rewriting history — a round following one that left
-  the standing runtime profile current has no shift to find and re-plans
-  instead. When the projector ran, it reads
-  `sol_projection.md` as context (not evidence): the projected headroom
-  and bound mix inform the ranking and sanity-bound each item's
-  `expected_gain_pct`; measured trace evidence always outranks the
-  projection. Each fresh analysis also runs the skill's **measured↔SOL
-  correlation** (`sol_calc.py analyze`): the round's traces roll up
-  into `analysis/regions.json`, join against the projector's
-  `sol_work/peaks.json`, and the resulting per-op table (% of SOL,
-  gap, bound per region) lands in the findings' *SOL correlation*
-  section — the sharpest re-ranking signal the roadmap gets. And it
-  never exhausts the roadmap silently: leaving no
-  actionable pending item while projected headroom remains obliges a
-  *Remaining-gap attribution* section in `profile_findings.md` — every
-  part of the gap gets a new item or an evidence-backed reason it
-  cannot be closed in this campaign (unexplained parts stay labeled
-  unexplained). With `profile.kernel_coverage`, it maintains a single
-  **kernel ledger** containing all four kernel questions and the best
-  current theoretical model, revised every round from facts about the
-  workload, hardware and actual implementation.
-- **optimizer** — one independent persistent optimizer is created for each
-  dispatched item. With `item_execution: parallel`, up to
-  `max_items_per_round` pairs start from the same frozen round base.
-  They run concurrently for local, Slurm, and disaggregated tasks. On a
-  shared local runtime, optimizer/evaluator instructions require `flock`
-  on `<workspace>/.local_runtime.lock` around each complete build/GPU/server
-  session, including cleanup. Reasoning, coding, CPU-only checks, and offline
-  analysis can overlap while those runtime sessions wait for exclusive access
-  to the shared GPUs and port 8000. This is a cooperative agent protocol;
-  the workflow does not intercept shell commands. Each session must verify
-  its candidate's runtime after acquiring the lock. All parallel tasks
-  retain the frozen base and integration stage. With `serial`, each
-  worktree starts from the latest accepted
-  campaign state. In both modes, approved and rejected terminal items
-  consume the shared `max_items_per_round` budget. Retries for one item
-  are always sequential:
-  `approach: config` edits `tuning/extra_llm_api_options.yaml`;
-  `approach: code` edits the TRT-LLM source (installed-package check
-  first). Smoke-checks the server, never benchmarks, never commits.
-  When the projector ran, it reads `sol_projection.md` as context (not
-  spec): where the item leaves a choice of realization variants or knob
-  values, it aims at the binding ceiling and records an `SOL alignment`
-  line in its summary — the projection never expands the item.
-- **evaluator** — reviews the diff, verifies functionality (sanity
-  completions; targeted tests for code items), re-measures with the
-  canonical benchmark, and applies the acceptance gate (below). Emits a
-  structured three-way verdict with a reason category: **APPROVE** marks the
-  isolated result `candidate_ready`, **PUSH_BACK** loops back to the optimizer with
-  actionable feedback (up to `max_attempts_per_item` attempts total),
-  and **REJECT** fails the item terminally — the judge's call that no
-  retry would help, saving the benchmarks a doomed retry would burn.
-  Stateless — every attempt is judged with fresh eyes. Negative
-  verdicts close with a one-line *Gap implication*
-  (mechanism-already-present / mechanism-inapplicable /
-  applied-but-no-gain / blocked-by-constraint) — the projection-free
-  evidence the analyzer's re-planning and the report's remaining-gap
-  accountability are built from.
-- **integrator** *(parallel only)* — after every item worker reaches `candidate_ready` or
-  `failed`, combines candidate commits/configs in roadmap order in a separate
-  integration worktree, resolves only conflicts and minimal combination
-  defects, benchmarks the combined state, and emits the authoritative
-  `APPROVE | FALLBACK_BEST | REJECT` verdict. It may diagnose/remediate twice;
-  after that it validates only the best standalone candidate, or rejects all.
-  Before applying the structured verdict, the Python orchestrator verifies
-  that included ids are non-empty candidate-ready items and cross-checks the
-  reported threshold, measured gain, and Pareto-curve regression budget.
-- **candidate evidence capture** — inside the evaluator's APPROVE turns,
-  not a separate stage: after the clean measurement, the evaluator
-  relaunches the server under the canonical nsys wrap, replays the load
-  once, and saves `attempt_<k>/profile/` (trace, `nsys_stats.txt`,
-  `nsys_analysis/`, replay log), then writes a *Kernel evidence* section
-  comparing the capture against the frozen accepted state — verifying
-  the item's claimed mechanism is actually visible in the trace. Because
-  rejected attempts are hard-reverted. A final-state integration
-  capture, when produced, becomes the reporter's newest accepted-state
-  profile.
-  The capture is diagnostic, never a measurement (fresh relaunch; the
-  verdict comes from the un-profiled run); no capture is made when
-  `nsys` is not in `profile.methods`, and a failed capture never flips
-  a verdict. An accepted runtime change without a successful matching
-  capture invalidates the current-evidence pointer; older traces remain
-  historical evidence and are not presented as the final accepted state.
-- **qa** — the campaign's **final verification**, run once after the
-  round loop (and skipped when no item was accepted): stateless
-  fresh-eyes benchmark + sanity completions (+ an accuracy eval iff
-  `task.yaml` configures one), computing the verified cumulative
-  improvement vs baseline that headlines the report. It makes no
-  loop decision — the loop is already over.
-- **reporter** — synthesizes `optimization_report.md` + a 1:1
-  `optimization_report.html`: verified cumulative improvement, the
-  optimization trajectory (baseline → each accepted serial item or parallel integration → final
-  verification, rendered as a line chart in the HTML),
-  expected-vs-measured per applied item, a kernel-level before/after
-  comparison from the round profiles and accept-evidence captures,
-  failed attempts with reasons, final config/code diff, and the
-  remaining roadmap as future work. When the projector ran, the report
-  gains a *Projection vs Measured* section (baseline vs final % of SOL
-  — how much of the projected headroom the campaign captured; the
-  curve-mode Pareto chart overlays the SOL-projected ceiling as a
-  dotted third polyline), closed by a **remaining-gap accountability**
-  breakdown: every part of the remaining gap-to-SOL is verdicted
-  `closed` / `infeasible: <constraint>` / `untried` / `unexplained`,
-  each verdict citing an artifact (a failed item's *Gap implication*,
-  a round's *Remaining-gap attribution*, the projection's caveats) —
-  a campaign may end short of the ceiling, but never without saying
-  why. With `profile.kernel_coverage`, the **Kernel Coverage**
-  section renders both the four questions and theoretical-model-versus-silicon
-  comparison from the latest kernel ledger, including evidence for model
-  revisions and explicitly unexplained discrepancies.
+- **benchmarker** — measures every configured operating point with the
+  canonical `benchmark_serving.py` command and writes
+  `baseline/benchmark_results.md`. These measurements anchor
+  `roadmap.yaml`'s `baseline` and its per-point curve.
+- **projector** — runs once between the baseline and round 1 unless
+  `sol.enabled: false`. It derives an initial SOL estimate from model
+  architecture, hardware peaks and measured latency constants where
+  available, writing `sol_projection.md` and `sol_work/peaks.json`.
+  This initial projection is provenance for the evolving model.
+- **profiler** — owns server launch and cleanup, nsys/ncu captures,
+  exports, targeting, coverage and runtime provenance. It writes
+  `rounds/round_<n>/profile/profiler_report.md` and
+  `profile_manifest.json`. The report summarizes capture quality and
+  missing evidence; the manifest retains capture identity and the artifact
+  inventory. A successful capture is checkpointed before analysis, so an
+  analyzer retry does not repeat GPU work.
+- **analyzer** — interprets saved evidence offline, writes
+  `rounds/round_<n>/analysis/analysis.md`, updates that directory's
+  `performance_model.yaml`, and ranks `roadmap.yaml` items by expected
+  measured benefit. Every turn updates the model, including reuse,
+  re-analysis and replan-only turns. It links kernel and region evidence
+  to the end-to-end model, accounts for nsys opportunities, and maintains
+  `kernel_ledger.yaml` when kernel coverage is enabled. It launches no
+  server or GPU profiler. A completed full analysis has an
+  `analysis_manifest.yaml` linking it to its source capture.
+- **optimizer** — implements a selected item in an isolated worktree,
+  using the current model to choose among allowed implementations.
+  `approach: config` edits the live tuning YAML; `approach: code` edits
+  the TRT-LLM source after verifying the installed package. It
+  smoke-checks its change and leaves benchmarking and commits to the
+  evaluator and orchestrator. Each item's retries are sequential.
+- **evaluator** — checks code quality and functionality, measures the
+  candidate, and emits `APPROVE`, `PUSH_BACK` or `REJECT`. Acceptance
+  uses measured-versus-measured gains, never a theoretical prediction.
+  Failure evidence distinguishes an invalid mechanism, no measured gain,
+  a scope constraint and insufficient measurement sensitivity. Approved
+  candidates receive a diagnostic nsys replay when configured; replay
+  throughput never enters the acceptance gate.
+- **integrator** — in parallel mode, combines candidate-ready changes in
+  roadmap order, benchmarks the combined state and emits
+  `APPROVE`, `FALLBACK_BEST` or `REJECT`. The orchestrator validates the
+  selected ids, gain arithmetic and regression limits before promotion.
+- **qa** — independently benchmarks the final accepted state once,
+  checks completions and runs a configured accuracy evaluation. It is
+  skipped when no item was accepted.
+- **final_analyzer** — after QA, the same offline analyzer reconciles
+  the final accepted runtime and independent measurements with current
+  theoretical bounds. It writes `final_verification/analysis/analysis.md`
+  and `performance_model.yaml` without editing the roadmap or using GPUs.
+  This is a separately checkpointed stage, skipped when no change was
+  accepted; retrying it does not repeat QA. Both output files must be
+  nonempty and the model must pass validation before the stage advances
+  to the reporter. Missing final-state evidence remains explicit in the model.
+- **reporter** — writes `optimization_report.md` and a self-contained
+  `optimization_report.html` with the same content. It prefers the
+  reconciled final model over round models and states remaining headroom,
+  its explanation, and unresolved evidence.
 
-The orchestrator — not the agents — owns the roadmap lifecycle fields and
-the git state of the TRT-LLM checkout, driven by the evaluator's
-structured decisions in `progress.yaml`.
+In serial mode each item starts from the latest accepted state. Parallel
+items start from one frozen round base and are combined by the integrator.
+On a shared local runtime, complete build/GPU/server sessions use
+`flock` on `<workspace>/.local_runtime.lock`, including cleanup; coding
+and offline analysis can overlap. This is a cooperative agent protocol.
+The orchestrator owns roadmap lifecycle fields and checkout git state.
+
+## The current theoretical performance model
+
+`performance_model.yaml` is the central analysis and convergence artifact,
+required independently of `sol.enabled` and `profile.kernel_coverage`.
+Each round writes it in `rounds/round_<n>/analysis/`; final reconciliation
+writes it in `final_verification/analysis/`. The latest validated model
+represents the current analysis, and the reconciled final model takes
+precedence for reporting. The analyzer updates it from the best available facts;
+`sol_projection.md` preserves the initial estimate and its assumptions.
+A failed optimization cannot by itself justify raising the theoretical
+floor or declaring the remaining gap unavoidable.
+
+For every benchmark concurrency, the current model connects measured
+performance to theoretical best performance on the same workload and
+timing basis. It identifies the runtime, model, hardware, parallelism,
+request counts, token lengths, timing window and statistic. Kernel-sum
+milliseconds, decode critical-path milliseconds and whole-run serving
+latency are separate observations until an explicit derivation connects
+them. A profile at one concurrency does not measure another concurrency.
+
+The model must make the following accounting reviewable:
+
+- Current measured performance, the current theoretical ceiling, the
+  distance between them and the assumptions behind the conversion.
+- Unavoidable physical costs, backed by a bound and evidence.
+- Recoverable implementation costs, tied to experiments or roadmap items.
+- Campaign scope constraints and measurement limitations, stated
+  separately from physical limits. A noise-floor rejection is not a
+  hardware impossibility.
+- The unresolved residual, including unmeasured phases and invalid or
+  incomplete comparisons, with the next measurement needed to resolve it.
+
+Region and kernel models support this accounting; detailed derivations
+remain linked artifacts. Account for overlap and dependencies before
+adding region savings. Do not subtract a short decode-window median from
+a whole-run mean and label the difference removable prefill overhead.
+Unavailable quantities stay explicit rather than acquiring guessed values.
+Evidence-backed model revisions retain the prior assumption and explain
+what changed. Imported evidence keeps its source measurement provenance.
+
+Convergence requires a consistent model and evidence explaining the
+remaining residual at every focus point (all configured points when no
+focus subset is set). Every benchmark point remains recorded, with
+unknown theory and a next measurement when no bound can be grounded.
+Model status is `open`, `converged`, `measurement_limited`, `scope_limited`
+or `model_invalid`; see the
+[shared model contract](../perf_analyze/performance_model.py).
+An empty roadmap, an exhausted budget, a met improvement target, or an unmeasured residual alone cannot
+establish convergence. Report the workflow stop reason separately.
+
+## Report format
+
+The analyzer's `analysis.md`, including final reconciliation, has four
+concise sections:
+
+1. **Result** — measured outcome, source/runtime identity and convergence
+   status; final reconciliation uses the independent QA measurements.
+2. **Theoretical performance model** — one per-point table comparing
+   current measurements with the current theoretical best, plus the
+   essential assumptions and model revisions.
+3. **Gap analysis** — the largest remaining costs, evidence for each
+   explanation, unresolved residual and missing measurements.
+4. **Next actions** — the few highest-value optimizations or measurements
+   needed to close the remaining gap.
+
+The final `optimization_report.md` and HTML companion use the same first
+three sections, then **Changes and next actions** for consequential
+accepted changes, failed experiments and follow-up work. Their **Result**
+includes the verified baseline-to-final gain.
+
+Keep commands, full configurations, per-kernel tables, attempt histories
+and detailed arithmetic in linked artifacts. Do not repeat the same gap
+in separate SOL, kernel-coverage, projection and future-work sections.
+`profiler_report.md` is the profiler's brief capture handoff: what was
+captured, whether it matches the requested runtime/window, coverage gaps,
+and links to evidence. It accompanies the machine-readable manifest.
 
 ## The nsys opportunity-coverage gate
 
@@ -276,35 +249,34 @@ one regime by hurting another is rejected. The ledger
 (`baseline`/`current_best`) then carries a `curve` of per-point
 `{concurrency, value, tok_s_user, tok_s_gpu}` rows (tok/s/user =
 `1000/mean_tpot_ms`, tok/s/gpu = `output_throughput/num_gpus`), and the
-report gains a *Pareto Improvement* section + chart (x = tok/s/user,
-y = tok/s/gpu, baseline vs final). Note the benchmark cost multiplies by
+report includes the per-point comparison in **Result**; a compact
+Pareto chart (x = tok/s/user, y = tok/s/gpu) can clarify it. Note the benchmark cost multiplies by
 the point count on **every** measurement (baseline, each evaluator
 attempt, the final verification) — keep the list short (~3–5 points).
 
 ## When the loop stops
 
-No agent decides when to stop. The loop runs exactly
-`optimize.max_rounds` rounds unless one of two deterministic,
-orchestrator-enforced breaks fires first:
+The orchestrator bounds optimization work by `optimize.max_rounds` and
+selects up to `max_items_per_round` candidates each round. The loop can
+stop at the round budget, at the optional measured improvement target,
+or after an analyzer turn leaves the roadmap exhausted on an unchanged
+build with no outstanding measurement request.
 
-- **Round budget spent** — `optimize.max_rounds` rounds have closed, each
-  selecting up to `max_items_per_round` candidates.
-- **Roadmap exhausted on an unchanged build** — no pending item
-  promises at least `noise_floor_pct` through an allowed approach
-  (checked after every analyzer turn and after every item's terminal
-  outcome) *and* nothing has been accepted since the analysis that
-  planned it. A fresh profile would then find the same nothing, at full
-  profile cost. When the roadmap runs dry with accepts outstanding the
-  loop does **not** close: the build those accepts produced has never
-  been analyzed, so it spends one more round profiling what they exposed
-  (budget permitting) and closes on *that* verdict.
-- **Target met** — the optional `optimize.target_improvement_pct` is
-  reached by the roadmap ledger's cumulative gain (`current_best` vs
-  `baseline`; curve mode: the mean of per-point gains), checked after
-  every accepted item.
+A `measurement_limited` model requesting a targeted capture keeps the
+loop moving while rounds remain, even when it has no pending optimization
+item. Measurement requests also persist when pending items are attempted
+and rejected; those verdicts do not cancel the need for evidence. The
+next profiler turn receives the requested operating point, phase or
+kernel instead of simply repeating the standing capture. A roadmap that
+runs dry after accepted changes still needs analysis of that runtime,
+subject to the remaining round budget.
 
-Either way the campaign proceeds to the one-shot final verification
-(skipped when nothing was accepted) and the reporter.
+When changes were accepted, the campaign proceeds through independent QA,
+the checkpointed `final_analyzer` reconciliation, and the reporter.
+Without accepted changes, it skips QA and final reconciliation and
+reports from the latest round model. Workflow stopping is separate from
+convergence: unfulfilled measurement requests remain visible when a
+budget or target ends the loop.
 
 ## What a round costs: profile, re-analyze, or replan
 
@@ -321,7 +293,8 @@ and measured by the Integrator, while serial candidates are accepted
 directly.
 
 - **Profile and analyze** — round 1 unless evidence is imported; any round
-  opening after an accept. The profiler captures the current runtime (nsys + ncu per
+  opening after an accept; or a round fulfilling an outstanding targeted
+  measurement request. The profiler captures the current runtime (nsys + ncu per
   `profile.methods`), then the analyzer interprets those captures and
   re-ranks the roadmap. An older checkpoint with no profile-currency
   marker also buys one
@@ -334,21 +307,23 @@ directly.
   follow the normal profiling rules; the option does not make the
   entire optimization campaign offline.
 - **Replan-only round** — opens when the standing profile is known to be
-  current: the predecessor accepted nothing. The analyzer launches no
+  current and there is no outstanding request for new evidence. The
+  predecessor accepted nothing. The analyzer launches no
   server and runs no profiler; it plans from the standing analysis plus
   the round's evaluator verdicts, marking
   disproven items obsolete, bounding the gains the measurements cap, and
   adding what the failures imply. Those verdicts are the round's real
   yield — an item measured dead is evidence about *this* build — and
   converting them into roadmap edits and model updates is what the turn
-  is for. The analyzer writes a new kernel/model ledger using standing
-  measurements and the latest evidence, preserving prior revisions and
-  recording any justified change to the model. The same ledger validation
-  applies without a new ncu capture.
+  is for. The analyzer updates `performance_model.yaml`, writes this round's
+  `analysis.md`, and refreshes the optional kernel ledger using standing
+  measurements and the latest evidence. Prior revisions and measurement
+  provenance remain intact; no new capture is needed.
 
-The orchestrator selects the mode, and a replan round is not a skipped
-round: if it leaves nothing actionable, that is the roadmap-exhausted
-break and the campaign closes.
+The orchestrator selects the mode. A replan turn updates the model and
+can either produce an optimization item or request targeted evidence.
+Only an exhausted roadmap with no outstanding measurement request can
+trigger the unchanged-build stop.
 
 Capture completion and analysis completion have separate checkpoints.
 If the analyzer fails after a successful capture, rerunning the command
@@ -360,10 +335,9 @@ does not earn the local profile-currency marker used by replan-only rounds.
 That break only fires at the top of a round, never mid-round. A roadmap
 that runs dry between items ran dry against a plan written *before* the
 round's measurements existed, so the loop spends one more round — free
-when nothing was accepted, a profile when something was — and closes on
-the plan the analyzer makes against them. What ends a campaign is an
-analyzer turn that has seen the evidence and still finds nothing, not
-the plan simply running out.
+when no capture is needed, a profile after accepted changes or a targeted
+request — subject to the round budget. It then evaluates the updated
+plan and model against the new evidence.
 
 ## Reusing a previous run's analysis
 
@@ -374,17 +348,21 @@ the optimize stage instead of re-deriving what that run already measured:
 | imported | from a perf-analyze workspace | from a perf-optimize workspace | replaces |
 | --- | --- | --- | --- |
 | baseline report + result JSONs | `benchmark_results.md` | `baseline/benchmark_results.md` | the benchmarker |
-| SOL projection + `sol_work/` | `sol_projection.md` | `sol_projection.md` | the projector |
-| profile findings (+ `kernel_ledger.yaml`) | `profile_findings.md` and companion artifacts | newest `rounds/round_<n>/analysis/` | round 1's analysis, unless `--reanalyze` |
+| Initial SOL projection + `sol_work/` | `sol_projection.md` | `sol_projection.md` | the projector |
+| analysis (+ optional `kernel_ledger.yaml`) | `analysis.md` and companion artifacts | newest `rounds/round_<n>/analysis/` | round 1's analysis, unless `--reanalyze` |
+| Current performance model | `performance_model.yaml` | newest valid `analysis/performance_model.yaml`, preferring final reconciliation | read-only `reused_analysis/prior_performance_model.yaml` |
 | raw profile captures | workspace trace files | `rounds/round_<n>/profile/` with `profile_manifest.json` (legacy `analysis/` layouts also supported) | round 1's profiler |
 | roadmap (as read-only prior art) | — | `roadmap.yaml` | nothing |
+
+Legacy `profile_findings.md` sources remain readable; new analyzer output
+is always `analysis.md`.
 
 Round 1's analyzer then runs **plan-only**: it reads the imported
 evidence, checks that it actually describes this task (same model,
 parallel mapping, operating point), runs the dormant-capability sweep,
-and writes `roadmap.yaml` — launching no server, no profiler, and no
-benchmark. Round 2 profiles normally: the imported traces describe
-*another* run's build, so they never stand in for one this campaign
+and writes `analysis.md`, the current `performance_model.yaml`, and
+`roadmap.yaml` without a new server, profiler or benchmark. Round 2
+profiles normally: the imported traces describe another run's build, so they never stand in for one this campaign
 made, and the replan rule only ever plans from a profile of this
 campaign's own checkout.
 
@@ -414,17 +392,21 @@ Two deliberate limits:
 - **Roadmap state is never imported.** A source `roadmap.yaml` lands in
   `reused_analysis/prior_roadmap.yaml` as reference material only; its
   statuses, gains and current best describe the source checkout. Imported
-  `kernel_ledger.yaml`, `sol.json` and `regions.json` provide evidence for
-  the analyzer, which writes this round's own kernel/model ledger and
-  roadmap with local item references, source measurement conditions and
-  citations, and an initially empty local model revision history. With `--reanalyze`, it regenerates derived artifacts from the
-  saved captures.
+  models are saved as `reused_analysis/prior_performance_model.yaml`.
+  This preserves source corrections and measurement provenance; it never
+  stands in for this campaign's current model. Together with
+  `kernel_ledger.yaml`, `sol.json` and `regions.json`, it provides evidence
+  for the analyzer, which writes this campaign's current model
+  and roadmap with local item references, source measurement conditions
+  and citations. Local revision history starts anew with imported
+  revisions retained as provenance. With `--reanalyze`, it regenerates
+  derived artifacts from the saved captures.
 - **The baseline is inherited, not re-measured.** Every gain this
   campaign reports is computed against numbers measured by the source
   run, so the two must describe the same system. The import writes
   `reused_analysis/manifest.md` recording what came from where, the
   analyzer owes a fit check against it, and the report says so in
-  Configuration. If the hardware or checkpoint differs, don't reuse the
+  **Result**. If the hardware or checkpoint differs, don't reuse the
   baseline — the import is per-artifact, so a source without one simply
   gets benchmarked normally.
 
@@ -440,11 +422,10 @@ Split-layout analysis imports require a matching completion manifest;
 an interrupted analyzer's partial findings cannot replace an earlier
 completed analysis. Capture-only imports remain available with `--reanalyze`.
 
-A run with `profile.kernel_coverage` validates this round's kernel/model
-ledger after every analyzer turn, including plan-only reuse and replan-only
-rounds. These rounds preserve source measurement provenance while updating
-the model and four-question reasoning from available facts; they need no
-new capture.
+Every analyzer turn, including plan-only reuse and replan-only rounds,
+updates and validates `performance_model.yaml`. With
+`profile.kernel_coverage`, this round's kernel ledger is validated too.
+Both preserve measurement provenance while incorporating new evidence.
 
 ## Usage
 
@@ -550,7 +531,7 @@ running the CLI.
 ├── task.yaml                        # resolved spec (defaults filled in)
 ├── prompts/<role>.md                # composed system prompt per role, snapshotted at launch
 ├── roadmap.yaml                     # the ranked plan; statuses/gains updated as the loop runs
-├── sol_projection.md                # projector's SOL ceiling + baseline-vs-SOL gap (blank when sol.enabled: false)
+├── sol_projection.md                # initial projection and assumptions (blank when disabled)
 ├── sol_work/peaks.json              # projector's machine-readable peaks (analyzer's correlation joins against it)
 ├── baseline/
 │   ├── benchmark_results.md         # benchmarker's baseline report
@@ -560,17 +541,23 @@ running the CLI.
 │   └── extra_llm_api_options.accepted.yaml  # last accepted snapshot (orchestrator-managed)
 ├── reused_analysis/                 # --reuse-analysis only
 │   ├── manifest.md                  #   what was imported, and from where
+│   ├── prior_performance_model.yaml #   corrected source model — read-only provenance
 │   └── prior_roadmap.yaml           #   source campaign's roadmap — read-only prior art
 ├── rounds/round_<n>/
 │   ├── profile/                     # profiler: raw nsys/ncu captures, exports, logs, targeting derivations
+│   │   ├── profiler_report.md       # concise human-readable capture handoff
 │   │   └── profile_manifest.json    # capture identity, provenance, and artifact inventory
-│   ├── analysis/                    # analyzer: profile_findings.md, regenerated nsys_analysis/ (+ regions.json / sol.json when the projector ran;
-│   │                                #   + kernel_ledger.yaml with a profile.kernel_coverage block)
+│   ├── analysis/                    # analyzer: analysis.md and linked derived evidence
+│   │                                #   kernel_ledger.yaml when kernel coverage is enabled
+│   │   ├── performance_model.yaml   # current theoretical-best model and remaining gap
 │   │   └── analysis_manifest.yaml   # orchestrator: successful full analysis identity and source capture link
 │   └── item_<j>_<id>/attempt_<k>/   # per item: optimization_summary.md, evaluation.md, result *.json
 │       └── profile/                 # accept-evidence nsys capture (APPROVEd attempts only)
 ├── final_verification/
-│   └── verification_report.md       # QA's one-shot independent verification (+ its artifacts)
+│   ├── verification_report.md       # QA's independent verification (+ its artifacts)
+│   └── analysis/                    # final_analyzer: offline reconciliation after QA
+│       ├── analysis.md              # final measured state, model and unresolved gap
+│       └── performance_model.yaml   # authoritative final model for the reporter
 ├── optimization_report.md           # reporter deliverable
 ├── optimization_report.html         # self-contained interactive companion (1:1)
 ├── progress.yaml                    # structured audit log (agents write via MCP tools)
@@ -595,7 +582,8 @@ running the CLI.
   item's retry attempts and is reset between items, and the evaluator /
   qa run stateless — the judges always get fresh eyes, and no role drags
   a long campaign's stale context into later decisions. (The
-  benchmarker, projector, qa, and reporter run once each.)
+  benchmarker, projector, qa, and reporter run once each. After QA, the
+  existing analyzer runs once more in final reconciliation mode.)
 - **Prompt extensions.** `PromptBundle.with_extensions(profiler=...)`
   customizes capture instructions independently of
   `with_extensions(analyzer=...)`, which customizes offline analysis and
@@ -646,135 +634,39 @@ running the CLI.
   the jitter wait shows up inside a collective but bucketing, overlap
   and interconnect levers cannot recover another rank's lateness.
 - **Per-kernel coverage contract (optional).** A
-  `profile.kernel_coverage` block in `task.yaml` (empty mapping =
-  defaults: `min_share_pct: 0.5`, `coverage_target_pct: 95`) upgrades
-  the ncu dive from "top nsys kernels" to **every kernel above the
-  share bar** (enumerated from the fresh kern_sum, extended until the
-  coverage target is reached, captured over up to 3 bounded ncu passes
-  that re-filter on still-missing stems so once-per-step kernels are
-  not starved by per-layer hot ones). The profiler owns targeting and
-  capture coverage; on every turn the analyzer must then
-  answer four questions per enumerated kernel — *can it be eliminated?*
-  *can it be made faster?* *can it be fused with its neighbors?* *can it
-  be overlapped with independent work on another stream?* — in
-  `rounds/round_<n>/analysis/kernel_ledger.yaml`: every row carries the
-  kernel's ncu SOL metrics/bound class plus an `elimination`, a
-  `faster`, a `fusion` and an `overlap` disposition, each either a
-  roadmap item id or an evidence-backed dismissal (`mandatory-math`,
-  `padding-minimal`, `already-hoisted`, `fast-path-active`,
-  `fast-path-blocked`, `at-sol-floor`, `below-materiality` with
-  arithmetic, `multi-consumer-pinned`, `already-fused`,
-  `phase-boundary`, `needs-rebuild`, `graph-disabled`,
-  `no-independent-partner`, `resource-saturated`, ...);
-  `needs-rebuild` is valid only when a written-from-scratch replacement
-  kernel routed from the Python call site is also ruled out, not merely
-  because the incumbent ships compiled; elimination rows record what
-  consumes the output (or the guard that selected this path), fusion
-  rows the observed neighbors from the trace, and overlap rows the
-  candidate partner plus the evidence the two are serialized today.
+  `profile.kernel_coverage` block (empty mapping selects defaults:
+  `min_share_pct: 0.5`, `coverage_target_pct: 95`) requires nsys+ncu
+  coverage of every kernel above the share threshold, extending capture
+  until the target is reached. The profiler owns targeting and capture
+  coverage. Every analyzer turn writes
+  `rounds/round_<n>/analysis/kernel_ledger.yaml`, answering whether each
+  kernel can be eliminated, made faster, fused or overlapped. Each answer
+  references a roadmap item or an evidence-backed dismissal, with
+  consumers, guards, neighbors or independent partners where relevant.
+  Materiality converts GPU-time shares through `coverage.gpu_busy_pct`
+  before comparing against wall-clock gains. Validation rejects missing
+  questions, invalid item references or insufficient coverage.
 
-  The four are ordered by how much they presuppose, each asking less
-  than the last. **Elimination** presupposes only that the kernel runs
-  today, and is first because a `yes` moots the rest and recovers the
-  row's *whole* share rather than a fraction — it covers redundant work,
-  work over padded/masked data, per-step recompute of something
-  invariant, and the accidental slow path (an `is_fused=False` fallback
-  firing because a gated fast path did not), which is the per-kernel
-  per-round teeth on round 1's dormant-capability sweep. **Faster** and
-  **fusion** presuppose the work is necessary *and* that the kernel must
-  run alone. **Overlap** drops the alone assumption: a kernel at its
-  bound-class ceiling (`at-sol-floor`) whose neighbors move only
-  mandatory bytes (`neighbors-at-bandwidth-floor`) is legitimately
-  closed on both and can still give back most of its share by running
-  concurrently with independent work — realized through the checkout's
-  own `maybe_execute_in_parallel` / `AuxStreamType` idiom, and gated on
-  CUDA graphs being enabled (multi-stream no-ops without them). The
-  ledger also carries `coverage.gpu_busy_pct`, the busy share of the
-  profiled window: `share_pct` is a share of *GPU time* while
-  `noise_floor_pct` and `expected_gain_pct` are shares of *wall clock*,
-  so every materiality claim converts through it rather than
-  overstating candidates by `1/busy` on a host-bound deployment.
-
-  The orchestrator schema-validates the ledger after every analyzer
-  turn (all four dispositions per row, `item` refs resolving to real
-  roadmap ids, coverage ≥ target, `gpu_busy_pct` present) and **aborts
-  the stage on an incomplete ledger**, so the campaign cannot conclude
-  while a hot kernel's elimination, optimization, fusion, or overlap
-  possibility was never considered; the reporter's *Kernel Coverage* section resolves
-  the final ledger's dispositions to campaign outcomes and itemizes the
-  untried tail. Requires `nsys` + `ncu` in `profile.methods`; costs
-  extra profiling wall-clock in rounds that collect fresh captures.
-
-  The same ledger also contains the analyzer's **best theoretical
-  performance model**. Every kernel references a model, and several
-  kernels may share a logical-region or iteration model so fusion,
-  elimination and overlap do not force artificial kernel boundaries or
-  double-count savings. Each model states its operating point, derivation,
-  assumptions, hardware constraints, predicted milliseconds, matching
-  measured milliseconds and evidence, unexplained discrepancy, and next
-  discriminating experiment. Missing predictions or measurements are
-  explicit `null` values with an explanation and next test.
-
-  On every turn, including replan-only rounds, the analyzer writes a new
-  `analysis/kernel_ledger.yaml` using standing measurements or a new
-  capture as appropriate. It preserves previous models and appends
-  evidence-backed changes in `model_revisions`, including the old and new
-  value of each changed field. Experiments improve the implementation when
-  they expose inefficiency and improve the model when they expose missing
-  costs or invalid assumptions. A failed optimization alone justifies
-  neither relaxing the prediction nor claiming the gap is unavoidable.
-  A measurement below a theoretical lower bound calls for investigating
-  model or measurement compatibility, not clamping the result. Convergence
-  means facts explain the residual under matching conditions; an
-  unexplained gap remains open even when the campaign ends.
-
-  The reporter renders both kernel dispositions and model-versus-silicon
-  evidence in one *Kernel Coverage* section. The evaluator and QA retain
-  their measured-versus-measured gates. No separate accounting ledger,
-  implementation-target layer, partition buckets or mandatory attribution
-  machinery is required, and the SOL projector remains optional context.
+  Kernel and shared-region models provide supporting derivations for
+  `performance_model.yaml`; they do not create another report headline or
+  replace end-to-end accounting. They preserve measurements and model
+  revisions across replan turns. Full kernel tables remain in the ledger,
+  linked from **Gap analysis** only where they explain a material gap.
 
 - **Optimization casebook.** The benchmarker/analyzer load the
   `trtllm-agent-toolkit:perf-optimization-casebook` skill as read-only
   reference; the optimizer uses it *actionably* (how-to-apply /
   verification / rollback guidance). All roles degrade gracefully when
   the skill is not installed.
-- **SOL projection (default-on stage).** The projector runs unless
-  `task.yaml` sets `sol.enabled: false`; it follows the
-  `trtllm-agent-toolkit:internal-perf-sol-analysis` skill as its
-  methodology. That skill is `internal-` prefixed, so open-source
-  toolkit builds strip it while keeping `perf-analysis`; which of the two
-  this session has is resolved **in Python** before the campaign starts
-  (`perf_analyze.sol_methodology`, one ~1 s probe — a session
-  connection, no model call — failing open to the SOL skill if it cannot
-  run), so the projector is told to load a skill that is actually there.
-  Without the SOL skill it loads `perf-analysis` instead and works the
-  same methodology without a calculator: the peaks come from named
-  sources, marked as not calculator-resolved, and no
-  `sol_work/peaks.json` is written — so the analyzer's per-round
-  correlation degrades to its honest "Correlation unavailable" line. It
-  degrades to a "Projection unavailable" file when no ceiling can be
-  grounded at all, and never fabricates one. It
-  runs once per campaign: the ceiling depends only on the hardware +
-  model + operating point, so every later round compares against the
-  initial `sol_projection.md` as provenance, while the analyzer updates its
-  current model from new facts. Consumers: the analyzer (roadmap ranking
-  context; each round it also joins its fresh per-op measurements
-  against the projector's `sol_work/peaks.json` with the skill's
-  `sol_calc.py analyze` and reports the joined table in
-  `profile_findings.md`'s *SOL correlation* section; plus the
-  remaining-gap attribution owed whenever it leaves
-  the roadmap exhausted with headroom remaining), the optimizer
-  (aiming each item's realization at the binding ceiling — context,
-  never an expansion of the item), and the reporter (the *Projection
-  vs Measured* headroom-captured section with its remaining-gap
-  accountability breakdown); the evaluator and qa deliberately see
-  nothing of it — their gates stay measured-vs-measured so an
-  analytical model can never anchor a verdict. For a spec or mapping
-  that stays uncertain, the projector is pointed at the
-  `internal-glean-search` skill / `internal-glean-specialist` subagent
-  as read-only reference, used only if it is installed in the
-  session.
+- **SOL projection (default-on stage).** Unless `sol.enabled: false`,
+  the projector follows `internal-perf-sol-analysis`. The workflow resolves
+  skill availability before launch; without that internal skill it falls
+  back to `perf-analysis` and named hardware sources. Unavailable peaks or
+  latency measurements remain explicit, and an ungrounded projection is
+  recorded as unavailable. `sol_projection.md` and `sol_work/peaks.json`
+  preserve the initial derivation. The analyzer revises the current model
+  from later evidence, using measured-to-SOL correlation when its inputs
+  are available. The evaluator and QA retain measured-versus-measured gates.
 - **Cost.** The profiler runs every round that follows an accept (nsys plus
   the bounded ncu deep dive by default); set `profile.methods: [nsys]`
   to trim it. When the standing runtime profile is still current, the
@@ -782,7 +674,8 @@ running the CLI.
   round costs* above. Each evaluator attempt runs a
   full benchmark, each **accepted** attempt additionally pays one
   profiled replay (the accept-evidence capture), and the final
-  verification runs one more benchmark at campaign end. The per-item
+  verification runs one more benchmark at campaign end. Final model
+  reconciliation uses saved evidence without additional GPU work. The per-item
   evaluator benchmark is the irreducible price of per-item attribution;
   raising `max_items_per_round` amortizes a round's capture across
   more serial items or widens a parallel batch. Parallel execution trades extra

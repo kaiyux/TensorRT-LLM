@@ -62,6 +62,43 @@ def _write_ws_task(ws: Path, sol: bool | None = None, concurrency=None) -> None:
     (ws / "task.yaml").write_text(yaml.safe_dump(spec), encoding="utf-8")
 
 
+def _write_unknown_model(path: Path, *, concurrencies, metric="output_throughput") -> None:
+    """A valid incomplete model must never imply convergence in orchestration tests."""
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "model_id": "test-model",
+                "target_metric": metric,
+                "direction": "lower" if metric.endswith("_ms") else "higher",
+                "points": [
+                    {
+                        "concurrency": point,
+                        "operating_point": {
+                            "build": "test-build",
+                            "hardware": "test-gpu",
+                            "workload": "test-load",
+                            "timing_basis": "serving wall time",
+                        },
+                        "measured_value": 100.0,
+                        "theoretical_best_value": None,
+                        "derivation": "Missing production profile prevents a supported bound.",
+                        "assumptions": [],
+                        "evidence": [],
+                        "measurement_evidence": ["baseline/result.json"],
+                        "components": [],
+                        "status": "measurement_limited",
+                        "unexplained": "Production profile is unavailable.",
+                        "next_test": "Capture the production workload.",
+                    }
+                    for point in concurrencies
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _stub_agents(workflow):
     """Replace the workflow's agent entry points with recorders.
 
@@ -89,6 +126,11 @@ def _stub_agents(workflow):
     def analyzer():
         trace.append("analyzer")
         workflow.profile_findings_path.write_text("# findings\n", encoding="utf-8")
+        workflow.profiler_report_path.write_text("# Capture summary\n", encoding="utf-8")
+        _write_unknown_model(
+            workflow.performance_model_path,
+            concurrencies=workflow._curve_points() if workflow._curve_mode() else [None],
+        )
         _append({"step": 3, "agent": "analyzer", "summary": "p"})
 
     def reporter():
@@ -312,6 +354,7 @@ def test_resume_at_projector_when_disabled_skips_forward(tmp_path):
 def test_resume_from_reporter_skips_benchmarker_and_analyzer(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
+    _write_unknown_model(ws / "performance_model.yaml", concurrencies=[None])
     state_module.save_state(
         ws / state_module.STATE_FILENAME,
         state_module.WorkflowState(
@@ -355,11 +398,11 @@ def test_already_done_checkpoint_short_circuits(tmp_path):
 
 
 def test_analyzer_without_findings_blocks_advance(tmp_path):
-    """A analyzer that writes no profile_findings.md must not reach the reporter.
+    """A analyzer that writes no analysis.md must not reach the reporter.
 
     Reproduces the real failure where the analyzer only launched a server
     (recording an interim progress entry) and yielded; the workflow then
-    ran the reporter against an empty profile_findings.md.
+    ran the reporter against an empty analysis.md.
     """
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
@@ -373,7 +416,7 @@ def test_analyzer_without_findings_blocks_advance(tmp_path):
 
     workflow._run_analyzer = analyzer_no_output
     try:
-        with pytest.raises(RuntimeError, match="profile_findings.md"):
+        with pytest.raises(RuntimeError, match="analysis.md"):
             workflow.run(str(task))
     finally:
         workflow.close()
@@ -711,9 +754,9 @@ def test_analyzer_prompt_mentions_projection_only_when_enabled(tmp_path):
 
     assert "sol_projection.md" not in without
     assert "sol_projection.md" in with_sol
-    assert "optional context" in with_sol
+    assert "initial theoretical model" in with_sol
     # The projection never outranks measured trace evidence.
-    assert "outranks" in with_sol
+    assert "Reconcile its assumptions with measured evidence" in with_sol
     # The measured↔SOL correlation is instructed only when the projector
     # stage ran: skill load, regions from traces, analyze vs the peaks
     # file, and the dedicated findings section.
@@ -772,7 +815,7 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
         assert "perf-nsight-compute-analysis" in prompt
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
         assert "server_ncu.ncu-rep" in prompt
-        assert "ncu kernel analysis" in prompt
+        assert "bound class, occupancy, stalls" in prompt
         assert "default both" in prompt
 
 
@@ -790,10 +833,10 @@ def test_reporter_prompt_mentions_projection_only_when_enabled(tmp_path):
     assert "sol_projection.md" not in without
     assert "Projection vs Measured" not in without
     assert "sol_projection.md" in with_sol
-    assert "Projection vs Measured" in with_sol
+    assert "Theoretical performance model" in with_sol
     # The projection weighs into the verdict, honestly degrading.
-    assert "SOL projection" in with_sol
-    assert "unavailable" in with_sol
+    assert "original model provenance" in with_sol
+    assert "performance_model.yaml" in with_sol
 
 
 # ------------------------------------------------------ curve-mode prompts
@@ -828,9 +871,11 @@ def test_driving_prompts_switch_on_concurrency_list(tmp_path):
     assert "largest concurrency point, 128" in curve["analyzer"]
     assert "--max-concurrency 128" in curve["analyzer"]
 
-    # Reporter: the Pareto Curve section is named in curve mode only.
-    assert "Pareto Curve" not in scalar["reporter"]
-    assert "Pareto Curve" in curve["reporter"]
+    # The same compact model table covers scalar and curve operating points.
+    for prompt in (scalar["reporter"], curve["reporter"]):
+        assert "for every operating point" in prompt
+        assert "performance_model.yaml" in prompt
+        assert "Pareto Curve" not in prompt
 
 
 # ------------------------------------------------- stale benchmark artifacts
@@ -988,3 +1033,62 @@ def test_a_workspace_the_workflow_refuses_keeps_its_previous_snapshot(tmp_path):
     assert (ws / PROMPTS_DIRNAME / "analyzer.md").read_text(encoding="utf-8") == (
         "the previous run's\n"
     )
+
+
+@pytest.mark.parametrize("artifact", ["profiler_report.md", "performance_model.yaml"])
+def test_analyzer_requires_capture_report_and_current_model_before_reporting(tmp_path, artifact):
+    task = _write_task(tmp_path, sol=False)
+    workflow = Workflow(workspace=tmp_path / "ws")
+    trace = _stub_agents(workflow)
+    analyze = workflow._run_analyzer
+
+    def missing_output():
+        analyze()
+        (workflow.workspace / artifact).unlink()
+
+    workflow._run_analyzer = missing_output
+    try:
+        with pytest.raises(RuntimeError, match=artifact):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace == ["benchmarker", "analyzer"]
+    assert state_module.load_state(workflow.state_path).stage == state_module.STAGE_ANALYZER
+
+
+def test_analyze_model_requires_every_benchmark_point(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    try:
+        _write_ws_task(workflow.workspace, sol=False, concurrency=[8, 64])
+        _write_unknown_model(workflow.performance_model_path, concurrencies=[64])
+        with pytest.raises(RuntimeError, match="missing=\\[8\\]"):
+            workflow._validate_performance_model()
+    finally:
+        workflow.close()
+
+
+def test_reporter_resume_revalidates_current_model(tmp_path):
+    task = _write_task(tmp_path, sol=False)
+    workspace = tmp_path / "ws"
+    workflow = Workflow(workspace=workspace)
+    _stub_agents(workflow)
+
+    def interrupted_reporter():
+        raise RuntimeError("reporter interrupted")
+
+    workflow._run_reporter = interrupted_reporter
+    try:
+        with pytest.raises(RuntimeError, match="reporter interrupted"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    workflow.performance_model_path.write_text("invalid: model\n")
+    resumed = Workflow(workspace=workspace)
+    trace = _stub_agents(resumed)
+    try:
+        with pytest.raises(RuntimeError, match="performance_model.yaml.*failed validation"):
+            resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert trace == []
+    assert state_module.load_state(resumed.state_path).stage == state_module.STAGE_REPORTER

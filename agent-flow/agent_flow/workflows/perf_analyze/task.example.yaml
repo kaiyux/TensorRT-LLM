@@ -22,7 +22,7 @@ benchmark:
   concurrency: 64
   # concurrency: [8, 32, 128]  # list => Pareto-curve mode: one benchmark run
   #                            # per point (over one server launch), profiling
-  #                            # at the largest point, and the report gains a
+  #                            # at the largest point. Result includes a
   #                            # measured Pareto curve (x = tok/s/user =
   #                            # 1000/mean_tpot_ms, y = tok/s/gpu =
   #                            # output_throughput/num_gpus)
@@ -40,7 +40,11 @@ benchmark:
 # The nsys timeline is decomposed with the internal-perf-nsight-system-analysis
 # skill (per-iteration time, busy/idle rungs, compute-absent causes);
 # ncu is the bounded per-kernel deep dive on the top nsys kernels,
-# interpreted with the perf-nsight-compute-analysis skill.
+# interpreted with the perf-nsight-compute-analysis skill. The combined
+# analyzer writes profiler_report.md for capture quality, analysis.md for
+# conclusions, and performance_model.yaml for the current theoretical best
+# and remaining gap at every benchmark point. Missing point evidence stays
+# explicit; a high-concurrency profile does not measure lower points.
 profile:
   methods: [nsys, ncu]
   nsys_iter_range: "100-150"
@@ -71,8 +75,10 @@ profile:
 # projector -> analyzer -> reporter) runs **by default**, so this section
 # only has to be written to turn it off or to hand the skill a hint. The
 # projector follows the internal-perf-sol-analysis skill
-# (trtllm-agent-toolkit) for the speed-of-light ceiling. Every field is
-# optional: `enabled` gates the stage (default true) and `gpu` is the
+# (trtllm-agent-toolkit) for the initial speed-of-light estimate preserved in
+# sol_projection.md. The analyzer updates performance_model.yaml even when
+# this stage is disabled. Reports use the current model as the comparison.
+# Every field is optional: `enabled` gates the stage (default true) and `gpu` is the
 # part-name hint for the skill's peaks calculator when the automatic
 # mapping would guess wrong.
 # The skill is internal, so open-source builds of the toolkit strip it.

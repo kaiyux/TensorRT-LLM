@@ -26,7 +26,7 @@ def _write(path: Path, text: str = "content\n") -> Path:
 def _perf_analyze_workspace(root: Path) -> Path:
     """A completed perf-analyze workspace (flat layout)."""
     _write(root / "benchmark_results.md", "# baseline\n")
-    _write(root / "profile_findings.md", "# findings\n")
+    _write(root / "analysis.md", "# findings\n")
     _write(root / "sol_projection.md", "# SOL\n")
     _write(root / "sol_work" / "peaks.json", "{}\n")
     _write(root / "server_nsys.nsys-rep", "trace\n")
@@ -49,7 +49,7 @@ def _perf_optimize_workspace(root: Path, rounds: int = 2) -> Path:
     _write(root / "roadmap.yaml", "version: 1\n")
     for index in range(1, rounds + 1):
         analysis = root / "rounds" / f"round_{index}" / "analysis"
-        _write(analysis / "profile_findings.md", f"# findings round {index}\n")
+        _write(analysis / "analysis.md", f"# findings round {index}\n")
         _write(analysis / "server_nsys.nsys-rep", "trace\n")
         _write(analysis / "kernel_ledger.yaml", f"version: 2  # round {index}\n")
     _write(root / "optimization_report.md", "# report\n")
@@ -125,6 +125,33 @@ def _complete_analysis(source: Path, analysis: Path) -> None:
     )
 
 
+def _performance_model(
+    analysis: Path,
+    *,
+    builds: tuple[str | dict[str, object], ...] = ("abc123",),
+    source: str | None = None,
+) -> Path:
+    model = {
+        "schema_version": 1,
+        "points": [
+            {
+                "concurrency": 64 * 2**index,
+                "operating_point": {"build": build},
+                "theoretical_best_tps": 100_000,
+            }
+            for index, build in enumerate(builds)
+        ],
+        "corrected_assumptions": ["Count prefill work in the serving bound"],
+    }
+    if source is not None:
+        model["source"] = source
+    return _write(
+        analysis / reuse.MODEL_FILENAME,
+        "# Preserve this corrected model and its original evidence references.\n"
+        + yaml.safe_dump(model, sort_keys=False),
+    )
+
+
 # -------------------------------------------------------------------- discover
 
 
@@ -132,7 +159,7 @@ def test_discover_reads_the_perf_analyze_layout(tmp_path):
     source = _perf_analyze_workspace(tmp_path / "analyze")
     found = reuse.discover(source)
     assert found.baseline_report == source / "benchmark_results.md"
-    assert found.findings == source / "profile_findings.md"
+    assert found.findings == source / "analysis.md"
     assert found.sol_projection == source / "sol_projection.md"
     assert found.sol_work == source / "sol_work"
     # perf-analyze never writes a roadmap.
@@ -153,7 +180,7 @@ def test_discover_picks_the_newest_round_numerically(tmp_path):
     """``round_10`` outranks ``round_9`` — the last state profiled wins."""
     source = _perf_optimize_workspace(tmp_path / "optimize", rounds=10)
     found = reuse.discover(source)
-    assert found.findings == (source / "rounds" / "round_10" / "analysis" / "profile_findings.md")
+    assert found.findings == (source / "rounds" / "round_10" / "analysis" / "analysis.md")
 
 
 def test_discover_skips_a_trailing_replan_round(tmp_path):
@@ -167,11 +194,11 @@ def test_discover_skips_a_trailing_replan_round(tmp_path):
     """
     source = _perf_optimize_workspace(tmp_path / "optimize", rounds=2)
     replan = source / "rounds" / "round_3" / "analysis"
-    _write(replan / "profile_findings.md", "# replan note (round 3)\n")
+    _write(replan / "analysis.md", "# replan note (round 3)\n")
 
     found = reuse.discover(source)
 
-    assert found.findings == (source / "rounds" / "round_2" / "analysis" / "profile_findings.md")
+    assert found.findings == (source / "rounds" / "round_2" / "analysis" / "analysis.md")
     assert found.kernel_ledger == found.findings.parent / "kernel_ledger.yaml"
 
 
@@ -237,30 +264,261 @@ def test_discover_keeps_sibling_ledger_when_newer_provenance_does_not_match(tmp_
     assert found.kernel_ledger == sibling
 
 
+@pytest.mark.parametrize("provenance", ["source", "manifest"])
+def test_discover_prefers_newest_model_for_same_capture_and_builds(tmp_path, provenance):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile", "selected-capture")
+    analysis = profile.parent / "analysis"
+    findings = _write(analysis / reuse.FINDINGS_NAME, "completed findings")
+    _complete_analysis(source, analysis)
+    _performance_model(analysis, builds=("abc123", "variant456"))
+    for number in (2, 10, 9):
+        later = source / "rounds" / f"round_{number}" / "analysis"
+        model = _performance_model(
+            later,
+            builds=("abc123", "variant456"),
+            source="rounds/round_1/profile" if provenance == "source" else None,
+        )
+        data = yaml.safe_load(model.read_text())
+        data["points"].reverse()
+        _write(model, yaml.safe_dump(data))
+        if provenance == "manifest":
+            _write(
+                later / "analysis_manifest.yaml",
+                "capture_id: selected-capture\nprofile_dir: rounds/round_1/profile\n",
+            )
+
+    found = reuse.discover(source)
+
+    assert found.findings == findings
+    assert found.profile_dir == profile
+    assert found.performance_model == source / "rounds/round_10/analysis/performance_model.yaml"
+    assert "selected capture" in found.performance_model_scope
+    assert "build identities" in found.performance_model_scope
+
+
+@pytest.mark.parametrize("different_revision", [False, True])
+def test_discover_compares_structured_build_identity_independent_of_key_order(
+    tmp_path, different_revision
+):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
+    sibling = _performance_model(
+        analysis,
+        builds=({"revision": "abc123", "compiler": {"cuda": "13", "flags": ["fast"]}},),
+    )
+    later = _performance_model(
+        source / "rounds" / "round_10" / "analysis",
+        builds=(
+            {
+                "compiler": {"flags": ["fast"], "cuda": "13"},
+                "revision": "changed" if different_revision else "abc123",
+            },
+        ),
+        source="rounds/round_1/profile",
+    )
+
+    found = reuse.discover(source)
+
+    assert found.performance_model == (sibling if different_revision else later)
+
+
+@pytest.mark.parametrize("mismatch", ["swapped-builds", "duplicate-concurrency"])
+def test_discover_model_requires_build_identity_at_each_unique_concurrency(tmp_path, mismatch):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
+    sibling = _performance_model(analysis, builds=("abc123", "variant456"))
+    later = _performance_model(
+        source / "rounds" / "round_10" / "analysis",
+        builds=("variant456", "abc123")
+        if mismatch == "swapped-builds"
+        else ("abc123", "variant456"),
+        source="rounds/round_1/profile",
+    )
+    if mismatch == "duplicate-concurrency":
+        data = yaml.safe_load(later.read_text())
+        data["points"][1]["concurrency"] = data["points"][0]["concurrency"]
+        _write(later, yaml.safe_dump(data))
+
+    found = reuse.discover(source)
+
+    assert found.performance_model == sibling
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "no-provenance",
+        "other-capture",
+        "invalid-manifest",
+        "outside",
+        "different-build",
+        "missing-build",
+        "extra-build",
+    ],
+)
+def test_discover_keeps_sibling_model_when_newer_scope_is_unproven(tmp_path, mismatch):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile", "selected-capture")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
+    sibling = _performance_model(analysis)
+    _capture(source / "rounds" / "round_2" / "profile", "different-capture")
+    _capture(tmp_path / "outside", "outside-capture")
+    later = source / "rounds" / "round_10" / "analysis"
+    references = {
+        "no-provenance": None,
+        "other-capture": "rounds/round_2/profile",
+        "outside": "../outside",
+    }
+    builds = {
+        "different-build": ("different-build",),
+        "missing-build": ("",),
+        "extra-build": ("abc123", "different-build"),
+    }
+    _performance_model(
+        later,
+        builds=builds.get(mismatch, ("abc123",)),
+        source=references.get(mismatch, "rounds/round_1/profile"),
+    )
+    if mismatch == "invalid-manifest":
+        _write(
+            later / "analysis_manifest.yaml",
+            "capture_id: wrong-capture\nprofile_dir: rounds/round_1/profile\n",
+        )
+
+    found = reuse.discover(source)
+
+    assert found.findings == analysis / reuse.FINDINGS_NAME
+    assert found.profile_dir == profile
+    assert found.performance_model == sibling
+    assert "Selected analysis's model" in found.performance_model_scope
+
+
+@pytest.mark.parametrize("build", ["abc123", "different-build"])
+def test_discover_model_without_sibling_requires_capture_build(tmp_path, build):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
+    candidate = _performance_model(
+        source / "rounds" / "round_2" / "analysis",
+        builds=(build,),
+        source="rounds/round_1/profile",
+    )
+
+    found = reuse.discover(source)
+
+    assert found.performance_model == (candidate if build == "abc123" else None)
+    assert bool(found.performance_model_scope) == (build == "abc123")
+
+
+@pytest.mark.parametrize("build", ["abc123", "final-build"])
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_import_prefers_completed_final_model_with_explicit_build_scope(tmp_path, build, reanalyze):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile", "selected-capture")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME, "standing capture findings")
+    _complete_analysis(source, analysis)
+    _performance_model(analysis)
+    _performance_model(source / "rounds" / "round_10" / "analysis", source="rounds/round_1/profile")
+    final_analysis = source / "final_verification" / "analysis"
+    final_model = _performance_model(final_analysis, builds=(build,))
+    _write(final_analysis / reuse.FINDINGS_NAME, "Final verification")
+    _write(
+        final_analysis / "analysis_manifest.yaml",
+        "schema_version: 1\nanalysis_id: final_verification\n"
+        "capture_id: selected-capture\nprofile_dir: rounds/round_1/profile\n",
+    )
+    original = final_model.read_bytes()
+    workspace = tmp_path / "destination"
+
+    found = reuse.discover(source, reanalyze=reanalyze)
+    imported = _split_import(source, workspace, reanalyze=reanalyze)
+
+    assert found.profile_dir == profile
+    assert found.performance_model == final_model
+    assert imported.performance_model
+    assert (
+        workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_PERFORMANCE_MODEL_NAME
+    ).read_bytes() == original
+    assert final_model.read_bytes() == original
+    assert not (workspace / "rounds/round_1/analysis/performance_model.yaml").exists()
+    scope = imported.performance_model_scope.lower()
+    assert "final" in scope
+    if build == "final-build":
+        assert "build" in scope and "differ" in scope
+        assert "inherited capture" in scope
+    manifest = imported.manifest_path.read_text()
+    assert str(final_model) in manifest
+    assert imported.performance_model_scope in manifest
+
+
+@pytest.mark.parametrize("identity", ["missing", "source-only", "other-capture", "wrong-id"])
+def test_discover_ignores_final_model_without_matching_completion_identity(tmp_path, identity):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile", "selected-capture")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
+    sibling = _performance_model(analysis)
+    _capture(source / "rounds" / "round_2" / "profile", "different-capture")
+    final_analysis = source / "final_verification" / "analysis"
+    _performance_model(
+        final_analysis,
+        source="rounds/round_1/profile" if identity == "source-only" else None,
+    )
+    _write(final_analysis / reuse.FINDINGS_NAME, "Unverified final analysis")
+    if identity in ("other-capture", "wrong-id"):
+        _write(
+            final_analysis / "analysis_manifest.yaml",
+            "capture_id: different-capture\nprofile_dir: "
+            + (
+                "rounds/round_2/profile\n"
+                if identity == "other-capture"
+                else "rounds/round_1/profile\n"
+            ),
+        )
+
+    found = reuse.discover(source)
+
+    assert found.profile_dir == profile
+    assert found.performance_model == sibling
+
+
 def test_discover_recognizes_a_profile_that_omitted_nsys(tmp_path):
     """`profile.methods` supports ncu-only profiling rounds."""
     source = tmp_path / "optimize"
     _write(source / "baseline" / "benchmark_results.md", "# baseline\n")
     profiled = source / "rounds" / "round_2" / "analysis"
-    _write(profiled / "profile_findings.md", "# profiled without nsys\n")
+    _write(profiled / "analysis.md", "# profiled without nsys\n")
     _write(profiled / "server_ncu.ncu-rep", "capture\n")
     replan = source / "rounds" / "round_3" / "analysis"
-    _write(replan / "profile_findings.md", "# trailing replan note\n")
+    _write(replan / "analysis.md", "# trailing replan note\n")
 
     found = reuse.discover(source)
 
-    assert found.findings == profiled / "profile_findings.md"
+    assert found.findings == profiled / "analysis.md"
 
 
 def test_discover_falls_back_to_prose_when_no_round_profiled(tmp_path):
     """Importing findings without traces still beats importing nothing."""
     source = tmp_path / "optimize"
     _write(source / "baseline" / "benchmark_results.md", "# baseline\n")
-    _write(source / "rounds" / "round_1" / "analysis" / "profile_findings.md", "# note\n")
+    _write(source / "rounds" / "round_1" / "analysis" / "analysis.md", "# note\n")
 
     found = reuse.discover(source)
 
-    assert found.findings == (source / "rounds" / "round_1" / "analysis" / "profile_findings.md")
+    assert found.findings == (source / "rounds" / "round_1" / "analysis" / "analysis.md")
 
 
 def test_discover_ignores_blank_managed_placeholders(tmp_path):
@@ -284,6 +542,94 @@ def test_discover_rejects_a_non_directory(tmp_path):
 # ---------------------------------------------------------------------- import
 
 
+@pytest.mark.parametrize("layout", ["flat", "split"])
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_import_preserves_corrected_model_as_reference_alongside_original_sol(
+    tmp_path, layout, reanalyze
+):
+    source = tmp_path / "source"
+    if layout == "flat":
+        _perf_analyze_workspace(source)
+        _capture(source)
+        analysis = source
+    else:
+        profile = _capture(source / "rounds" / "round_1" / "profile")
+        analysis = profile.parent / "analysis"
+        _write(analysis / reuse.FINDINGS_NAME)
+        _complete_analysis(source, analysis)
+    projection = _write(source / "sol_projection.md", "# Original SOL\nCeiling: 120,409 tok/s\n")
+    model = _performance_model(analysis)
+    original_model = model.read_bytes()
+    original_projection = projection.read_bytes()
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=reanalyze)
+
+    prior = workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_PERFORMANCE_MODEL_NAME
+    assert imported.performance_model
+    assert imported.performance_model_scope
+    assert prior.read_bytes() == original_model
+    assert (workspace / "sol_projection.md").read_bytes() == original_projection
+    assert model.read_bytes() == original_model
+    assert projection.read_bytes() == original_projection
+    assert not (workspace / "rounds/round_1/analysis/performance_model.yaml").exists()
+    assert not (
+        workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_ANALYSIS_DIRNAME / reuse.MODEL_FILENAME
+    ).exists()
+    manifest = imported.manifest_path.read_text()
+    assert str(model) in manifest
+    assert "reused_analysis/prior_performance_model.yaml" in manifest
+    assert "read-only reference" in manifest
+    assert "performance model (as reference)" in imported.summary()
+
+
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_legacy_import_without_model_preserves_existing_artifacts(tmp_path, reanalyze):
+    source = _perf_analyze_workspace(tmp_path / "source")
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=reanalyze)
+
+    assert imported.profile
+    assert imported.baseline_report
+    assert imported.sol_projection
+    assert not imported.performance_model
+    assert imported.performance_model_scope == ""
+    assert (workspace / "sol_projection.md").read_bytes() == (
+        source / "sol_projection.md"
+    ).read_bytes()
+    assert not (workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_PERFORMANCE_MODEL_NAME).exists()
+    assert not (workspace / "rounds/round_1/analysis/performance_model.yaml").exists()
+    assert "No prior performance model was available" in imported.manifest_path.read_text()
+
+
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_import_copies_selected_replan_model_with_original_provenance(tmp_path, reanalyze):
+    source = tmp_path / "source"
+    profile = _capture(source / "rounds" / "round_1" / "profile")
+    analysis = profile.parent / "analysis"
+    _write(analysis / reuse.FINDINGS_NAME)
+    _complete_analysis(source, analysis)
+    _performance_model(analysis)
+    model = _performance_model(
+        source / "rounds" / "round_10" / "analysis", source="rounds/round_1/profile"
+    )
+    original = model.read_bytes()
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=reanalyze)
+
+    prior = workspace / reuse.REUSE_DIRNAME / reuse.PRIOR_PERFORMANCE_MODEL_NAME
+    assert imported.performance_model
+    assert prior.read_bytes() == original
+    assert model.read_bytes() == original
+    assert "selected capture" in imported.performance_model_scope
+    manifest = imported.manifest_path.read_text()
+    assert str(model) in manifest
+    assert imported.performance_model_scope in manifest
+    assert not (workspace / "rounds/round_1/analysis/performance_model.yaml").exists()
+
+
 def test_import_from_perf_analyze_lands_in_canonical_paths(tmp_path):
     source = _perf_analyze_workspace(tmp_path / "analyze")
     ws = tmp_path / "ws"
@@ -291,7 +637,7 @@ def test_import_from_perf_analyze_lands_in_canonical_paths(tmp_path):
 
     analysis = ws / "rounds" / "round_1" / "analysis"
     assert (ws / "baseline" / "benchmark_results.md").read_text(encoding="utf-8") == "# baseline\n"
-    assert (analysis / "profile_findings.md").read_text(encoding="utf-8") == "# findings\n"
+    assert (analysis / "analysis.md").read_text(encoding="utf-8") == "# findings\n"
     assert (ws / "sol_projection.md").read_text(encoding="utf-8") == "# SOL\n"
     assert (ws / "sol_work" / "peaks.json").is_file()
     # Result JSONs follow the baseline report (the evaluator diffs its
@@ -355,7 +701,7 @@ def test_import_from_perf_optimize_brings_ledger_and_prior_roadmap(tmp_path):
 
     analysis = ws / "rounds" / "round_1" / "analysis"
     # Full findings remain analysis; the source ledger is reference material.
-    assert "round 2" in (analysis / "profile_findings.md").read_text(encoding="utf-8")
+    assert "round 2" in (analysis / "analysis.md").read_text(encoding="utf-8")
     prior = ws / reuse.REUSE_DIRNAME / reuse.PRIOR_KERNEL_LEDGER_NAME
     assert "round 2" in prior.read_text(encoding="utf-8")
     assert not (analysis / reuse.KERNEL_LEDGER_NAME).exists()
@@ -405,7 +751,7 @@ def test_import_writes_a_manifest_naming_source_and_destinations(tmp_path):
     manifest = imported.manifest_path.read_text(encoding="utf-8")
     assert str(source) in manifest
     assert "benchmark_results.md" in manifest
-    assert "rounds/round_1/analysis/profile_findings.md" in manifest
+    assert "rounds/round_1/analysis/analysis.md" in manifest
     # The provenance warning the report is expected to relay.
     assert "measured" in manifest
 
@@ -413,7 +759,7 @@ def test_import_writes_a_manifest_naming_source_and_destinations(tmp_path):
 def test_import_is_best_effort_per_artifact(tmp_path):
     """A source with only findings still saves the profile."""
     source = tmp_path / "partial"
-    _write(source / "profile_findings.md", "# findings\n")
+    _write(source / "analysis.md", "# findings\n")
     ws = tmp_path / "ws"
     imported = _import_into(source, ws)
 
@@ -748,3 +1094,48 @@ def test_chained_imports_rebase_analysis_identity_to_destination_profile(tmp_pat
     assert imported.findings and imported.profile
     assert reuse.discover(second).profile_dir == second / "rounds" / "round_1" / "profile"
     assert (analysis / "analysis_manifest.yaml").read_text() == original_identity
+
+
+@pytest.mark.parametrize("layout", ["flat", "round"])
+@pytest.mark.parametrize("canonical", [None, "", "# current analysis\n"])
+def test_analysis_filename_migration_prefers_new_name_and_falls_back_to_legacy(
+    tmp_path, layout, canonical
+):
+    source = tmp_path / "source"
+    directory = source if layout == "flat" else source / "rounds/round_10/analysis"
+    legacy = _write(directory / "profile_findings.md", "# legacy findings\n")
+    if canonical is not None:
+        _write(directory / "analysis.md", canonical)
+    found = reuse.discover(source)
+    expected = directory / "analysis.md" if canonical else legacy
+    assert found.findings == expected
+
+    workspace = tmp_path / "destination"
+    _import_into(source, workspace)
+    analysis = workspace / "rounds/round_1/analysis"
+    assert (analysis / "analysis.md").read_text() == expected.read_text()
+    assert not (analysis / "profile_findings.md").exists()
+
+
+def test_import_preserves_profiler_report_even_when_not_listed_in_manifest(tmp_path):
+    source = tmp_path / "source"
+    _capture(source / "profile")
+    _write(source / "profile/profiler_report.md", "# Partial ncu coverage\n")
+    workspace = tmp_path / "destination"
+
+    imported = _split_import(source, workspace, reanalyze=True)
+
+    assert imported.profile is True
+    report = workspace / "rounds/round_1/profile/profiler_report.md"
+    assert report.read_text() == "# Partial ncu coverage\n"
+
+
+def test_import_from_combined_analyzer_preserves_profiler_report(tmp_path):
+    source = _perf_analyze_workspace(tmp_path / "source")
+    _write(source / "profiler_report.md", "# Combined-stage capture\n")
+    workspace = tmp_path / "destination"
+
+    _split_import(source, workspace, reanalyze=True)
+
+    report = workspace / "rounds/round_1/profile/profiler_report.md"
+    assert report.read_text() == "# Combined-stage capture\n"

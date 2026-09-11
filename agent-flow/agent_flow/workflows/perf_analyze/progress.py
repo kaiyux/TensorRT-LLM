@@ -46,7 +46,7 @@ Agents never write this file directly. Each agent is given:
 The orchestrator reads the resulting YAML to confirm each stage logged a
 summary before advancing — no regex over prose. The substantive data
 flows through the workspace artifact files (``benchmark_results.md``,
-``profile_findings.md``, the report), not through these summaries.
+``analysis.md``, the report), not through these summaries.
 """
 
 from __future__ import annotations

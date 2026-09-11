@@ -1,6 +1,6 @@
 ---
 name: perf-analyze
-description: Launch and operate this repo's perf-analyze workflow, which DIAGNOSES a TensorRT-LLM serving deployment without applying changes — benchmark at one concurrency or a Pareto curve of them (tok/s/user vs tok/s/gpu), analytical SOL projection on by default (via the internal-perf-sol-analysis skill), nsys + ncu per-kernel deep dive (via the perf-nsight-compute-analysis skill), and a report naming the single dominant bottleneck. Use when the user wants to analyze / profile / diagnose trtllm-serve performance (throughput, TTFT, TPOT, ITL, e2e latency) or says "run perf-analyze". To actually APPLY optimizations, use the perf-optimize workflow instead.
+description: Launch and operate this repo's perf-analyze workflow to diagnose TensorRT-LLM serving performance without applying changes. Benchmarks configured operating points, captures nsys/ncu evidence, and explains the remaining gap using the current theoretical-best performance_model.yaml. Use when the user wants to analyze, profile or diagnose trtllm-serve throughput or latency, or says "run perf-analyze". Use perf-optimize to apply and verify optimizations.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -9,19 +9,15 @@ metadata:
 # Operating the perf-analyze workflow
 
 `perf-analyze` is this repo's one-shot diagnosis pipeline for
-`trtllm-serve`: benchmarker → projector → analyzer → reporter. It
-serves the model, benchmarks one operating point, derives an analytical
-speed-of-light (SOL) ceiling (via the `internal-perf-sol-analysis`
-skill — the projector runs unless `sol.enabled: false` turns it off),
-profiles the same load under nsys + a bounded ncu per-kernel deep dive
-on the top nsys kernels (the analyzer — the same
-diagnosis stage perf-optimize runs; the ncu pass follows the
-`perf-nsight-compute-analysis` skill, and with the projector on the
-analyzer also correlates the measured per-op times against the ceiling
-via the SOL skill's `sol_calc.py analyze`), and writes
-`<workspace>/performance_report.md` (+ `.html`) whose headline is the
-**single dominant bottleneck**. It never applies optimizations and
-never mutates the TRT-LLM checkout.
+`trtllm-serve`: benchmarker → projector → analyzer → reporter. It measures
+configured operating points, derives an initial SOL estimate unless
+`sol.enabled: false`, and profiles the load under nsys and bounded ncu.
+The combined analyzer writes `profiler_report.md` for capture provenance
+and quality, `analysis.md` for conclusions, and `performance_model.yaml`
+for the current measured-to-theoretical comparison. The final
+`<workspace>/performance_report.md` (+ `.html`) explains the remaining
+performance gap and next actions. It never applies optimizations or
+mutates the TRT-LLM checkout.
 
 Do not hand-roll a serve/benchmark/profile loop when the user asks to
 diagnose serving performance — drive this workflow instead.
@@ -106,7 +102,7 @@ than inventing values:
   `request_rate` and `dataset_path`. `concurrency` is a single int
   (one operating point) **or a list of ints** — a list turns on
   Pareto-curve mode: one benchmark run per point over the same server,
-  profiling at the largest point, and the report gains a measured
+  profiling at the largest point, and **Result** includes a measured
   Pareto curve (x = tok/s/user = 1000/mean_tpot_ms, y = tok/s/gpu =
   output_throughput/num_gpus). Benchmark time scales with the point
   count; in curve mode `num_prompts` may also be a **list** paired
@@ -127,32 +123,26 @@ than inventing values:
 - `slurm-environment`: include only when the server + benchmark must
   run inside a Slurm-launched container; both `slurm_partition` and
   `docker_image` are then required.
-- `sol`: **the analytical SOL-projection stage is on by default**, so
-  omit this block unless the user wants to turn it off or hand the
-  skill a hint. Enabled, it produces `sol_projection.md` +
-  `sol_work/peaks.json`, the analyzer's measured↔SOL per-op correlation
-  in `profile_findings.md`, and a Projection vs Measured section in the
-  report. Write `sol: {enabled: false}` when the user explicitly does
-  not want it — e.g. to save the extra stage's wall-clock, or when the
-  SOL skill is unavailable. The
-  projector follows the `internal-perf-sol-analysis` skill (from the
-  `trtllm-agent-toolkit` plugin — an `internal-` skill, so open-source
-  builds strip it; install a build that has it for the full
-  methodology). Without it the projector falls back to `perf-analysis`
-  and degrades honestly: a coarse ceiling grounded on named sources
-  rather than the peaks calculator, no peaks file, and no measured↔SOL
-  correlation downstream. It never recalls a hardware peak.
-  Every field is optional — `enabled` gates the stage (default `true`)
-  and `gpu` is the part-name hint for the skill's peaks calculator. The stage needs no
-  GPU (with local GPUs it additionally measures the skill's latency
-  constants).
-  Where a spec or a mapping stays uncertain, the projector is pointed at
-  the `internal-glean-search` skill / `internal-glean-specialist`
-  subagent as read-only reference, used only if that skill or subagent is
-  installed in the session. The hosted-MCP wiring this skill used to
-  document (`--glean-mcp-url`, `$PERF_ANALYZE_GLEAN_MCP_URL`) is gone: the
-  workflow ships from TensorRT-LLM now, and upstream replaced the MCP
-  server with that skill. Passing the flag would be a CLI error.
+- `sol`: the initial SOL projection runs by default. Set
+  `sol: {enabled: false}` to skip the projector or use `gpu` as a hardware
+  part-name hint. The projector follows `internal-perf-sol-analysis` when
+  installed, otherwise `perf-analysis` with named hardware sources. It
+  preserves its initial estimate and assumptions in `sol_projection.md`
+  and writes `sol_work/peaks.json` when available. Missing hardware or
+  latency inputs remain explicit.
+
+The analyzer always produces `performance_model.yaml`, including when the
+projector is disabled. It pairs measured and theoretical performance at
+every benchmark point on the same workload, runtime, timing window and
+statistic. The initial projection is provenance for this current model.
+Kernel sums, decode critical paths and whole-run serving measurements
+need an explicit derivation before comparison. The model distinguishes
+physical limits, recoverable costs, scope constraints, measurement
+limitations and unresolved residual. Unknown bounds remain explicit with
+the next measurement needed. A profile at one concurrency cannot supply
+measurements at another point. Convergence requires consistent evidence
+explaining the residual across all focus points (all configured points
+when no subset is set); all points remain represented in the model.
 
 ## 3. Launch (long-running — background it)
 
@@ -173,8 +163,8 @@ a log file, then monitor.
   workspace `task.yaml` while prompt selection reads the `--task` file,
   and they must agree about the `sol` / `slurm-environment` blocks.
 - **Fresh start**: `--clean` wipes the checkpoint and managed outputs
-  (`benchmark_results.md`, `sol_projection.md`,
-  `profile_findings.md`, `performance_report.md/.html`,
+  (`benchmark_results.md`, `sol_projection.md`, `performance_model.yaml`,
+  `profiler_report.md`, `analysis.md`, `performance_report.md/.html`,
   `progress.yaml`); run artifacts (`serve.log`, result JSON,
   `*.nsys-rep`, `*.ncu-rep`) are left alone.
 - A workspace holding non-empty outputs but **no checkpoint** refuses
@@ -188,7 +178,8 @@ Poll the workspace (and the launch log) rather than waiting silently:
 - `progress.yaml` — append-only audit log; new entries mean it's alive.
 - Stage deliverables appear in order: `benchmark_results.md` →
   `sol_projection.md` (unless `sol.enabled: false`) →
-  `profile_findings.md` → `performance_report.md` / `.html`.
+  `profiler_report.md`, `analysis.md` and `performance_model.yaml` →
+  `performance_report.md` / `.html`.
 - Run artifacts: `serve.log` (server health), the raw benchmark result
   JSON, `server_nsys.nsys-rep` + `nsys_stats.txt`,
   `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`,
@@ -202,21 +193,24 @@ environment issue and re-run.
 
 ## 5. Wrap up
 
-When the run finishes (`✔ performance report written`), report to the
-user from `performance_report.md` / `.html`:
+Use the four sections of `performance_report.md` / `.html`:
 
-- the **single dominant bottleneck** (the report names exactly one
-  headline category) and the key trace evidence behind it,
-- the headline benchmark metrics at the configured operating point,
-- **Projection vs Measured** and the projected headroom, when the
-  projector ran (or note the projection declared itself unavailable),
-- the top recommendations — stressing that nothing was applied; this
-  workflow is diagnosis-only,
-- point them at `performance_report.html` (self-contained, renders the
-  top-kernel share-bar chart) and the raw traces for their own digging.
+1. **Result** — measured performance and runtime/coverage provenance.
+2. **Theoretical performance model** — current measured versus theoretical
+   best per point, the common timing basis and essential assumptions.
+3. **Gap analysis** — material remaining costs, evidence for each
+   explanation, constraints and explicit unresolved residual.
+4. **Next actions** — consequential findings and the
+   highest-value optimization or measurement recommendations.
 
-If the user wants the recommendations acted on, offer to run the
-`perf-optimize` workflow next — its roadmap can start from this report.
+Keep commands, full configurations, kernel tables and detailed arithmetic
+in linked artifacts. The initial `sol_projection.md` provides provenance;
+headlines use the current model. Unavailable theory or missing evidence
+cannot establish convergence. Model status is `open`, `converged`,
+`measurement_limited`, `scope_limited` or `model_invalid`.
+
+Point the user to the self-contained HTML report and its linked evidence.
+If they want changes applied, perf-optimize can reuse this analysis.
 
 ## Pitfalls
 

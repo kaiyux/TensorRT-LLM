@@ -42,7 +42,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("workspace/perf-analyze"),
         help="Workspace directory for shared state files (task.yaml, "
-        "benchmark_results.md, sol_projection.md, profile_findings.md, "
+        "benchmark_results.md, sol_projection.md, profiler_report.md, analysis.md, performance_model.yaml, "
         "performance_report.md/.html, progress.yaml, prompts/) and run "
         "artifacts (serve.log, result JSON, *.nsys-rep, *.ncu-rep). Each "
         "launch snapshots every role's composed system prompt to "
@@ -53,7 +53,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Wipe the workspace checkpoint and managed files "
         f"({STATE_FILENAME}, benchmark_results.md, sol_projection.md, "
-        "profile_findings.md, performance_report.md, "
+        "profiler_report.md, analysis.md, performance_model.yaml, performance_report.md, "
         "performance_report.html, progress.yaml) and "
         "start fresh. Without this flag the workflow resumes from the "
         "checkpoint when one is present, and starts fresh otherwise.",

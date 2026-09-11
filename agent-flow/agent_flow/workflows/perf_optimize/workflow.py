@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
@@ -24,6 +25,7 @@ from agent_flow import (
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
+from agent_flow.workflows.perf_analyze import performance_model
 from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
 from agent_flow.workflows.perf_analyze.sol_methodology import (
     SolMethodology,
@@ -34,7 +36,12 @@ from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_res
 
 from . import gitops, kernel_ledger, measurements, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
-from .profile import PROFILE_MANIFEST_NAME, ProfileError, validate_profile_manifest
+from .profile import (
+    PROFILE_MANIFEST_NAME,
+    PROFILE_REPORT_NAME,
+    ProfileError,
+    validate_profile_manifest,
+)
 from .progress import (
     EVALUATOR_DECISIONS,
     GAP_IMPLICATIONS,
@@ -55,6 +62,7 @@ from .state import (
     STAGE_ANALYZER,
     STAGE_BENCHMARKER,
     STAGE_EVALUATOR,
+    STAGE_FINAL_ANALYZER,
     STAGE_INTEGRATOR,
     STAGE_OPTIMIZER,
     STAGE_OPTIMIZER_EVALUATOR,
@@ -265,6 +273,7 @@ class PerfOptimizeWorkflow:
         self.worktrees_dir = workspace / "worktrees"
         self.final_verification_dir = workspace / "final_verification"
         self.verification_report_path = self.final_verification_dir / "verification_report.md"
+        self.final_analysis_dir = self.final_verification_dir / "analysis"
         self.report_path = workspace / "optimization_report.md"
         self.report_html_path = workspace / "optimization_report.html"
         self.progress_path = workspace / "progress.yaml"
@@ -506,18 +515,22 @@ class PerfOptimizeWorkflow:
                     self._run_analyzer(state)
                     analyzer_outputs = [
                         self.roadmap_path,
-                        analysis_dir / "profile_findings.md",
+                        analysis_dir / "analysis.md",
+                        analysis_dir / performance_model.MODEL_FILENAME,
                     ]
                     enforce_ledger = self._kernel_coverage() is not None
                     if enforce_ledger:
                         analyzer_outputs.append(analysis_dir / kernel_ledger.LEDGER_FILENAME)
                     self._require_stage_outputs(STAGE_ANALYZER, analyzer_outputs)
                     roadmap = self._validate_roadmap()
+                    model = self._validate_performance_model(analysis_dir)
                     if enforce_ledger:
                         self._validate_kernel_ledger(roadmap, analysis_dir, round_no=round_no)
                     self._validate_nsys_items(roadmap, analysis_dir)
-                    if not replan_only and not state.reuse_pending:
-                        self._record_analysis_source(state, analysis_dir)
+                    if not state.reuse_pending:
+                        self._record_analysis_source(
+                            state, analysis_dir, mode="replan" if replan_only else "capture"
+                        )
                     if not replan_only and not (state.reuse_pending or state.reanalyze_pending):
                         # This round's evidence now describes the current
                         # build; a replan round produced none and leaves the
@@ -530,7 +543,11 @@ class PerfOptimizeWorkflow:
                         # round 2 of a reuse campaign profile normally instead
                         # of replanning against a stranger's traces.
                         state.last_profiled_analysis_dir = str(analysis_dir)
-                        state.profile_required = False
+                        state.profile_required = self._model_needs_measurement(model)
+                    elif self._model_needs_measurement(model):
+                        # Replans may discover a new capture need even when an
+                        # existing optimization item remains actionable.
+                        state.profile_required = True
                     state.reuse_pending = False
                     state.reanalyze_pending = False
                     noise_floor = float(self._optimize_block()["noise_floor_pct"])
@@ -541,13 +558,35 @@ class PerfOptimizeWorkflow:
                         self._allowed_approaches(),
                     )
                     if not items:
-                        # The analyzer just profiled the current state and
-                        # planned nothing actionable — further rounds would
-                        # re-derive the same nothing at full profile cost.
+                        model_status = performance_model.convergence_status(
+                            model, focus_concurrencies=self._focus_points()
+                        )
                         state.round_index += 1
                         state.item_index = 0
+                        if (
+                            self._model_needs_measurement(model)
+                            and state.round_index < state.max_rounds
+                        ):
+                            state.profile_required = True
+                            state.stage = STAGE_PROFILER
+                            print_message(
+                                "[cyan]model requires new evidence; scheduling a targeted "
+                                "profile from its next tests[/cyan]",
+                                log,
+                            )
+                            self._checkpoint(state)
+                            continue
+                        budget_note = (
+                            "; round budget exhausted"
+                            if state.round_index >= state.max_rounds
+                            else ""
+                        )
                         self._conclude_round_loop(
-                            state, "roadmap has no actionable pending items", log
+                            state,
+                            "roadmap has no actionable pending items; theoretical model status: "
+                            + model_status
+                            + budget_note,
+                            log,
                         )
                         break
                     state.stage = STAGE_OPTIMIZER_EVALUATOR
@@ -600,12 +639,49 @@ class PerfOptimizeWorkflow:
                         "verification benchmark[/bold yellow]",
                         log,
                     )
+                state.stage = STAGE_FINAL_ANALYZER if self._any_accepted_items() else STAGE_REPORTER
+                self._checkpoint(state)
+
+            # A pre-reconciliation reporter checkpoint must also acquire a
+            # final model; the existing QA artifact remains the measurement.
+            if state.stage in (STAGE_REPORTER, STAGE_FINAL_ANALYZER) and self._any_accepted_items():
+                self._require_stage_outputs(STAGE_QA, [self.verification_report_path])
+            if (
+                state.stage == STAGE_REPORTER
+                and self._any_accepted_items()
+                and self.verification_report_path.is_file()
+                and not self._is_nonempty(
+                    self.final_analysis_dir / performance_model.MODEL_FILENAME
+                )
+            ):
+                state.stage = STAGE_FINAL_ANALYZER
+                self._checkpoint(state)
+
+            if state.stage == STAGE_FINAL_ANALYZER:
+                print_rule("[bold cyan]Analyzer (final model reconciliation)[/bold cyan]", log)
+                self.final_analysis_dir.mkdir(parents=True, exist_ok=True)
+                self._run_final_analyzer(state)
+                self._require_stage_outputs(
+                    STAGE_FINAL_ANALYZER,
+                    [
+                        self.final_analysis_dir / "analysis.md",
+                        self.final_analysis_dir / performance_model.MODEL_FILENAME,
+                    ],
+                )
+                self._validate_performance_model(self.final_analysis_dir)
+                self._record_analysis_source(
+                    state, self.final_analysis_dir, mode="final_reconciliation"
+                )
                 state.stage = STAGE_REPORTER
                 self._checkpoint(state)
 
             # ---- one-shot: report ----
             if state.stage == STAGE_REPORTER:
                 print_rule("[bold cyan]Reporter[/bold cyan]", log)
+                model_path = self._report_performance_model()
+                if model_path is None:
+                    raise RuntimeError("reporter requires a validated performance_model.yaml")
+                self._validate_performance_model(model_path.parent)
                 self._run_reporter(state)
                 self._require_stage_outputs(
                     STAGE_REPORTER, [self.report_path, self.report_html_path]
@@ -1839,6 +1915,7 @@ class PerfOptimizeWorkflow:
                 profile_dir,
                 required_methods=None if imported else self._profile_methods(),
                 require_raw=imported,
+                require_report=not imported,
             )
         except ProfileError as exc:
             raise RuntimeError(
@@ -1847,11 +1924,112 @@ class PerfOptimizeWorkflow:
                 f"fresh campaign if a new capture is needed."
             ) from exc
 
-    def _record_analysis_source(self, state: WorkflowState, analysis_dir: Path) -> None:
+    def _validate_performance_model(self, analysis_dir: Path) -> dict[str, Any]:
+        path = analysis_dir / performance_model.MODEL_FILENAME
+        try:
+            model = performance_model.load_model(path)
+            problems = performance_model.validate_task_model(
+                model,
+                metric=str(self._optimize_block()["target_metric"]),
+                concurrencies=self._curve_points() if self._curve_mode() else [None],
+            )
+            if problems:
+                raise performance_model.ModelError("; ".join(problems))
+            return model
+        except performance_model.ModelError as exc:
+            raise RuntimeError(
+                f"analyzer stage finished but {path} failed validation: {exc}"
+            ) from exc
+
+    def _performance_model_instruction(self, state: WorkflowState) -> str:
+        path = self._analysis_dir(state) / performance_model.MODEL_FILENAME
+        previous = self._latest_performance_model(before_round=state.round_index + 1)
+        prior_instruction = (
+            f"Read `{previous}` as the prior model, retaining the evidence and "
+            f"explanation for any changed assumption or bound. "
+            if previous is not None
+            else ""
+        )
+        imported_model = self.reuse_dir / reuse.PRIOR_PERFORMANCE_MODEL_NAME
+        if previous is None and imported_model.is_file():
+            prior_instruction += (
+                f"Read `{imported_model}` as read-only prior art and "
+                f"`{self.reuse_manifest_path}` for its source and selection scope. "
+                f"Retain its corrected assumptions where capture, build, hardware, "
+                f"workload and timing conditions match; do not silently replace them "
+                f"with the original SOL projection. Resolve citations in the source "
+                f"workspace. Source measurements do not establish this campaign's "
+                f"current performance: write a fresh model below and mark mismatches "
+                f"or missing evidence explicitly. "
+            )
+        return (
+            prior_instruction
+            + f"Write `{path}` as the single current theoretical best performance "
+            f"model, even when SOL projection or kernel coverage is disabled. "
+            f"Cover every configured concurrency (use null for scalar mode), "
+            f"the task's target metric, matching runtime/workload/timing scope, "
+            f"measured performance, a supported best-case bound or explicit unknown, "
+            f"and an exhaustive non-overlapping gap decomposition. Every bound or "
+            f"blocker needs evidence; unknowns need the next discriminating test. "
+            f"Use this model for roadmap gain estimates and convergence. A stopped "
+            f"campaign or failed attempt alone does not establish convergence. "
+            f"Summarize the model in `analysis.md` and link detailed evidence.\n\n"
+        )
+
+    def _latest_performance_model(self, *, before_round: int | None = None) -> Path | None:
+        candidates = []
+        for path in self.rounds_dir.glob(f"round_*/analysis/{performance_model.MODEL_FILENAME}"):
+            match = re.fullmatch(r"round_(\d+)", path.parent.parent.name)
+            if match and (before_round is None or int(match.group(1)) < before_round):
+                candidates.append((int(match.group(1)), path))
+        return max(candidates)[1] if candidates else None
+
+    def _report_performance_model(self) -> Path | None:
+        final_model = self.final_analysis_dir / performance_model.MODEL_FILENAME
+        return final_model if final_model.is_file() else self._latest_performance_model()
+
+    def _model_needs_measurement(self, model: dict[str, Any]) -> bool:
+        focus = self._focus_points()
+        return any(
+            point["status"] == "measurement_limited"
+            or any(
+                component["gap_kind"] == "measurement_limited" for component in point["components"]
+            )
+            for point in model["points"]
+            if focus is None or point["concurrency"] in focus
+        )
+
+    def _record_analysis_source(
+        self, state: WorkflowState, analysis_dir: Path, *, mode: str = "capture"
+    ) -> None:
         """Record which immutable capture this completed analysis interprets."""
+        if mode == "final_reconciliation" and not state.last_profile_dir:
+            # Findings-only legacy reuse can optimize and reach QA without a
+            # reusable capture. Preserve that explicit limit in the final model.
+            (analysis_dir / "analysis_manifest.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": 1,
+                        "analysis_id": "final_reconciliation",
+                        "capture_id": None,
+                        "profile_dir": None,
+                        "mode": mode,
+                        "new_capture": False,
+                        "capture_matches_model_build": False,
+                        "capture_unavailable": "No reusable capture identity was recorded; "
+                        "final measurements come from QA and prior findings remain scoped evidence.",
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            return
         profile_dir = Path(state.last_profile_dir)
         manifest = validate_profile_manifest(profile_dir)
         relative_profile = profile_dir.relative_to(self.workspace)
+        model_path = analysis_dir / performance_model.MODEL_FILENAME
+        model_builds = reuse._model_builds(model_path)
+        capture_build = json.dumps(manifest["runtime"]["build"], sort_keys=True)
         (analysis_dir / "analysis_manifest.yaml").write_text(
             yaml.safe_dump(
                 {
@@ -1860,6 +2038,10 @@ class PerfOptimizeWorkflow:
                     "capture_id": manifest["capture_id"],
                     "profile_dir": str(relative_profile),
                     "imported": state.reanalyze_pending,
+                    "mode": mode,
+                    "new_capture": mode == "capture" and not state.reanalyze_pending,
+                    "capture_matches_model_build": bool(model_builds)
+                    and all(build == capture_build for build in model_builds.values()),
                 },
                 sort_keys=False,
             ),
@@ -2057,14 +2239,14 @@ class PerfOptimizeWorkflow:
             f"and extend to {coverage['coverage_target_pct']}% coverage. Record "
             f"`coverage.gpu_busy_pct` and answer all four questions — eliminable? "
             f"faster? fusible? overlappable? — with roadmap references or cited "
-            f"evidence. Mirror the answers under `## Kernel disposition ledger` "
-            f"in the findings. Maintain the **best current theoretical performance "
-            f"model** in this same ledger, using shared region models where kernel "
+            f"evidence. Keep the detailed dispositions in the machine-readable "
+            f"ledger and link to them from the analysis. Maintain supporting "
+            f"per-kernel and per-region models in this ledger, using shared models where kernel "
             f"boundaries change through fusion or elimination. {history}"
-            f"Write `## Per-layer theoretical performance model` in "
-            f"`{self._analysis_dir(state) / 'profile_findings.md'}` following the "
+            f"Write `## Theoretical performance model` in "
+            f"`{self._analysis_dir(state) / 'analysis.md'}` following the "
             f"report contract, including on replan/reuse turns. Give it the explicit "
-            f"HTML anchor `per-layer-theoretical-performance-model-round-{round_no}` "
+            f"HTML anchor `theoretical-performance-model-round-{round_no}` "
             f"(prefix with `current-campaign-` if imported text already uses it). "
             f"Compare predictions with measured silicon performance under matching "
             f"conditions; retain source capture/build identities and measurement "
@@ -2617,7 +2799,7 @@ class PerfOptimizeWorkflow:
         that assignment in ``run``).
         """
         analysis_dir = self._analysis_dir(state)
-        findings_path = analysis_dir / "profile_findings.md"
+        findings_path = analysis_dir / "analysis.md"
         profile_dir = Path(state.last_profile_dir) if state.last_profile_dir else analysis_dir
         prior_roadmap_context = ""
         if self.prior_roadmap_path.is_file():
@@ -2637,10 +2819,9 @@ class PerfOptimizeWorkflow:
         if self._sol_enabled():
             projection_context = (
                 f"Read `{self.sol_projection_path}` (imported with the rest) "
-                f"as **optional context**: the projected ceiling, % of SOL "
-                f"headroom, and bound mix inform how you rank items and "
-                f"sanity-bound their `expected_gain_pct`; the imported "
-                f"measured evidence still outranks it. Any measured↔SOL "
+                f"as the initial theoretical model. Reconcile its assumptions "
+                f"with imported measurements into `performance_model.yaml`, "
+                f"the current basis for gap estimates and convergence. Any measured↔SOL "
                 f"correlation the source produced is already in "
                 f"`{analysis_dir}` — use it as the initial model and revise assumptions "
                 f"when the saved evidence warrants a correction.\n\n"
@@ -2661,12 +2842,14 @@ class PerfOptimizeWorkflow:
             f"`{self.reuse_manifest_path}` (what was imported, and from "
             f"where), `{findings_path}` **in full** plus the traces and "
             f"summaries in `{analysis_dir}` plus preserved captures in "
-            f"`{profile_dir}` (read-only), and "
+            f"`{profile_dir}` (read-only, including `{PROFILE_REPORT_NAME}` when "
+            f"present in the imported source), and "
             f"`{self.baseline_results_path}` (the validated baseline "
             f"measurement, imported or measured by this campaign — the anchor for the roadmap's `baseline` "
             f"block).\n\n"
             + projection_context
             + prior_roadmap_context
+            + self._performance_model_instruction(state)
             + self._kernel_ledger_instruction(state, reused=True)
             + f"Then **load the `perf-optimization-casebook` skill** (via the "
             f"`Skill` tool) as your system prompt directs, and tag each "
@@ -2690,13 +2873,13 @@ class PerfOptimizeWorkflow:
             f"`expected_gain_pct` descending, each grounded in the imported "
             f"evidence with a quantified `expected_gain_rationale`."
             f"{self._baseline_curve_note()}\n\n"
-            f"Then **extend** `{findings_path}` — keep every imported line "
-            f"verbatim (it is the record of a run you did not make) and "
-            f"append two sections: `## Reused analysis` (what you reused, "
-            f"from where per the manifest, how well it fits this task, and "
-            f"what it does not cover) and `## Dormant capabilities` (the "
-            f"sweep's outcome), plus the current-campaign model section when "
-            f"required by the per-kernel coverage contract above.\n\n"
+            f"Preserve the imported analysis verbatim at "
+            f"`{self.reuse_dir / reuse.PRIOR_ANALYSIS_DIRNAME / reuse.FINDINGS_NAME}` "
+            f"before replacing `{findings_path}` with this campaign's concise analysis: "
+            f"`## Result`, `## Theoretical performance model`, `## Gap analysis`, "
+            f"and `## Next actions`. Cite the imported source and capture identity; "
+            f"state fit limitations and only capability findings that change the model "
+            f"or next actions. Keep detailed derivations in linked artifacts.\n\n"
             f"Before completing your turn, call `append_analyzer_progress` "
             f"with a `summary` naming the reuse source, which imported "
             f"artifacts you planned from, the fit check's outcome, and the "
@@ -2719,6 +2902,23 @@ class PerfOptimizeWorkflow:
                 "with each selected point in `benchmark.concurrency`; otherwise "
                 "use the scalar prompt count)"
             )
+        prior_model = self._latest_performance_model(before_round=round_no)
+        measurement_context = ""
+        if prior_model is not None:
+            model = performance_model.load_model(prior_model)
+            if self._model_needs_measurement(model):
+                measurement_context = (
+                    f"Read `{prior_model}` before choosing captures. Its scored points "
+                    f"need new evidence: follow each `next_test` and measurement-limited "
+                    f"component to target the missing concurrency, phase, kernel or "
+                    f"counter. Prioritize those captures even when the build is unchanged. "
+                    f"Record which model question each capture resolves, or the precise "
+                    f"reason the requested evidence remains unavailable.\n\n"
+                )
+                replay_note = (
+                    " at the operating points and iteration phases requested by the "
+                    "prior model's next tests, preserving their matching prompt counts"
+                )
         coverage = self._kernel_coverage()
         if coverage is not None:
             ncu_scope = (
@@ -2741,7 +2941,8 @@ class PerfOptimizeWorkflow:
             f"Profile directory (write capture artifacts here): {profile_dir}\n"
             f"Active runtime checkout: `{self._trtllm_repo_path()}`\n"
             f"Active tuning config: `{self.tuning_config_path}`\n\n"
-            f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
+            + measurement_context
+            + f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
             f"recover the serving commands and operating point. Verify this "
             f"checkout's profiling knobs with `rg` via `Bash` under "
             f"`{self._trtllm_hint()}` and record the actual build, import path, "
@@ -2765,7 +2966,10 @@ class PerfOptimizeWorkflow:
             f"(fully-qualified `trtllm-agent-toolkit:perf-nsight-compute-analysis` "
             f"if needed) as the capture methodology. {ncu_scope}\n\n"
             f"Poll readiness in the foreground and tear every server down before "
-            f"completing this turn. Write `{profile_dir / PROFILE_MANIFEST_NAME}` "
+            f"completing this turn. Write `{profile_dir / PROFILE_REPORT_NAME}` with "
+            f"a short capture summary, operating points and runtime identity, coverage "
+            f"and limitations, plus links to raw evidence. Keep analytical conclusions "
+            f"for the analyzer. Write `{profile_dir / PROFILE_MANIFEST_NAME}` last "
             f"using the manifest contract in your system prompt: a unique "
             f"`capture_id`, runtime provenance (`serve_command`, "
             f"`benchmark_command`, `config`, `build`, and `import_path`), and a "
@@ -2798,8 +3002,8 @@ class PerfOptimizeWorkflow:
             round_context = (
                 f"This is **round 1**: run the **dormant-capability sweep** "
                 f"per your system prompt (checkpoint config + weight index, "
-                f"unset serving knobs, gated code paths — record the outcome "
-                f"under `## Dormant capabilities` in `profile_findings.md`), "
+                f"unset serving knobs, gated code paths — record details in "
+                f"`dormant_capabilities.md` and link consequential findings from Next actions), "
                 f"then author `{self.roadmap_path}` from scratch "
                 f"per the roadmap contract in your system prompt — the `baseline` "
                 f"block from `{self.baseline_results_path}` (the target metric's "
@@ -2826,22 +3030,16 @@ class PerfOptimizeWorkflow:
                 f"history, `baseline`, `current_best`, or existing ids."
             )
         coverage_context = self._kernel_ledger_instruction(state)
-        comparison_section = (
-            "Per-layer theoretical performance model"
-            if coverage_context
-            else "SOL correlation (measured vs ceiling)"
-        )
         projection_context = ""
         if self._sol_enabled():
             projection_context = (
                 f"Also read `{self.sol_projection_path}` (or call "
                 f'`read_latest_progress` with `agent: "projector"`) as '
-                f"**optional context**: the projected SOL ceiling, % of SOL "
-                f"headroom, and compute/memory/launch bound mix can inform "
-                f"how you rank roadmap items and sanity-bound their "
-                f"`expected_gain_pct`, but measured trace evidence always "
-                f"outranks the projection — note where the profile confirms "
-                f"or contradicts it. Run the offline **measured↔SOL "
+                f"the initial theoretical model. Reconcile its assumptions with "
+                f"the measured evidence into `performance_model.yaml`; use that "
+                f"single current model to rank roadmap items and bound expected "
+                f"end-to-end gains. Preserve the original projection as provenance, "
+                f"not a competing headline ceiling. Run the offline **measured↔SOL "
                 f"correlation** per your system prompt: load the "
                 f"`internal-perf-sol-analysis` skill (via the `Skill` tool; "
                 f"fully-qualified "
@@ -2853,13 +3051,12 @@ class PerfOptimizeWorkflow:
                 f"against the Projector's "
                 f"`{self.workspace}/sol_work/peaks.json`, write "
                 f"`{analysis_dir}/sol.json`, and transcribe the joined "
-                f"per-op table into the findings' **{comparison_section}** "
-                f"section (or `Correlation "
+                f"per-op evidence into the linked model derivations supporting "
+                f"`## Theoretical performance model` (or `Correlation "
                 f"unavailable: <reason>` when a precondition fails). If you "
                 f"leave the roadmap with no "
                 f"actionable pending item while projected headroom remains, "
-                f"close `profile_findings.md` with the **Remaining-gap "
-                f"attribution** section per your system prompt — every part "
+                f"explain that stop in `analysis.md`'s **Gap analysis** — every part "
                 f"of the gap gets a supported item, an evidence-backed constraint, "
                 f"or is marked unexplained. Keep it brief and link to the "
                 f"comparison's explanations and next tests.\n\n"
@@ -2910,7 +3107,8 @@ class PerfOptimizeWorkflow:
             f"time, busy/idle rungs, and the compute-absent split "
             f"(launch-starved / blocking / dependency-stalled) from that "
             f"pipeline, not from the `nsys stats` table alone.\n\n"
-            f"Interpret the saved ncu reports (`server_ncu.ncu-rep` or the "
+            f"Read `{profile_dir / PROFILE_REPORT_NAME}` for capture coverage and "
+            f"limitations (legacy imports may lack it). Interpret the saved ncu reports (`server_ncu.ncu-rep` or the "
             f"per-pass reports) and exports using "
             f"`perf-nsight-compute-analysis` (fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if needed) "
@@ -2918,11 +3116,12 @@ class PerfOptimizeWorkflow:
             f"class, occupancy, and stalls. Respect unavailable methods and "
             f"capture caveats. If evidence is insufficient, name the needed "
             f"additional capture in findings; do not obtain it this turn.\n\n"
+            + self._performance_model_instruction(state)
             + coverage_context
-            + f"Write `{analysis_dir / 'profile_findings.md'}` (Profiling "
-            f"setup / nsys timeline / ncu kernel analysis / "
-            + (f"{comparison_section} / " if coverage_context or self._sol_enabled() else "")
-            + f"Ranked bottleneck hypotheses / Caveats), then write "
+            + f"Write `{analysis_dir / 'analysis.md'}` with only `## Result`, "
+            f"`## Theoretical performance model`, `## Gap analysis`, and "
+            f"`## Next actions`. Link detailed traces, per-kernel dispositions and "
+            f"derivations instead of duplicating them. Then write "
             f"`{self.roadmap_path}` with items ordered by expected benefit "
             f"and quantified `expected_gain_rationale` grounded across the "
             f"available analyses.\n\n"
@@ -2965,9 +3164,8 @@ class PerfOptimizeWorkflow:
                 f"correlation already in `{profiled_dir}` provide the standing "
                 f"comparison; new facts may correct the model. If you "
                 f"leave the roadmap with no actionable pending item while "
-                f"projected headroom remains, close this round's findings "
-                f"with the **Remaining-gap attribution** section per your "
-                f"system prompt — every part of the gap gets a supported item, "
+                f"projected headroom remains, explain the stop in this round's "
+                f"**Gap analysis** — every part of the gap gets a supported item, "
                 f"an evidence-backed constraint, or is marked unexplained, "
                 f"with links to existing explanations and next tests.\n\n"
             )
@@ -3003,6 +3201,7 @@ class PerfOptimizeWorkflow:
             f"about the item's *realizability* under this campaign's "
             f"`optimize.approaches`, not about the bottleneck.\n\n"
             + projection_context
+            + self._performance_model_instruction(state)
             + self._kernel_ledger_instruction(state)
             + f"Then update `{self.roadmap_path}` **in place** against that "
             f"evidence: mark `obsolete` every pending item the round's "
@@ -3020,17 +3219,16 @@ class PerfOptimizeWorkflow:
             f"**If the evidence leaves nothing actionable, leave the roadmap "
             f"with no actionable pending item and say so.** The orchestrator "
             f"reads that as the campaign's end and closes the loop — the "
-            f"correct outcome for a plateau. Do not invent items to keep the "
+            f"administrative stop; only the current model can establish convergence. "
+            f"Do not invent items to keep the "
             f"loop alive; an unfounded item costs a full benchmark to "
             f"disprove.\n\n"
-            f"`Write` `{analysis_dir / 'profile_findings.md'}` as this "
-            f"round's record — a short **replan note**, not a profiling "
-            f"report: which analysis you planned from (`{profiled_dir}`), "
-            f"each failed item with the verdict and reason category that "
-            f"killed it, what you changed in the roadmap and why, and what "
-            f"remains actionable (or why nothing does). Include the full current "
-            f"model section when required by the per-kernel coverage contract "
-            f"above, retaining standing measurement provenance.\n\n"
+            f"`Write` `{analysis_dir / 'analysis.md'}` as this "
+            f"round's concise analysis: `## Result`, `## Theoretical performance "
+            f"model`, `## Gap analysis`, and `## Next actions`. Link the standing "
+            f"capture and analysis (`{profiled_dir}`). Explain only experiment results "
+            f"that change the model, gap attribution, or next actions; retain "
+            f"standing measurement provenance and identify untested gaps.\n\n"
             f"Before completing your turn, call `append_analyzer_progress` "
             f"with a `summary` naming the round that accepted nothing, the "
             f"verdicts you planned from, and the items you marked obsolete / "
@@ -3471,27 +3669,77 @@ class PerfOptimizeWorkflow:
             f"{progress_fields}."
         )
 
+    def _run_final_analyzer(self, state: WorkflowState) -> None:
+        """Reconcile final measurements and accepted changes without new runtime work."""
+        self._stamp_progress(state)
+        previous = self._latest_performance_model()
+        prior_instruction = (
+            f"Read `{previous}` and `{previous.with_name('analysis.md')}` as the last "
+            f"round's model and supporting analysis. "
+            if previous is not None
+            else "No prior model is available; explicitly retain unknown bounds. "
+        )
+        self.analyzer(
+            f"Workspace: {self.workspace}\n"
+            f"Final model reconciliation (offline only)\n"
+            f"Write final analysis artifacts to `{self.final_analysis_dir}`.\n\n"
+            + prior_instruction
+            + f"Read `{self.task_path}`, `{self.roadmap_path}`, "
+            f"`{self.verification_report_path}` and benchmark result JSONs under "
+            f"`{self.final_verification_dir}`. Read accepted evaluation and integration "
+            f"reports under `{self.rounds_dir}`, `{self.tuning_accepted_path}`, and "
+            f"the accepted git diff `{state.campaign_git_base_commit}..HEAD` in "
+            f"`{self._trtllm_repo_path()}` as read-only evidence.\n\n"
+            f"This turn reconciles the final model only: do not edit the roadmap, "
+            f"checkout, tuning configuration, captures or prior models; do not launch "
+            f"servers, benchmarks, profilers, or optimization attempts. Preserve "
+            f"existing artifacts and write only inside `{self.final_analysis_dir}` "
+            f"apart from your required progress entry.\n\n"
+            f"Write `{self.final_analysis_dir / performance_model.MODEL_FILENAME}` "
+            f"for the task's target metric and every configured concurrency (null "
+            f"in scalar mode), identifying the final accepted build and QA workload. "
+            f"Use QA's matching final measurements. Retain supported bounds only "
+            f"where assumptions still hold after accepted changes; explain revisions "
+            f"with evidence. Preserve the old capture identity beside inherited "
+            f"component measurements and never relabel them as final-build captures. "
+            f"Leave unmodeled final components and unsupported bounds unknown with "
+            f"their next discriminating test. Missing final profiling means an "
+            f"unresolved comparison, not convergence. Reconcile all gap arithmetic "
+            f"against this one final model.\n\n"
+            f"Write `{self.final_analysis_dir / 'analysis.md'}` with only `## Result`, "
+            f"`## Theoretical performance model`, `## Gap analysis`, and "
+            f"`## Next actions`; link source derivations, captures and experiments "
+            f"instead of repeating them. Call `append_analyzer_progress` summarizing "
+            f"the final model status, corrected assumptions and unresolved evidence."
+        )
+
     def _run_reporter(self, state: WorkflowState) -> None:
         self._stamp_progress(state)
+        model_path = self._report_performance_model()
+        model_read = (
+            f" `{model_path}` (the authoritative current model and gap accounting; "
+            f"check that its build and workload still match the final measurement), "
+            f"`{model_path.with_name('analysis.md')}` (its current analysis),"
+            if model_path is not None
+            else " `performance_model.yaml` (unavailable; report an unresolved "
+            "model and do not claim convergence),"
+        )
         if self._curve_mode():
-            pareto_section = "Pareto Improvement / "
-            pareto_chart = ", the Pareto improvement chart,"
+            pareto_chart = "; a Pareto curve may show the operating-point tradeoff"
             focus = self._focus_points()
             if focus:
                 pareto_headline = (
                     f" (curve mode with `optimize.focus_concurrencies` "
                     f"{focus}: the ledger means and the headline score the "
                     f"focus subset — say so wherever a mean is presented — "
-                    f"with every point still shown in the Pareto "
-                    f"Improvement section)"
+                    f"with every point still shown in the model table)"
                 )
             else:
                 pareto_headline = (
                     " (curve mode: the mean across concurrency points, with the "
-                    "per-point curve in the Pareto Improvement section)"
+                    "per-point curve in the model table)"
                 )
         else:
-            pareto_section = ""
             pareto_chart = ""
             pareto_headline = ""
         if self.verification_report_path.is_file():
@@ -3520,20 +3768,13 @@ class PerfOptimizeWorkflow:
         if self._sol_enabled():
             projection_read = (
                 f" `{self.sol_projection_path}` (the Projector's SOL "
-                f"ceiling — the Projection vs Measured section follows the "
-                f"SOL guidance in your system prompt: how much of the "
-                f"projected headroom the campaign captured, closed by the "
-                f"remaining-gap accountability breakdown — every part of "
-                f"the remaining gap attributed to cited evidence or "
-                f"explicitly marked unexplained — honestly marked "
-                f"unavailable when the projection is),"
+                f"projection, retained as the original model assumptions; "
+                f"use the latest validated `performance_model.yaml` for all "
+                f"current ceilings and remaining-gap arithmetic),"
             )
-            projection_section = "Projection vs Measured / "
         else:
             projection_read = ""
-            projection_section = ""
         coverage_read = ""
-        coverage_section = ""
         if self._kernel_coverage() is not None:
             final_ledger = self._latest_kernel_ledger()
             ledger_name = (
@@ -3545,16 +3786,13 @@ class PerfOptimizeWorkflow:
             )
             coverage_read = (
                 f" {ledger_name} (the final round's per-kernel disposition "
-                f"ledger — the Kernel Coverage section per your system "
-                f"prompt: every kernel's elimination/faster/fusion/overlap "
-                f"disposition "
-                f"resolved to its campaign outcome, the still-pending refs "
-                f"itemized as the untried tail),"
+                f"ledger — supporting evidence for the central model; link "
+                f"its detailed dispositions without reproducing the ledger),"
             )
             coverage_read += (
-                " Give a concise **Theoretical headroom summary** and link to "
-                "**Per-layer theoretical performance model** in the latest "
-                "analyzer's `analysis/profile_findings.md`, beside that ledger. "
+                " In **Theoretical performance model**, link to the "
+                "**Theoretical performance model** in the latest "
+                "analyzer's `analysis/analysis.md`, beside that ledger. "
                 "Use a relative section link to its actual current-campaign "
                 "round anchor in Markdown and HTML, not an imported section "
                 "with the same heading. The analyzer "
@@ -3567,7 +3805,6 @@ class PerfOptimizeWorkflow:
                 "build has no validated model comparison. A closed roadmap "
                 "does not establish model/implementation convergence."
             )
-            coverage_section = "Kernel Coverage / "
         reuse_read = ""
         if state.reuse_analysis_dir:
             baseline_origin = (
@@ -3580,7 +3817,7 @@ class PerfOptimizeWorkflow:
                 f" `{self.reuse_manifest_path}` (this campaign was launched "
                 f"with `--reuse-analysis {state.reuse_analysis_dir}`. {baseline_origin}"
                 f"Name which profiles and analyses were imported using their manifests, "
-                f"and distinguish them from new captures in Configuration),"
+                f"and state their provenance beside the model comparison),"
             )
         self.reporter(
             f"Workspace: {self.workspace}\n"
@@ -3589,14 +3826,15 @@ class PerfOptimizeWorkflow:
             f"The campaign is over ({state.round_index} round(s) ran). Read "
             f"**all** inputs listed in your system prompt: `{self.task_path}`, "
             f"`{self.baseline_results_path}`,"
-            f"{reuse_read}{projection_read}{coverage_read} "
+            f"{reuse_read}{projection_read}{model_read}{coverage_read} "
             f"`{self.roadmap_path}` (final "
             f"statuses, expected vs measured gains, baseline/current_best), "
             f"every round's `integration/integration.md` and "
             f"`integration/candidate_manifest.yaml` when present, "
             f"every `optimization_summary.md` / `evaluation.md` under "
             f"`{self.rounds_dir}`, every round's "
-            f"`analysis/profile_findings.md` + `profile/{PROFILE_MANIFEST_NAME}` "
+            f"`analysis/analysis.md` + `profile/{PROFILE_REPORT_NAME}` + "
+            f"`profile/{PROFILE_MANIFEST_NAME}` "
             f"+ `profile/nsys_stats.txt` (legacy rounds may keep stats under "
             f"`analysis/`) and "
             f"every accepted attempt's `profile/nsys_stats.txt` (the "
@@ -3613,23 +3851,20 @@ class PerfOptimizeWorkflow:
             f"`git diff --stat` over `{state.campaign_git_base_commit[:12]}..HEAD` for "
             f"the code-diff summary. Launch no servers and run no "
             f"benchmarks.\n\n"
-            f"`Write` `{self.report_path}` with every required section "
-            f"(Executive Summary / Configuration / Baseline / Optimization "
-            f"Trajectory / {pareto_section}"
-            f"Applied Optimizations / Kernel-Level Comparison / "
-            f"{coverage_section}"
-            f"Failed Attempts / Final Verification / {projection_section}"
-            f"Config & Code Diff "
-            f"Summary / Remaining Roadmap / Durable facts for the next "
-            f"campaign), then `Write` "
-            f"`{self.report_html_path}` "
-            f"mirroring it 1:1 (self-contained, interactive, with the "
-            f"required trajectory line chart{pareto_chart} "
-            f"and kernel before/after bars — "
-            f"see your system prompt). The headline cumulative improvement "
-            f"{headline_source}{pareto_headline}; "
-            f"expected vs measured is reported faithfully for every item, "
-            f"failures included.\n\n"
+            f"`Write` `{self.report_path}` with only `## Result`, "
+            f"`## Theoretical performance model`, `## Gap analysis`, and "
+            f"`## Changes and next actions`. Put baseline, final measured performance, current "
+            f"theoretical best, remaining gap and convergence status in one table "
+            f"for every operating point. State scoring scope and final verification "
+            f"status beside the table. Summarize accepted changes and only failed "
+            f"experiments that explain the gap; link detailed reports, configuration, "
+            f"kernel coverage, revisions and roadmap instead of duplicating them. "
+            f"Use the same current model for the headline and every breakdown. "
+            f"Then `Write` `{self.report_html_path}` mirroring the content 1:1, "
+            f"self-contained and using charts only when they clarify the model or "
+            f"gap{pareto_chart}. The cumulative improvement {headline_source}"
+            f"{pareto_headline}. Distinguish hardware limits, scope limits, failed "
+            f"attempts, measurement limits and unresolved gaps.\n\n"
             f"Before completing your turn, call `append_reporter_progress` "
             f"with a `summary` of the cumulative improvement headline, the "
             f"accepted/failed item counts, and confirmation that both files "

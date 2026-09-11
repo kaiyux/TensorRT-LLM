@@ -101,7 +101,7 @@ def test_measuring_roles_carry_canonical_benchmark_flags():
     for role in _MEASURING:
         for flag in _BENCHMARK_CANONICAL_FLAGS:
             assert flag in _ALL_PROMPTS[role], (role, flag)
-        assert "do not improvise" in _ALL_PROMPTS[role], role
+        assert "keep other flags as shown" in _ALL_PROMPTS[role], role
 
 
 def test_profiler_carries_canonical_nsys_flags():
@@ -176,7 +176,7 @@ def test_analyzer_carries_the_nsys_timeline_decomposition():
     assert "costs no extra server launch" in prompt
     # The roadmap's expected-gain grounding reads the split, not just shares.
     assert "compute-absent split" in prompt
-    assert "faster kernels do not recover launch-starved host time" in prompt
+    assert "faster kernels cannot recover launch-starved host time" in prompt
     # Degrades to a one-liner rather than blocking or fabricating.
     assert "timeline analysis unavailable" in prompt
 
@@ -186,11 +186,11 @@ def test_evaluator_decomposes_the_accept_evidence_capture():
     # gaps shrunk" is measured on both sides rather than eyeballed.
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
     assert "internal-perf-nsight-system-analysis" in prompt
-    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+    assert "try its `trtllm-agent-toolkit:` prefix" in prompt
     assert "nsys_analysis" in prompt
-    assert "the launch-starved share shrunk" in prompt
+    assert "signed iteration/busy/module deltas" in prompt
     # Never blocks the verdict, never states an unmeasured split.
-    assert "never block the verdict on it" in prompt
+    assert "never assert an unmeasured split or block the benchmark verdict" in prompt
 
 
 def test_evaluator_diffs_with_the_skills_comparative_mode():
@@ -203,11 +203,13 @@ def test_evaluator_diffs_with_the_skills_comparative_mode():
     # Per-call deltas survive a launch-count mismatch between the sides.
     assert "difference/rank-0/module_slice.json" in prompt
     # One taxonomy across both sides — a diff across two is not a diff.
-    assert "a diff across two taxonomies is not a diff" in prompt
+    assert "both sides and the next comparison share it" in prompt
+    assert "previous accepted capture and its unchanged taxonomy" in prompt
     # Degrades where the earlier capture kept no sqlite.
-    assert "kept no `.sqlite`" in prompt
+    assert "Without previous SQLite, run single-variant" in prompt
     # The mechanism claim names a row, not a vibe.
-    assert "is not a mechanism" in prompt
+    assert "specific row or kernel expected to change actually did" in prompt
+    assert "A faster total alone does not confirm the mechanism" in prompt
 
 
 def test_run_a2a_capture_feeds_the_timeline_pipeline():
@@ -245,9 +247,10 @@ def test_analyzer_grounds_roadmap_items_across_the_analyses() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     for evidence in ("nsys timeline", "ncu kernel analysis", "SOL correlation"):
         assert evidence in prompt
-    assert "including disagreement or missing analyses" in prompt
-    assert "measured bound class" in prompt
-    assert "Dormant capabilities use the explicit source/config evidence exception" in prompt
+    assert "explain disagreement or missing analyses" in prompt
+    assert "ncu bound-class" in prompt
+    assert "source/config evidence" in prompt
+    assert "where traces cannot expose a disabled feature" in prompt
 
 
 def test_no_prompt_references_removed_builtin_tools():
@@ -266,20 +269,21 @@ def test_benchmarker_and_analyzer_load_casebook_read_only():
     for role in ("benchmarker", "analyzer"):
         prompt = _ALL_PROMPTS[role]
         assert "perf-optimization-casebook" in prompt, role
-        assert "`Skill` tool" in prompt, role
-        assert "Ground your analysis in the optimization casebook" in prompt, role
+        assert "with `Skill`" in prompt, role
+        assert "read-only references" in prompt, role
+        assert "do not apply changes or run extra experiments" in prompt, role
 
 
 def test_optimizer_gets_the_actionable_casebook_variant():
     assert "Apply from the optimization casebook" in OPTIMIZER_SYSTEM_PROMPT
     assert "perf-optimization-casebook" in OPTIMIZER_SYSTEM_PROMPT
     # The read-only stance would contradict the optimizer's job.
-    assert "Ground your analysis in the optimization casebook" not in OPTIMIZER_SYSTEM_PROMPT
+    assert "do not apply changes or run extra experiments" not in OPTIMIZER_SYSTEM_PROMPT
     block = _norm(CASEBOOK_APPLY)
-    assert "how-to-apply" in block
+    assert "`how_to_apply` overrides conflicting casebook guidance" in block
     assert "rollback" in block
     # Still no hard dependency on the toolkit.
-    assert "not available in this environment" in block
+    assert "If unavailable, note it once and proceed" in block
 
 
 # -------------------------------------------------------------- git discipline
@@ -288,13 +292,13 @@ def test_optimizer_gets_the_actionable_casebook_variant():
 def test_mutating_roles_carry_git_discipline():
     for role in ("optimizer", "evaluator"):
         prompt = _norm(_ALL_PROMPTS[role])
-        assert "dedicated optimization branch" in prompt, role
+        assert "orchestrator owns the optimization branch" in prompt, role
         assert "import tensorrt_llm" in prompt, role
         assert "`git push`" in prompt, role
     block = _norm(GIT_DISCIPLINE)
     # The orchestrator owns commits and reverts; agents never mutate git.
     assert "Never run `git commit`" in block
-    assert "orchestrator owns all git state" in block
+    assert "committing accepted items and reverting rejected attempts" in block
     assert "only the current roadmap item's changes" in block
     assert "active runtime checkout from the turn instructions" in block
     assert "prepend that exact checkout to `PYTHONPATH`" in block
@@ -309,10 +313,10 @@ def test_code_edits_never_reference_run_internals():
     # code-quality axis gates on it.
     block = _norm(GIT_DISCIPLINE)
     assert "stand on its own" in block
-    assert "roadmap item ids (`opt-008`)" in block
-    assert "the provenance story belongs in `optimization_summary.md`" in block
+    assert "must not reference roadmap ids (`opt-008`)" in block
+    assert "provenance in `optimization_summary.md`" in block
     gate = _norm(EXPECTATION_GATE)
-    assert "no comments or names that reference this run's internals" in gate
+    assert "follow *Git discipline*" in gate
 
 
 # ---------------------------------------------------------------- kernel reuse
@@ -338,13 +342,15 @@ def test_kernel_work_roles_prefer_existing_kernels():
     # plans it, the optimizer falls back to writing instead of recording a
     # no-change blocker, and the evaluator judges it on the normal axes.
     assert "If none fits, plan a scoped **new kernel**" in block
-    assert "fall back to writing the kernel rather than recording a no-change blocker" in block
-    assert "the new kernel is a legitimate realization" in block
+    assert "write a scoped kernel instead of recording a no-change blocker" in block
+    assert "recorded search confirms none exists" in block
+    assert "correctness, targeted-test and measured-gain checks" in block
     # The evaluator enforces reuse on the code-quality axis, gain or not.
-    assert "never passes the code-quality axis, whatever gain it measures" in block
+    assert "new kernel fails code quality when a suitable existing kernel exists" in block
+    assert "regardless of gain" in block
     assert "PUSH_BACK with `reason_category: code_quality`" in block
     gate = _norm(EXPECTATION_GATE)
-    assert "adds no hand-written kernel" in gate
+    assert "follow *Git discipline* and *Prefer existing kernels*" in gate
     # The measuring-only and synthesis roles never touch kernels.
     assert "Prefer existing kernels" not in BENCHMARKER_SYSTEM_PROMPT
     assert "Prefer existing kernels" not in REPORTER_SYSTEM_PROMPT
@@ -365,7 +371,7 @@ def test_roadmap_touching_roles_carry_the_contract():
 def test_roadmap_contract_pins_ownership():
     for role in ("analyzer", "optimizer"):
         prompt = _norm(_ALL_PROMPTS[role])
-        assert "The **orchestrator** owns every lifecycle field" in prompt, role
+        assert re.search(r"The \*\*orchestrator\*\* owns (?:every )?lifecycle field", prompt), role
 
 
 def test_roadmap_readers_do_not_receive_analyzer_authoring_duties():
@@ -400,19 +406,19 @@ def test_expectation_gate_is_three_way():
     assert "PUSH_BACK" in gate
     assert "REJECT" in gate
     assert "premise is broken" in gate
-    assert "no retry would help" in gate
-    assert "the orchestrator treats it as REJECT" in gate
+    assert "blocker is unresolvable" in gate
+    assert "PUSH_BACK is treated as REJECT" in gate
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
-    assert "`APPROVE` | `REJECT` | `PUSH_BACK`" in prompt
+    assert "`decision`: APPROVE | REJECT | PUSH_BACK" in prompt
 
 
 def test_evaluator_carries_the_accept_evidence_procedure():
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
     assert "Accept-evidence capture (APPROVE only)" in prompt
     # The capture is diagnostic and never contaminates the measurement.
-    assert "diagnostic, never a measurement" in prompt
+    assert "Capture timings never supply measured_value/measured_gain_pct" in prompt
     assert "fresh relaunch" in prompt
-    assert "never a reason to flip the verdict" in prompt
+    assert "a failed capture leaves the verdict unchanged" in prompt
     # Mechanism verification is the point of the capture.
     assert "claimed mechanism is visible" in prompt
     # The canonical nsys wrap ships with the prompt so the evaluator
@@ -445,13 +451,13 @@ def test_expectation_gate_carries_focus_scoring():
     # The scored subset narrows the mean, never the no-regress veto.
     assert "optimize.focus_concurrencies" in gate
     assert "scored points" in gate
-    assert "no-regress condition covers **every** point" in gate
+    assert "Always measure and check regressions at **every** point" in gate
     # The ledger fields follow the scored mean.
     assert "the **scored** mean" in gate
     # Roadmap-touching roles learn the ledger semantics from the contract.
     spec = _norm(ROADMAP_SPEC)
     assert "Focus scoring" in spec
-    assert "mean over **only those points**" in spec
+    assert "scalar values and gains average **only those points**" in spec
     # The measurement protocol's aggregation rule names the subset too.
     assert "optimize.focus_concurrencies" in _norm(MEASUREMENT_PROTOCOL)
 
@@ -461,11 +467,12 @@ def test_expectation_gate_carries_the_regression_budget():
     # The budget is owner-declared, never assumed, and defaults strict.
     assert "optimize.max_regression_pct" in gate
     assert "regression_bar" in gate
-    assert "never yours to assume" in gate
+    assert "owner-declared; never assume one" in gate
     # Used budgets must be surfaced, not buried in the mean.
-    assert "name that point" in gate
+    assert "name the point, regression and budget" in gate
     reporter = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "regression budget is headline material" in reporter
+    assert "used regression budget, affected point and signed regression" in reporter
+    assert "here and in the per-point table" in reporter
 
 
 def test_analyzer_carries_the_dormant_capability_sweep():
@@ -476,20 +483,19 @@ def test_analyzer_carries_the_dormant_capability_sweep():
     assert "mtp_num_hidden_layers" in prompt
     assert "speculative_config" in prompt
     assert 'grep -n "environ"' in prompt
-    assert "## Dormant capabilities" in prompt
+    assert "dormant_capabilities.md" in prompt
+    assert "Link material opportunities from `analysis.md`'s Next actions" in prompt
     # Dormant levers cannot have trace evidence — dismissing them for
     # lacking it is exactly the failure the sweep exists to prevent.
     assert 'Never dismiss for "no trace evidence"' in prompt
 
 
-def test_reporter_carries_the_durable_facts_section():
+def test_reporter_preserves_material_lessons_in_changes_and_next_actions():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Durable facts for the next campaign" in prompt
-    # The three tags, each demanding a citation.
-    assert "`[dead]`" in prompt
-    assert "`[alive]`" in prompt
-    assert "`[env]`" in prompt
-    assert "Durable facts are evidence, not opinion" in prompt
+    assert "## Changes and next actions" in prompt
+    assert "Summarize material failures by mechanism, outcome and model consequence" in prompt
+    assert "Keep constrained opportunities visible" in prompt
+    assert "## Durable facts for the next campaign" not in prompt
 
 
 def test_measuring_roles_carry_the_measurement_protocol():
@@ -587,24 +593,26 @@ def test_integrator_has_a_complete_measured_acceptance_contract():
         "output_throughput / num_gpus",
         "full-metric diff",
         "isolated integration config",
-        "candidate config changes relative to the common base",
-        "never edit the accepted config snapshot",
+        "Merge config deltas against the common base",
+        "accepted snapshots are read-only",
     ):
         assert contract in prompt, contract
 
 
 def test_parallel_candidate_approval_is_distinct_from_campaign_acceptance():
     evaluator = _norm(EVALUATOR_SYSTEM_PROMPT)
-    assert "parallel mode waits for integration before accepting the item" in evaluator
-    assert "it does not describe the later combined accepted state" in evaluator
+    assert "parallel mode awaits integration" in evaluator
+    assert (
+        "parallel candidate trace cannot establish the later integrated state's mechanism"
+        in evaluator
+    )
     reporter = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "only the accepted integrator APPROVE or FALLBACK_BEST" in reporter
-    assert "must never become successive trajectory steps" in reporter
-    assert "`100 → 116`" in reporter
+    assert "only an accepted integrator APPROVE or FALLBACK_BEST" in reporter
+    assert "promotes a combined result" in reporter
+    assert "candidates sharing a batch base as successive states" in reporter
+    assert "never add standalone gains" in reporter
     assert "never compute gain from the ratio of two curve means" in reporter
-    html = _norm(OPTIMIZE_HTML_COMPANION)
-    assert "accepted parallel integrations" in html
-    assert "scored concurrency points" in html
+    assert "compare baseline and final only" in _norm(OPTIMIZE_HTML_COMPANION)
 
 
 def test_parallel_slurm_and_disagg_prompts_require_distinct_node_allocations():
@@ -629,14 +637,14 @@ def test_qa_prompt_is_a_decisionless_final_verification():
     prompt = _norm(QA_SYSTEM_PROMPT)
     # QA runs once and verifies; the orchestrator owns the loop.
     assert "final verification" in prompt
-    assert "You do not decide whether the campaign continues" in prompt
+    assert "you do not decide whether the loop continues" in prompt
     assert "CONTINUE" not in prompt
     assert "Final-profile" not in prompt
     # Accuracy runs only when task.yaml configures it.
-    assert "only if `task.yaml` has an `accuracy` block" in prompt
+    assert "If configured, run `accuracy.command` verbatim" in prompt
     assert "accuracy: not configured" in prompt
     # Fresh-eyes isolation.
-    assert "Do **not** read the evaluator's" in prompt
+    assert "Do not read evaluator reports, optimizer summaries or other agents' progress" in prompt
 
 
 # -------------------------------------------------------------------- reporter
@@ -644,109 +652,82 @@ def test_qa_prompt_is_a_decisionless_final_verification():
 
 def test_reporter_reports_expected_vs_measured_and_future_work():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Expected vs measured" in prompt
-    assert "Failed Attempts" in prompt
-    assert "Remaining Roadmap" in prompt
-    # The headline is the final verification's independent number, not
-    # the evaluator chain's.
-    assert "The headline number is the final verification's" in prompt
-    assert "Final Verification" in prompt
+    assert "Expected gain | Measured gain and reference | Model consequence" in prompt
+    assert "next actions by modeled excess or uncertainty resolved" in prompt
+    assert "independent final metrics" in prompt
+    assert "This supplies the headline" in prompt
     assert "verification_report.md" in prompt
-    assert "optimization_report.html" in REPORTER_SYSTEM_PROMPT
+    assert "sanity/accuracy outcomes" in prompt
+    assert "optimization_report.html" in prompt
 
 
 def test_reporter_never_launches_servers():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Do **not** launch servers" in prompt
+    assert "no servers, benchmarks, profiling" in prompt
 
 
-def test_reporter_carries_the_trajectory_section():
+def test_reporter_uses_promotion_history_without_repeating_a_trajectory():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Optimization Trajectory" in prompt
-    # The path is reconstructed from the structured trail in the order
-    # applied — the roadmap's listing order is priority, not chronology —
-    # and gaps stay gaps.
-    assert "measured_value" in prompt
-    assert "never interpolated" in prompt
-    # The markdown table is the data the HTML line chart plots.
-    assert "line chart" in prompt
+    assert "Accepted changes in promotion order" in prompt
+    assert "Check progress.yaml against roadmap.yaml" in prompt
+    assert "## Optimization Trajectory" not in prompt
+    assert "full attempt histories" in prompt
+    assert "in linked artifacts" in prompt
 
 
-def test_reporter_carries_the_kernel_comparison():
+def test_reporter_uses_matched_kernel_evidence_without_a_kernel_dump():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Kernel-Level Comparison" in prompt
-    # Grounded in the analyzer rounds' nsys artifacts. The kernel table
-    # still comes from `kern_sum` — it is the only per-kernel artifact
-    # carrying call counts — but it is a sum across overlapping streams
-    # over the whole capture, so it carries the relative before/after
-    # shift and the iteration budget carries the magnitude.
-    assert "cuda_gpu_kern_sum" in prompt
-    assert "nsys_stats.txt" in prompt
-    assert "the only artifact carrying per-kernel call" in prompt
-    assert "never as a per-iteration magnitude" in prompt
-    assert "the budget is the one describing" in prompt
-    # ...with honest provenance: what each profile covers, and no
-    # fabricated "after" data when only round 1 was profiled.
-    assert "which accepted items were in effect" in prompt
-    assert "closing profiler round may supply that evidence" in prompt
+    assert "Use disjoint critical-path costs" in prompt
+    assert "overlapping kernel sums cannot replace elapsed time" in prompt
+    assert "timing scopes" in prompt
+    assert "Identify accepts newer than the freshest supplied capture" in prompt
+    assert "## Kernel-Level Comparison" not in prompt
+    assert "raw kernel/latency tables" in prompt
+    assert "in linked artifacts" in prompt
+
+
+def test_reporter_links_round_and_candidate_decomposition_with_capture_identity():
+    prompt = _norm(REPORTER_SYSTEM_PROMPT)
+    assert "`analysis/nsys_analysis/`" in prompt
+    assert "accepted-attempt `profile/nsys_analysis/`" in prompt
     assert (
-        "capture directory your driving instructions name as matching the final accepted state"
+        "A standalone candidate capture cannot establish the final integrated state's mechanism"
         in prompt
     )
-    assert "no post-optimization profile exists" in prompt
+    assert "matching analysis/capture identities" in prompt
+    assert "missing coverage" in prompt
+    assert "Explain reconciliation errors" in prompt
 
 
-def test_reporter_lists_both_sides_of_the_iteration_budget():
-    # The comparison opens on the iteration budget "where both sides
-    # carry a nsys_analysis/" — so both sides have to be reachable. The
-    # round-level products are the *before* side; the *after* side lives
-    # under the accepted attempt's profile/, and listing only the former
-    # leaves the reporter looking for a directory it was never given.
-    prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "rounds/round_<n>/analysis/nsys_analysis/" in prompt
-    assert "`profile/nsys_analysis/` beside it" in prompt
-    assert "parallel candidate capture does not describe the later integrated" in prompt
-    # And the budget leads the section, ahead of the kernel table.
-    assert "open the section with the iteration budget before the kernel table" in prompt
-    # Degrades rather than fabricating a one-sided budget.
-    assert "where either side lacks it, say so and compare on kernels alone" in prompt
-
-
-def test_html_companion_charts_are_self_contained():
+def test_html_companion_preserves_compact_offline_content():
     block = _norm(OPTIMIZE_HTML_COMPANION)
-    assert "Trajectory line chart" in block
-    assert "Kernel before/after bars" in block
-    # No chart library: data embedded inline, rendered to inline SVG.
-    assert "no chart library" in block
-    assert "inline SVG" in block
-    # Charts never diverge from the tables they sit above.
-    assert "the table is the source of truth" in block
-    # New sections slot into the HTML body in markdown order.
-    assert "Baseline, Optimization Trajectory, Pareto Improvement — curve mode only" in block
-    assert "Kernel-Level Comparison, Failed Attempts" in block
+    assert "self-contained offline HTML" in block
+    assert "same four sections" in block
+    assert "inline CSS" in block
+    assert "no external CDN/fonts/assets" in block
+    assert "optional inline SVG" in block
+    assert "exactly the table data" in block
+    assert "No separate trajectory or top-kernel charts" in block
 
 
-def test_html_companion_carries_the_pareto_chart():
+def test_html_companion_keeps_one_supported_pareto_chart():
     block = _norm(OPTIMIZE_HTML_COMPANION)
-    assert "Pareto improvement chart" in block
+    assert "one compact Pareto chart" in block
     assert "x = tok/s/user, y = tok/s/gpu" in block
-    # Exactly two series — baseline vs final — with labeled points, and
-    # the chart disappears rather than plotting invented curves.
-    assert "baseline curve vs the final curve" in block
-    assert "`c=<n>`" in block
-    assert "Omit the chart and the section in scalar mode" in block
+    assert "when the measured curve is available" in block
+    assert "compare baseline and final only" in block
+    assert "Label concurrency and series clearly" in block
 
 
-def test_reporter_carries_the_pareto_improvement_section():
+def test_reporter_keeps_curve_provenance_in_the_single_model_comparison():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
-    assert "Pareto Improvement" in prompt
-    assert "omit this section entirely in scalar mode" in prompt
-    # Provenance: baseline from the roadmap curve, final from QA's curve.
+    assert "One row per configured operating point" in prompt
     assert "`baseline.curve`" in prompt
-    # Curve-mode headline aggregates as the mean across points.
-    assert "mean across concurrency points" in prompt
-    # Rigor: per-point values trace to recorded curves.
-    assert "Pareto values trace to recorded curves" in prompt
+    assert "verification `curve`" in prompt
+    assert "`current_best.curve`" in prompt
+    assert "scored subset" in prompt
+    assert "missing curves stay missing" in prompt
+    assert "## Pareto Improvement" not in prompt
 
 
 # -------------------------------------------------------------- SOL projector
@@ -775,8 +756,8 @@ def test_projector_prompt_builds_on_sol_skill():
     # and graceful degradation when the skill is not installed.
     assert "internal-perf-sol-analysis" in prompt
     assert "trtllm-agent-toolkit:internal-perf-sol-analysis" in prompt
-    assert "`Skill` tool" in prompt
-    assert "not available in this environment" in prompt
+    assert "with `Skill`" in prompt
+    assert "If the skill is unavailable" in prompt
 
 
 # --------------------------------------------------------------------------- #
@@ -797,12 +778,12 @@ def test_projection_setup_template_states_no_methodology_as_fact():
         ("full", PROJECTOR_SYSTEM_PROMPT),
         ("reduced", build_projector_prompt("reduced")),
     ):
-        assert "- Method: <" in prompt, label
-        assert "- Peaks file: <" in prompt, label
+        assert "- Method/sources: <" in prompt, label
+        assert "- Peaks/latencies: <" in prompt, label
         assert "- Method: internal-perf-sol-analysis" not in prompt, label
         assert "- Peaks file: sol_work/peaks.json" not in prompt, label
         # The environment without a calculator has something to write.
-        assert "not written: no peaks" in prompt, label
+        assert "or reason unavailable" in prompt, label
 
 
 def test_full_methodology_leaves_the_projector_prompt_untouched():
@@ -832,7 +813,7 @@ def test_projector_prompt_resolves_peaks_and_latencies_via_skill():
     # recorded as unmeasured (never guessed) when one is not — this
     # stage may run on a login node, which the skill cannot know.
     assert "measure_channels.py" in prompt
-    assert "do **not** guess" in prompt
+    assert "Never guess α" in prompt
     assert "unmeasured" in prompt
 
 
@@ -841,7 +822,7 @@ def test_projector_prompt_never_fabricates_measured_inputs():
     # ``sol_calc.py analyze`` correlates measured per-op times; no
     # profiling stage has run yet, so there are none — and script inputs
     # are never invented to force a run.
-    assert "never fabricate an input" in prompt
+    assert "Do not invent measured_ms rows" in prompt
     assert "measured_ms" in prompt
 
 
@@ -853,7 +834,7 @@ def test_projector_prompt_speaks_skill_vocabulary():
     # The ceiling models kernel execution + per-launch latency only — a
     # gap beyond it points at host/scheduling costs it does not price.
     assert "kernel execution plus per-launch latency only" in prompt
-    assert "request queueing" in prompt
+    assert "scheduler/host prep, queueing and dynamic-batching" in prompt
 
 
 def test_projector_prompt_names_internal_knowledge_and_keeps_it_consultative():
@@ -864,9 +845,9 @@ def test_projector_prompt_names_internal_knowledge_and_keeps_it_consultative():
     assert "http://" not in prompt
     assert "https://" not in prompt
     normed = _norm(prompt)
-    assert "if that skill/subagent exists" in normed
-    assert "consultative" in normed
-    assert "reproducible from the arithmetic" in normed
+    assert "`internal-glean-specialist` if available" in normed
+    assert "Internal knowledge (reference only)" in normed
+    assert "reproducible from named sources and recorded arithmetic" in normed
 
 
 def test_projector_prompt_degrades_honestly():
@@ -877,14 +858,14 @@ def test_projector_prompt_degrades_honestly():
 
 def test_projector_prompt_template_sections():
     for header in (
+        "## Result",
         "## Projection setup",
-        "## Projected SOL ceiling",
-        "## Measured vs SOL",
-        "## Headroom & bound mix",
-        "## Guidance for optimization",
-        "## Caveats",
+        "## Initial theoretical performance model",
+        "## Open questions",
     ):
         assert header in PROJECTOR_SYSTEM_PROMPT, header
+    assert "## Measured vs SOL" not in PROJECTOR_SYSTEM_PROMPT
+    assert "## Headroom & bound mix" not in PROJECTOR_SYSTEM_PROMPT
 
 
 def test_projector_prompt_targets_the_optimize_pipeline():
@@ -892,122 +873,103 @@ def test_projector_prompt_targets_the_optimize_pipeline():
     # Once per campaign, against perf-optimize's artifact layout: the
     # baseline lives under baseline/ and the parallel mapping comes from
     # the live tuning config, not the task-level extra_llm_api_options.
-    assert "once per campaign" in prompt
+    assert "In one turn after the baseline" in prompt
     assert "baseline/benchmark_results.md" in prompt
     assert "tuning/extra_llm_api_options.yaml" in prompt
     # Guidance addresses this workflow's consumers — the Analyzer owns
     # the roadmap, while capture details belong to the profiler.
     assert "Analyzer" in prompt
-    assert "the Analyzer owns `roadmap.yaml`" in prompt
-    assert "expected_gain_pct" in prompt
+    assert "Analyzer later corrects these assumptions in performance_model.yaml" in prompt
+    assert "current model for gap accounting and convergence" in prompt
     assert "Profiler" not in prompt
     # Later stages' files are off-limits.
-    assert "do not touch them" in prompt
+    assert "do not edit them or the inputs" in prompt
     # Curve mode: the ceiling is derived per configured point.
-    assert "once per concurrency point" in prompt
-    assert "point by point" in prompt
+    assert "at every configured concurrency" in prompt
+    assert "Cover every configured point in ascending order" in prompt
 
 
 def test_sol_analyzer_context_is_context_not_evidence() -> None:
     block = _norm(SOL_ANALYZER_CONTEXT)
-    assert "its measured column is the baseline snapshot" in block
-    assert "bound `expected_gain_pct` by recoverable headroom" in block
-    assert "Fresh measured evidence outranks the projection" in block
-    assert "Projected numbers must remain labeled as projections" in block
-    assert "Treat the projection as the initial theoretical model, not a frozen answer" in block
-    assert "`kernel_ledger.yaml`'s `model_revisions`" in block
-    assert "never justifies weakening a bound" in block
-    assert "projection is missing or unavailable, skip correlation" in block
+    assert "`sol_projection.md`'s structural derivations against the selected capture" in block
+    assert "`performance_model.yaml`" in block
+    assert "under the shared model contract" in block
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "Revise assumptions from evidence" in contract
+    assert "never to fit a failed attempt" in contract
+    assert "Unknowns require `unexplained` and `next_test`" in contract
 
 
 def test_sol_analyzer_context_forbids_silent_exhaustion() -> None:
-    block = _norm(SOL_ANALYZER_CONTEXT)
-    assert "no actionable item remains despite meaningful projected headroom" in block
-    assert "## Remaining-gap attribution" in block
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     assert (
-        "each kernel or logical region, its roadmap item or evidence-backed campaign constraint"
-        in block
+        "an empty roadmap, target gain attained or exhausted budgets do not prove convergence"
+        in prompt
     )
-    assert "any `unexplained` remainder" in block
-    assert "failed items' `evaluation.md`" in block
-    assert "Gap implication" in block
-    assert "preserve the ledger's unexplained discrepancies" in block
-    assert "campaign-end accounting brief" in block
-    assert "link to the existing gap explanations" in block
+    assert "Unknowns require `unexplained` and `next_test`" in prompt
+    assert "`scope_limited`" in prompt
+    assert "`measurement_limited`" in prompt
+    assert "no unexplained residual" in prompt
+    assert "## Remaining-gap attribution" not in prompt
 
 
 def test_sol_analyzer_context_correlates_per_round_with_the_skill_calculator():
     block = _norm(SOL_ANALYZER_CONTEXT)
-    # The correlation is the skill's calculator over structural facts,
-    # joined against the projector's persisted peaks file.
-    assert "sol_calc.py analyze" in block
-    assert "regions.json" in block
-    assert "sol_work/peaks.json" in block
+    for artifact in ("sol_calc.py analyze", "regions.json", "sol_work/peaks.json", "sol_recipes/"):
+        assert artifact in block
     assert "never invent params or `measured_ms` rows" in block
-    # The assembled findings contract selects one destination for the
-    # comparison; the calculator recipe retains honest degradation.
-    assert "## SOL correlation (measured vs ceiling)" not in block
-    assert "report's comparison section" in block
+    assert "Keep `sol.json` as a supporting artifact" in block
+    assert "do not paste the full table into `analysis.md`" in block
     assert "Correlation unavailable" in block
-    # Optimize-specific placement and cadence: per-round artifacts, one
-    # campaign-level peaks file, a fresh join every profiling round.
-    assert "this round's `analysis/` directory" in block
-    assert "Re-run correlation in full analyses, including re-analysis" in block
-    # Replan preserves measurements while facts may revise the prediction.
-    assert "Replan-only rounds preserve standing measurements" in block
-    assert "may revise analytical predictions from new facts" in block
+    assert "current analysis/ directory" in block
+    assert "Re-run correlation in full analysis/re-analysis" in block
+    assert "replan-only turns preserve standing measurements" in block
+    assert "may revise predictions from new facts without collecting runtime evidence" in block
 
 
 def test_projector_prompt_persists_peaks_for_the_analyzer():
     prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
-    assert "Persist the machine-readable peaks file" in prompt
+    assert "Persist calculator output and any measured latencies" in prompt
     assert "sol_work/peaks.json" in prompt
     # And the required-output template records the path — as the
     # placeholder it is, so a run without a calculator does not assert a
     # file it never wrote (see the template guard above).
-    assert "Peaks file: <sol_work/peaks.json" in prompt
+    assert "Peaks/latencies: <sol_work/peaks.json" in prompt
 
 
 def test_analyzer_composes_the_shared_findings_contract():
-    # perf-optimize's analyzer is perf-analyze's analyzer plus the
-    # roadmap machinery: the findings report follows the same shared
-    # contract (including the reserved SOL correlation section).
     assert PROFILE_FINDINGS_CONTRACT in ANALYZER_SYSTEM_PROMPT
-    assert "## SOL correlation (measured vs ceiling)" in _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "## Theoretical performance model" in PROFILE_FINDINGS_CONTRACT
+    assert "performance_model.yaml" in PROFILE_FINDINGS_CONTRACT
+    assert "## SOL correlation (measured vs ceiling)" not in PROFILE_FINDINGS_CONTRACT
 
 
-def test_sol_optimizer_context_aims_at_the_binding_ceiling_without_scope_creep():
+def test_sol_optimizer_context_aims_at_current_model_without_scope_creep():
     block = _norm(SOL_OPTIMIZER_CONTEXT)
-    # Context, not spec: the item outranks the projection, and the
-    # projection never grows the change.
-    assert "context, not spec" in block
-    assert "Aim the implementation at the binding ceiling" in block
-    assert "The projection never expands the item" in block
-    assert "not yours to chase" in block
-    assert "outrank the projection" in block
-    # The claimed mechanism becomes checkable downstream.
-    assert "SOL alignment:" in block
-    assert "Mapping to the roadmap item" in block
-    # Honest degradation when the projection is absent.
-    assert "missing or declares itself unavailable" in block
+    assert "current `performance_model.yaml` and `analysis.md`" in block
+    assert "`sol_projection.md` is initial provenance only" in block
+    assert "current model's binding resource, operating point and exposed excess" in block
+    assert "a model never expands the item" in block
+    assert "Unclaimed headroom is the Analyzer's to plan" in block
+    assert "current measured evidence takes precedence over an older prediction" in block
+    assert "Model alignment:" in block
+    assert "current model_id/component, predicted effect on the scored metric" in block
+    assert "Retain actual contrary evidence" in block
+    assert "model is unavailable, say so" in block
+    assert "without inventing a ceiling or declaring convergence" in block
+    assert "SOL alignment:" not in block
+    assert "bound the projection names" not in block
+    assert "Do not infer an end-to-end gain from a raw kernel-time share" in block
 
 
 def test_sol_reporter_guidance_carries_remaining_gap_accountability():
     block = _norm(SOL_OPTIMIZE_REPORTER_GUIDANCE)
-    assert "Remaining-gap accountability" in block
-    # The four exhaustive verdicts.
-    for verdict in ("`closed`", "`infeasible: <constraint>`", "`untried`", "`unexplained`"):
-        assert verdict in block, verdict
-    # Verdicts trace to artifacts; fabricated justifications are worse
-    # than an honest unexplained bucket. The analyzer's per-op
-    # correlation table is a named evidence source for the gap parts.
-    assert "Every accountability verdict traces to an artifact" in block
-    assert "Gap implication" in block
-    assert "comparison in *Per-layer theoretical performance model*" in block
-    assert "*SOL correlation* when kernel coverage is disabled" in block
-    assert "worse than reporting it unexplained" in block
-    # A zero-accept campaign still owes the breakdown.
-    assert "accepted nothing must still fill the accountability" in block
+    assert "physical limits, campaign scope, measurement limits and unresolved model error" in block
+    assert "A drained roadmap is not convergence" in block
+    assert "current bound is unavailable, display unknown" in block
+    assert "required next test" in block
+    assert "Large model discrepancies do not establish host/scheduler overhead" in block
+    assert "require phase measurements" in block
 
 
 def test_evaluator_negative_verdicts_carry_gap_implication():
@@ -1024,36 +986,28 @@ def test_evaluator_negative_verdicts_carry_gap_implication():
         assert tag in prompt, tag
     # Judged from the evaluator's own evidence, and recorded in the
     # progress entry too.
-    assert "judged from your own evidence" in prompt
-    assert "include the `Gap implication` line" in prompt
+    assert "judge the diff, functionality and your measurements" in prompt
+    assert "include the Gap implication line on PUSH_BACK/REJECT" in prompt
 
 
-def test_sol_reporter_guidance_carries_the_headroom_story():
+def test_sol_reporter_guidance_uses_the_current_model_once():
     block = _norm(SOL_OPTIMIZE_REPORTER_GUIDANCE)
-    assert "## Projection vs Measured" in block
-    # Placement inside the optimize report.
-    assert 'between "Final Verification" and "Config & Code Diff Summary"' in block
-    # The optimize-flavored table: baseline vs final % of SOL.
-    assert "Baseline % of SOL" in block
-    assert "Final % of SOL" in block
-    assert "final % of SOL − baseline % of SOL" in block
-    # The final side falls back to the ledger, and a no-accept campaign
-    # captured no headroom.
-    assert "`current_best`" in block
-    assert "captured none of the projected headroom" in block
-    # Honesty rules.
-    assert "Projection unavailable" in block
-    assert "never fabricate" in block
+    assert "latest `performance_model.yaml` + `analysis.md`" in block
+    assert "single per-point comparison" in block
+    assert "Do not add Projection vs Measured" in block
+    assert "final verification measurements when available" in block
+    assert "compatible builds/workloads/timing scopes" in block
+    assert "do not fall back to a superseded initial bound" in block
 
 
 def test_sol_bundle_extends_profiler_analyzer_optimizer_and_reporter():
     base = build_perf_optimize_prompts(include_sol=False)
     sol = build_perf_optimize_prompts(include_sol=True)
-    assert "SOL projection as context" in sol.analyzer
-    assert "SOL projection as context" in sol.optimizer
-    assert "Projection vs Measured" in sol.reporter
-    assert "SOL projection as context" not in base.analyzer
-    assert "SOL projection as context" not in base.optimizer
+    assert "Update the current model from SOL evidence" in sol.analyzer
+    assert "Current model alignment" in sol.optimizer
+    assert "Use the current theoretical model" in sol.reporter
+    assert "Update the current model from SOL evidence" not in base.analyzer
+    assert "Current model alignment" not in base.optimizer
     assert "Projection vs Measured (this task has a `sol` block)" not in base.reporter
     # Everything else — including the projector's own prompt, which is
     # always in the bundle (the stage gate lives in the workflow) — is
@@ -1067,23 +1021,23 @@ def test_sol_bundle_composes_with_slurm_and_restriction():
     bundle = build_perf_optimize_prompts(
         include_slurm_environment=True, approaches=["config"], include_sol=True
     )
-    assert "SOL projection as context" in bundle.analyzer
-    assert "SOL projection as context" in bundle.optimizer
+    assert "Update the current model from SOL evidence" in bundle.analyzer
+    assert "Current model alignment" in bundle.optimizer
     assert "Approach restriction (`optimize.approaches`)" in bundle.analyzer
     assert "slurm-environment" in bundle.profiler
     assert "slurm-environment" not in bundle.analyzer
-    assert "Projection vs Measured" in bundle.reporter
+    assert "Use the current theoretical model" in bundle.reporter
     # The evaluator and QA judge on measurements alone — no SOL context.
     assert "SOL projection" not in bundle.evaluator
     assert "SOL projection" not in bundle.qa
 
 
-def test_html_companion_overlays_the_sol_projected_curve():
+def test_html_companion_never_overlays_a_superseded_projection():
     block = _norm(OPTIMIZE_HTML_COMPANION)
-    assert "SOL-projected" in block
-    assert "third polyline" in block
-    # The overlay is honest: omitted, never approximated, without data.
-    assert "omit the overlay, never approximate it" in block
+    assert "supported conversion from the CURRENT model to both axes" in block
+    assert "never substitute the initial projection" in block
+    assert "omitting unknown points" in block
+    assert "name the model revision" in block
 
 
 # ----------------------------------------------------------------------- slurm
@@ -1411,30 +1365,29 @@ def test_kernel_coverage_degrade_string_takes_bound_on_the_row():
     assert "`bound` is required in either shape" in block
 
 
-def test_kernel_coverage_note_requires_marking_unmeasured_rows():
+def test_kernel_coverage_note_preserves_unmeasured_rows_in_supporting_ledger():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "## Kernel disposition ledger" in block
-    assert "authoritative YAML" in block
-    assert "mark every unmeasured bound" in block
-    assert "degrade reason or null metric's `note`" in block
+    assert 'ncu: "unavailable: <reason>"' in block
+    assert "an absent metric is `null` with an explanatory `note`" in block
+    assert "Keep measured metrics and never invent others" in block
+    assert "complete kernel disposition table in `kernel_ledger.yaml`" in block
+    assert "do not duplicate every row in Markdown" in block
 
 
 def test_kernel_coverage_reporter_discloses_how_much_ncu_measured():
     block = _norm(KERNEL_COVERAGE_REPORTER_GUIDANCE)
-    # A ledger of degrade strings / null metrics is valid, so the reporter
-    # must say so — otherwise an unmeasured coverage proof renders exactly
-    # like a measured one.
-    assert "Say how much of the table ncu actually measured" in block
-    assert "must never render" in block
+    assert "how many rows ncu actually measured" in block
+    assert "Unavailable counters, nulls and contaminated samples remain visible" in block
+    assert "does not supply a second headline ceiling" in block
 
 
 def test_kernel_coverage_bundle_extends_profiler_analyzer_and_reporter():
     base = build_perf_optimize_prompts()
     coverage = _coverage_bundle()
     assert "Per-kernel coverage contract" in coverage.analyzer
-    assert "## Kernel Coverage" in coverage.reporter
+    assert "## Supporting kernel evidence" in coverage.reporter
     assert "Per-kernel coverage contract" not in base.analyzer
-    assert "## Kernel Coverage" not in base.reporter
+    assert "## Supporting kernel evidence" not in base.reporter
     for role in ("benchmarker", "projector", "optimizer", "evaluator", "qa"):
         assert getattr(coverage, role) == getattr(base, role), role
 
@@ -1480,23 +1433,14 @@ def test_kernel_coverage_off_leaves_bundle_unchanged():
     assert build_perf_optimize_prompts(kernel_coverage=None) == DEFAULT_PROMPTS
 
 
-def test_kernel_coverage_reporter_section_slots_after_kernel_comparison():
+def test_kernel_coverage_reporter_links_details_in_existing_gap_analysis():
     block = _norm(KERNEL_COVERAGE_REPORTER_GUIDANCE)
-    assert 'between "Kernel-Level Comparison" and "Failed Attempts"' in block
-    # Dispositions resolve to campaign outcomes and the untried tail is
-    # itemized, never buried.
-    assert "pending at campaign end" in block
-    assert "untried tail" in block
-    # All four questions get a column, and the busy share that makes the
-    # shares readable as wall clock is stated.
-    assert "| eliminate → | faster → | fusion → | overlap → |" in block
-    assert "coverage.gpu_busy_pct" in block
-    assert "all four questions" in block
-    # One item can span two cells (alternative realizations) or two rows
-    # (a pair) — resolved consistently, counted once.
-    assert "never count its gain twice" in block
-    # Honest degrade when the final ledger is missing.
-    assert "Kernel coverage ledger unavailable" in block
+    assert "link to it from Gap analysis" in block
+    assert "ledger/model IDs and evaluation evidence" in block
+    assert "Resolve item outcomes from the roadmap" in block
+    assert "without treating rejected or dismissed items as physical limits" in block
+    assert "Keep detailed four-question dispositions and per-kernel counters in the YAML" in block
+    assert "Do not reproduce all kernels" in block
 
 
 def test_kernel_coverage_composes_with_sol_slurm_and_restriction():
@@ -1507,12 +1451,12 @@ def test_kernel_coverage_composes_with_sol_slurm_and_restriction():
         kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
     )
     assert "Per-kernel coverage contract" in bundle.analyzer
-    assert "SOL projection as context" in bundle.analyzer
+    assert "Update the current model from SOL evidence" in bundle.analyzer
     assert "Approach restriction (`optimize.approaches`)" in bundle.analyzer
     assert "slurm-environment" in bundle.profiler
     assert "slurm-environment" not in bundle.analyzer
-    assert "## Kernel Coverage" in bundle.reporter
-    assert "Projection vs Measured" in bundle.reporter
+    assert "## Supporting kernel evidence" in bundle.reporter
+    assert "Use the current theoretical model" in bundle.reporter
 
 
 def test_measuring_roles_inherit_the_server_identity_checks():
@@ -1550,19 +1494,19 @@ def test_analyzer_bounds_expected_gain_by_measured_headroom() -> None:
     for field in ("bounding_resource", "bounding_pct", "headroom_verdict"):
         assert field in prompt
     assert "bound faster-execution claims" in prompt
-    assert "elimination, fusion or independent-overlap" in prompt
+    assert "elimination, fusion or independent overlap" in prompt
     assert "utilization cannot support an item alone" in prompt
-    assert "If ncu's bound disagrees with utilization" in prompt
+    assert "resolves disagreement with ncu" in prompt
 
 
 def test_analyzer_must_account_for_every_nsys_opportunity() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     assert "nsys_analysis/items.json" in prompt
-    assert "`nsys_items` accounts for the timeline analysis, one row per id" in prompt
+    assert "`nsys_items` covers exactly the ids in `nsys_analysis/items.json`" in prompt
     assert "disposition: item" in prompt
     assert "disposition: dismissed" in prompt
-    assert "an unaccounted id does" in prompt
-    assert "Never pad the roadmap" in prompt
+    assert "Missing or extra ids fail validation" in prompt
+    assert "never pad the queue" in prompt
 
 
 def test_roadmap_spec_documents_the_nsys_items_block():
@@ -1571,26 +1515,26 @@ def test_roadmap_spec_documents_the_nsys_items_block():
     assert "disposition: item" in spec
     assert "disposition: dismissed" in spec
     # Same vocabulary as the kernel ledger, and the same reason for it.
-    assert "must name a real roadmap item id, any status" in spec
+    assert "a real roadmap id in any status" in spec
     # Absent when the pipeline could not run; required when it did.
-    assert "omitted entirely when it does not" in spec
+    assert "Omit it when that file is unavailable and state why" in spec
     # Ids are local to the analysis that wrote them, so the block is
     # authored fresh each round rather than carried forward — a stale row
     # names an id this round's file does not have.
-    assert "author the block fresh from this round's `items.json`" in spec
+    assert "Full analyses rebuild this block from their own file" in spec
     assert "replan-only rounds use the standing analysis" in spec
-    assert "never carried forward" in spec
+    assert "Reassess reused judgments against the current ids" in spec
 
 
 def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    assert "Categorize imbalance by `imbalance_operator`'s work, not communication" in prompt
+    assert "Classify imbalance by `imbalance_operator`'s work" in prompt
     assert "uneven experts are `compute`" in prompt
     assert "uneven KV footprint is `kv-capacity`" in prompt
-    assert "`pinned` / `rotating`" in prompt
-    assert "A pinned machine issue may be outside this campaign" in prompt
+    assert "`pinned`/`rotating` verdict" in prompt
+    assert "Pinned machine issues may be outside scope" in prompt
     assert "rotating imbalance calls for work distribution" in prompt
-    assert "bound recovery by `pct_of_iter`, not the whole rank spread" in prompt
+    assert "bound recovery by `pct_of_iter`, not total rank spread" in prompt
 
 
 # ------------------------------------------------------ unified performance model
@@ -1598,131 +1542,89 @@ def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective() -> None
 
 def test_kernel_ledger_updates_the_model_on_every_analyzer_turn():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "Every analyzer turn, including re-analysis and replan-only rounds" in block
-    assert "copy the standing measurements and coverage into a fresh ledger" in block
-    assert "preserve measurement provenance" in block.lower()
-    assert "append-only `model_revisions`" in block
-    assert "record each changed model field with its previous and new value" in block.lower()
-    assert "Include the full current section on **replan-only** turns" in block
-    assert "name their source round" in block
-    assert "preserve the imported report verbatim" in block
-    assert "clearly labeled current-campaign section with this heading" in block
-    assert "Preserve imported anchors and give the appended section a unique anchor" in block
-    assert "`current-campaign-` if its round anchor already exists in imported text" in block
+    assert "Every optimization-round Analyzer, including re-analysis and replan turns" in block
+    assert "Final reconciliation reads the last ledger" in block
+    assert "updates only the aggregate model and analysis" in block
+    assert "Replans copy standing measurements, coverage and provenance" in block
+    assert "changed field's old/new value, reason, round and evidence to `model_revisions`" in block
+    assert "preserving earlier revisions" in block
+    assert "four-section `analysis.md` contract on full, replan and reused turns" in block
+    assert "Imported ledgers are prior art" in block
+    assert "source operating conditions and measurement citations" in block
+    assert "link imported reports rather than copying or appending them" in _norm(
+        ANALYZER_SYSTEM_PROMPT
+    )
 
 
 def test_kernel_model_converges_from_facts_and_preserves_unknowns():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    assert "A failed optimization alone cannot justify relaxing the model" in block
-    assert "Measured time below a predicted lower bound exposes an invalid model" in block
-    assert "never clamp the measurement" in block
-    assert "Unknown predictions or measurements are `null`" in block
-    assert "unknown never means no opportunity" in block
-    assert "facts explain the residual" in block
-    assert "unexplained gaps open" in block
-    assert "matching units and scope" in block
-    assert "Never sum overlapping kernel durations" in block
-    assert "logical region shared by several kernels" in block
-    report = block.split("### Required analyzer report section:", 1)[1].split(
-        "### The kernel ledger contract", 1
-    )[0]
-    assert "## Per-layer theoretical performance model" in report
-    assert "before **## Ranked bottleneck hypotheses**" in report
-    assert "HTML anchor `per-layer-theoretical-performance-model-round-N`" in report
-    assert "logical layers from config/source" in report
-    assert "model IDs and kernel/region evidence" in report
-    assert "index range/count" in report
-    assert "per-layer, averaged and repeated-total timings" in report
-    assert "sharding" in report
-    assert "shapes/dtypes, FLOPs, necessary memory traffic" in report
-    assert "collectives" in report
-    assert "Substitute numbers and units into formulas" in report
-    assert "hardware constants and their sources" in report
-    assert "Separate theoretical minimum latency from empirical practical estimates" in report
-    assert "Label which kind `predicted_ms` represents in `derivation`" in report
-    assert "record both calculations there when both are available" in report
-    assert "Match the operating point and timing scope" in report
-    assert "unexplained residuals and the next discriminating test" in report
-    assert "critical-path lower bound" in report
-    assert "never double count regions or alternative savings" in report
-    assert "Label incomplete totals as partial" in report
-    assert "include the `sol.json` comparison here once" in report
-    assert "calculator columns and region scopes intact" in report
-    assert "add layer totals only with an explicit mapping" in report
-    assert "equations, bounds, comparison tables and gap explanations in this section" in report
-    assert "nsys/ncu sections own measured diagnostics" in report
-    assert "kernel disposition ledger owns decisions" in report
-    assert "ranked hypotheses own prioritized experiments" in report
-    assert "Both reference the model's gaps instead of repeating them" in report
-    assert "Remaining-gap attribution is brief campaign-end accounting with links" in report
+    for requirement in (
+        "failure alone neither relaxes a bound nor closes an opportunity",
+        "measurements below predicted bounds without clamping or fitting them",
+        "Unknown predictions/measurements are `null`, with `unexplained` and `next_test`",
+        "operating_point",
+        "timing aggregation for a matched comparison",
+        "shared logical region",
+        "A shared model appears once",
+    ):
+        assert requirement in block
+    assert "Map repeated logical layers to `models` IDs" in block
+    assert "label per-layer versus repeated-total costs" in block
+    assert "Put full layer/op tables and calculator output in linked artifacts" in block
+    # Aggregate accounting and convergence are defined once for all analyzer turns.
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    for requirement in (
+        "Measurements beating a predicted bound require `model_invalid`",
+        "complete explained components, no unexplained residual",
+        "disjoint critical-path components",
+        "achieved bandwidth is an empirical reference",
+        "including prefill and non-layer serving work",
+        "Unknown bounds cannot become zero",
+    ):
+        assert requirement in contract
 
 
 @pytest.mark.parametrize("include_sol", [False, True])
-def test_per_layer_report_keeps_absolute_and_relative_practical_gaps(include_sol: bool) -> None:
+def test_current_model_reports_absolute_and_relative_gaps_without_mixing_ceilings(
+    include_sol: bool,
+):
     bundle = build_perf_optimize_prompts(
         include_sol=include_sol,
         kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
     )
-    report = (
-        _norm(bundle.analyzer)
-        .split("### Required analyzer report section:", 1)[1]
-        .split("### The kernel ledger contract", 1)[0]
-    )
-    assert "**Gap vs practical (ms)** and **Gap vs practical (%)**" in report
-    assert "gap_ms = measured_ms - practical_ms" in report
-    assert "gap_pct = gap_ms / practical_ms * 100" in report
-    assert "Calculate before rounding" in report
-    assert "show signed percentages to one decimal place" in report
-    assert "Show `—` for percentages with missing or mismatched timings" in report
-    assert "practical_ms <= 0" in report
-    assert "Label gaps against theoretical estimates separately" in report
+    prompt = _norm(bundle.analyzer)
+    assert "Measured ms | Best ms | Gap ms" in prompt
+    assert "Theoretical best | % of best | Remaining gain" in prompt
+    assert "measured/best" in prompt
+    assert "best/measured - 1" in prompt
+    assert "Name units and denominator" in prompt
+    assert "unknowns as —" in prompt
+    assert "Baseline and final must use the same current model" in prompt
+    assert "model revisions are not implementation gains" in prompt
 
 
 @pytest.mark.parametrize("include_sol", [False, True])
-def test_unified_ledger_exposes_models_only_to_analyzer_and_reporter(include_sol):
+def test_unified_model_is_unconditional_and_kernel_ledger_remains_supporting(include_sol):
+    base = build_perf_optimize_prompts(include_sol=include_sol)
     bundle = build_perf_optimize_prompts(
         include_sol=include_sol,
         kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
     )
     assert "version: 2" in bundle.analyzer
     assert "models:" in bundle.analyzer
-    assert "## Per-layer theoretical performance model" in bundle.analyzer
-    analyzer = _norm(bundle.analyzer)
-    assert "## SOL correlation (measured vs ceiling)" not in analyzer
-    assert ("sol_calc.py analyze" in analyzer) is include_sol
-    if include_sol:
-        for artifact in ("regions.json", "sol.json", "sol_recipes/", "sol_work/peaks.json"):
-            assert artifact in analyzer
-        for field in (
-            "region",
-            "calls",
-            "measured ms",
-            "SOL ms",
-            "% of SOL",
-            "MFU %",
-            "MBU %",
-            "gap ms",
-            "bound",
-        ):
-            assert field in analyzer
-        assert "Correlation unavailable" in analyzer
-    reporter = _norm(bundle.reporter)
-    assert "Theoretical headroom summary" in reporter
-    assert "link directly to **Per-layer theoretical performance model**" in reporter
-    assert "relative link with its section anchor in both Markdown and HTML" in reporter
-    assert "Use the actual current-campaign anchor" in reporter
-    assert "an imported section with the same heading is historical evidence" in reporter
-    assert "do not reproduce or re-derive them here" in reporter
-    assert "Theoretical model vs silicon" not in bundle.reporter
-    assert "if the analyzer section is absent, report it as unavailable" in reporter.lower()
-    assert "| eliminate → | faster → | fusion → | overlap → |" in bundle.reporter
-    assert ("Projection vs Measured" in bundle.reporter) is include_sol
-    base = build_perf_optimize_prompts(include_sol=include_sol)
-    assert "## Per-layer theoretical performance model" not in base.analyzer
-    assert "## SOL correlation (measured vs ceiling)" in _norm(base.analyzer)
-    assert ("sol_calc.py analyze" in base.analyzer) is include_sol
+    for current in (base, bundle):
+        for prompt in (current.analyzer, current.reporter):
+            assert "performance_model.yaml" in prompt
+            assert "## Theoretical performance model" in prompt
+            assert "## Per-layer theoretical performance model" not in prompt
+            assert "## SOL correlation (measured vs ceiling)" not in prompt
+        assert ("sol_calc.py analyze" in current.analyzer) is include_sol
     if include_sol:
         assert SOL_ANALYZER_CONTEXT in base.analyzer
+        for artifact in ("regions.json", "sol.json", "sol_recipes/", "sol_work/peaks.json"):
+            assert artifact in bundle.analyzer
+    assert "Supporting kernel evidence" in bundle.reporter
+    assert "Supporting kernel evidence" not in base.reporter
     for role in ("optimizer", "evaluator", "qa"):
         assert getattr(bundle, role) == getattr(base, role)
     for role in _ALL_PROMPTS:
@@ -1735,16 +1637,17 @@ def test_evaluator_carries_the_change_not_live_implication():
     # the opposite: one bounds the headroom, the other bounds nothing.
     block = _norm(EVALUATOR_SYSTEM_PROMPT)
     assert "change-not-live" in block
-    assert "bounds nothing, because the mechanism was never tested" in block
+    assert "bounds no headroom because the mechanism was not tested" in block
 
 
 def test_evaluator_is_told_to_pass_the_structured_fields():
     block = _norm(EVALUATOR_SYSTEM_PROMPT)
     for field in ("gap_implication", "gap_implication_note", "lever", "target_blocker"):
         assert field in block, field
-    assert "Prose is not a contract" in block
+    assert "Populate optional evidence fields when applicable" in block
     # The blocker is a fact about the code that it verifies, not authors.
-    assert "Forward, never author" in block
+    assert "forward an Optimizer-reported wall" in block
+    assert "Do not author a blocker the Optimizer did not report" in block
 
 
 # ---------------------------------------------------- the workspace prompt snapshot
@@ -1798,7 +1701,8 @@ def test_profiler_emits_only_the_effective_config_and_replay_policies() -> None:
         assert "every item must be `approach: config`" not in prompt
         assert "still measure and report every point" not in prompt
         assert "**One run per concurrency point.**" not in prompt
-        assert "replay only the **largest**" in prompt
+        assert "With no explicit request, replay the **largest**" in prompt
+        assert "explicitly requested operating points and phases" in prompt
         assert "lowest and highest scored concurrency points" not in prompt
 
 
@@ -1816,11 +1720,12 @@ def test_analyzer_omits_other_roles_implementation_and_verdict_instructions() ->
 
 def test_analyzer_replan_preserves_measurements_and_history() -> None:
     prompt = _norm(_coverage_bundle().analyzer)
-    assert "launch no server, run no profiler" in prompt
+    assert "Never apply optimizations or launch servers" in prompt
+    assert "benchmark workloads, profiler captures" in prompt
     assert "Do not regenerate measured artifacts" in prompt
-    assert "full findings structure applies only to full analysis, including re-analysis" in prompt
-    assert "replan/reuse notes must also include" in prompt
-    assert "its full current per-layer theoretical performance model section" in prompt
+    assert "replan, reuse and SOL-disabled turns" in prompt
+    assert "Replan/reuse preserves measurement provenance" in prompt
+    assert "Old measurements do not describe a new build" in prompt
     assert "freeze `baseline`" in prompt
     assert "preserve all accepted / failed / in_progress items" in prompt
     assert "Never renumber or reuse ids" in prompt
@@ -1833,8 +1738,8 @@ def test_profiler_and_analyzer_have_separate_artifact_ownership() -> None:
     assert "capture_preprocessing" in profiler
     assert "append_profiler_progress" in profiler
     assert "Write `profile_manifest.json` last" in profiler
-    assert "never overwrite the profiler's preliminary decomposition" in analyzer
-    assert "`<profile_dir>` means the read-only source capture directory" in analyzer
+    assert "Never overwrite the Profiler's preliminary decomposition" in analyzer
+    assert "`<profile_dir>` is the read-only capture directory" in analyzer
     assert "rounds/round_<n>/analysis/" in analyzer
     assert "append_analyzer_progress" in analyzer
     assert "## Required findings structure" not in profiler
@@ -1889,8 +1794,8 @@ def test_sol_calibration_is_owned_by_profiler_and_snapshotted() -> None:
 def test_analyzer_can_reanalyze_saved_captures_without_runtime_access() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     assert "**re-analysis of existing captures**" in prompt
-    assert "A new capture is not required" in prompt
-    assert "earlier round or another workspace" in prompt
+    assert "No new capture is required" in prompt
+    assert "verify capture provenance and availability" in prompt
     assert "nsys export --type sqlite" in prompt
     assert "nsys stats --report" in prompt
     assert "ncu --import <profile_dir>/server_ncu.ncu-rep" in prompt
@@ -1898,9 +1803,9 @@ def test_analyzer_can_reanalyze_saved_captures_without_runtime_access() -> None:
     assert "taxonomy before quoting a single category number" in prompt
     assert "Never run a workload to fill a missing file" in prompt
     assert "Additional capture requested:" in prompt
-    assert "Do not launch a runtime probe to re-analyze" in prompt
+    assert "without a runtime probe" in prompt
     assert "runtime.import_path" in prompt
-    assert "The current source checkout may differ from the profiled build" in prompt
+    assert "Distinguish later source changes from captured behavior" in prompt
 
 
 def test_analyzer_has_no_capture_commands_under_any_extensions() -> None:
@@ -1927,7 +1832,7 @@ def test_analyzer_has_no_capture_commands_under_any_extensions() -> None:
             "you just profiled on it",
         ):
             assert command not in prompt, command
-        assert "never launch a server" in prompt
+        assert "Never apply optimizations or launch servers" in prompt
 
 
 def test_disagg_analyzer_gets_only_capture_interpretation_context() -> None:
@@ -1946,17 +1851,16 @@ def test_reanalysis_refreshes_ledgers_and_correlation_without_recapture() -> Non
         kernel_coverage={"min_share_pct": 0.5, "coverage_target_pct": 95.0},
     )
     prompt = _norm(bundle.analyzer)
-    assert "Re-analysis rebuilds the ledger from saved evidence" in prompt
-    assert "Re-run correlation in full analyses, including re-analysis" in prompt
-    assert "without collecting measurements" in prompt
+    assert "Re-analysis rebuilds from saved evidence" in prompt
+    assert "Re-run correlation in full analysis/re-analysis" in prompt
+    assert "without collecting runtime evidence" in prompt
     assert "Never run a GPU microbenchmark" in prompt
     assert "<campaign_workspace>/sol_work/peaks.json" in prompt
-    assert "**Full analyses**: author the block fresh" in prompt
-    assert "replan-only rounds use the standing analysis" in prompt
+    assert "replan-only turns preserve standing measurements" in prompt
     for artifact in ("regions.json", "sol.json", "sol_recipes/"):
         assert artifact in prompt
     assert "## SOL correlation (measured vs ceiling)" not in prompt
-    assert "## Per-layer theoretical performance model" in prompt
+    assert "## Theoretical performance model" in prompt
 
 
 def test_prompt_bundle_profiler_extensions_are_independent() -> None:
@@ -1983,15 +1887,18 @@ def test_reporter_pairs_raw_captures_with_their_completed_analysis() -> None:
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
     assert "profile/profile_manifest.json" in prompt
     assert "analysis/analysis_manifest.yaml" in prompt
-    assert "Re-analysis alone never makes a capture newer" in prompt
-    assert "Match analysis and capture identities" in prompt
-    assert "associated `analysis/nsys_analysis/`" in prompt
+    assert "Replan or re-analysis does not renew measurement provenance" in prompt
+    assert "matching analysis/capture identities" in prompt
+    assert "`analysis/nsys_analysis/`" in prompt
 
 
 def test_evaluator_comparative_analysis_preserves_previous_capture() -> None:
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
-    assert "Keep previous captures and analyses read-only" in prompt
-    assert "associated round's `analysis/taxonomy.json`" in prompt
+    assert "Keep previous artifacts read-only" in prompt
+    assert (
+        "analysis_manifest.yaml links profile/ to completed analysis/ exports and taxonomy"
+        in prompt
+    )
     assert "<previous capture or analysis server_nsys.sqlite>" in prompt
 
 
@@ -2012,18 +1919,31 @@ def test_kernel_ledger_prompt_example_validates(tmp_path):
 
 def test_projector_records_initial_model_without_freezing_future_analysis():
     prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
-    assert "Later facts may expose a faulty assumption or omitted cost" in prompt
-    assert "the analyzer maintains the best current model" in prompt.lower()
+    assert "conditional on" in prompt
+    assert "current model for gap accounting and convergence" in prompt
+    assert "Analyzer later corrects these assumptions" in prompt
+    assert "sol_projection.md remains initial provenance" in prompt
     assert "ceiling stays valid for every later round" not in prompt
 
 
 def test_reporter_distinguishes_superseded_projection_from_current_model():
     block = _norm(SOL_OPTIMIZE_REPORTER_GUIDANCE)
-    assert "superseded initial model" in block
-    assert "cite the model revision" in block
-    assert "Never present a falsified prediction" in block
-    assert "Attribute missing time to host/scheduler costs only when traces" in block
-    assert (
-        "a large discrepancy alone does not distinguish implementation inefficiency from model error"
-        in block
-    )
+    assert "initial projection has been superseded" in block
+    assert "correction once with its evidence and model_id" in block
+    assert "do not fall back to a superseded initial bound" in block
+    assert "Large model discrepancies do not establish host/scheduler overhead" in block
+    assert "require phase measurements" in block
+
+
+@pytest.mark.parametrize("analyzer_only", [False, True])
+@pytest.mark.parametrize("allowed", [("code",), ("config",)])
+def test_restrictions_preserve_opportunities_in_current_model_without_extra_sections(
+    analyzer_only, allowed
+):
+    block = _norm(approach_restriction_note(allowed, analyzer_only=analyzer_only))
+    assert "scope_limited" in block
+    assert "`analysis.md`'s Gap analysis/Next actions" in block
+    assert "Out-of-scope opportunities" not in block
+    assert "## Gap analysis" not in block
+    assert "## Next actions" not in block
+    assert "without planning unactionable work" in block or "leave no unactionable item" in block

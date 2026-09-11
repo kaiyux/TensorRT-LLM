@@ -107,7 +107,7 @@ def build_perf_analyze_prompts(
     projection-consumption guidance is appended to the
     analyzer (context for hypothesis ranking plus the measured↔SOL
     correlation via ``sol_calc.py analyze``) and the reporter (required
-    "Projection vs Measured" section + weighing rules). The projector's
+    current theoretical-model comparison and evidence rules). The projector's
     own prompt is always in the bundle — the stage gate lives in the
     workflow.
 
