@@ -113,12 +113,12 @@ def test_profiler_report_preserves_capture_only_ownership_and_requested_coverage
     assert "**Coverage**" in prompt
     assert "**Timing provenance**" in prompt
     assert "every requested point/phase/rank/kernel target" in prompt
-    assert "missing evidence/failure reason" in prompt
+    assert "reasons for missing evidence" in prompt
     assert "explicitly requested operating points and phases" in prompt
     assert "With no explicit request, replay the **largest**" in prompt
     assert "Separate prefill/mixed iterations from steady-state decode" in prompt
     assert "expose missing phases/concurrencies" in prompt
-    assert "The Analyzer owns bottleneck rankings, optimization suggestions" in prompt
+    assert "The Analyzer owns bottleneck rankings, optimization opportunities" in prompt
     assert "never apply optimizations" in prompt.lower()
     assert "profile_findings.md" not in prompt
 

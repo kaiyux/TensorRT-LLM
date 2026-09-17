@@ -155,7 +155,9 @@ def test_final_reconciliation_updates_only_model_and_analysis_from_final_evidenc
     )
     assert "preserve supported structural bounds" in final_mode
     assert "leave final component timings unknown when unprofiled" in final_mode
-    assert "Acceptance does not prove a mechanism or make an old profile current" in final_mode
+    # The mode-independent warning applies to final reconciliation as well.
+    modes = prompt.split("## Modes", 1)[1].split("**Full analysis**", 1)[0]
+    assert "Acceptance does not prove a mechanism or profile currency" in modes
     assert "Apply the shared model's mismatch and convergence rules" in final_mode
     assert "Never apply optimizations or launch servers" in prompt
 

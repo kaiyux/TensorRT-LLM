@@ -265,15 +265,16 @@ def test_the_disagg_section_is_composed_last_so_its_overrides_win():
 
 def test_the_disagg_section_freezes_the_topology():
     flat = _flat(DISAGG_CAMPAIGN)
-    assert "frozen for this campaign" in flat
-    assert "is a REJECT" in flat
+    assert "Worker counts and per-role parallel sizes are **frozen**" in flat
+    assert "any change is a REJECT regardless of gain" in flat
     # num_gpus is the sum over roles, not one server's world size.
     assert "sum over roles" in flat
 
 
 def test_the_disagg_section_scopes_profiling_to_nsys_on_workers():
     flat = _flat(DISAGG_CAMPAIGN)
-    assert "no path through this harness" in flat
+    assert "ncu is unsupported" in flat
+    assert "not available in a disagg campaign" in flat
     assert "workers only" in flat
     assert "communication" in flat
 
@@ -297,7 +298,7 @@ def test_stage_prompts_state_the_mode_so_the_system_prompt_section_wins(tmp_path
 
     directive = wf._disagg_directive()
     assert "DISAGGREGATED" in directive
-    assert "replaces all of it" in directive
+    assert "replaces all instructions below" in directive
     assert str(harness) in directive
     # It must name the guidance it overrides, or a reader cannot tell what to skip.
     assert "trtllm-serve" in directive

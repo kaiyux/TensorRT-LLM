@@ -1624,20 +1624,17 @@ class PerfOptimizeWorkflow:
                 f"`trtllm-serve` launch:\n\n"
                 f'`export PYTHONPATH="{state.integration_worktree_path}'
                 f'${{PYTHONPATH:+:$PYTHONPATH}}"`\n\n'
-                f"Read the manifest in order. Cherry-pick every non-empty "
-                f"candidate_commit into the integration branch, resolve only "
-                f"merge conflicts/minimal combination defects, and combine the "
-                f"candidate config files into the live integration config. Commit "
-                f"any conflict-resolution code before finishing.\n\n"
+                f"In manifest order, cherry-pick every non-empty `candidate_commit` "
+                f"into the integration branch and combine candidate configs into "
+                f"the live integration config. Fix only merge conflicts and minimal "
+                f"combination defects; commit conflict-resolution code before finishing.\n\n"
                 f"Launch and benchmark this combined state using "
                 f"`--extra_llm_api_options {integration_config}` and the same "
                 f"Evaluator measurement/Pareto rules. Compute the combined "
                 f"required gain as `max(noise_floor_pct, best standalone "
                 f"measured_gain_pct - noise_floor_pct)` from task.yaml and the "
-                f"manifest. Report that threshold exactly; the Python "
-                f"orchestrator cross-checks it and the measured gain before "
-                f"applying your verdict. You may diagnose/remediate at most "
-                f"twice. If the combined "
+                f"manifest. Report the exact threshold and measured gain for "
+                f"orchestrator validation. Diagnose/remediate at most twice. If the combined "
                 f"state still fails, retain and validate only the highest standalone "
                 f"gain candidate (manifest order breaks ties); if that also fails, "
                 f"restore the base and REJECT.\n\n"
@@ -1835,10 +1832,10 @@ class PerfOptimizeWorkflow:
             return ""
         config = disagg_config_path(self._task_data())
         return (
-            f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
-            f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
-            f"or polling a server applies — your system prompt's "
-            f"*Disaggregated serving* section replaces all of it.\n\n"
+            f"**This campaign is DISAGGREGATED** (harness config: `{config}`). "
+            f"The system prompt's *Disaggregated serving* section replaces all "
+            f"instructions below about `trtllm-serve`, `--extra_llm_api_options` "
+            f"or polling a server.\n\n"
         )
 
     def _require_baseline_measurement(self) -> None:
@@ -1945,8 +1942,8 @@ class PerfOptimizeWorkflow:
         path = self._analysis_dir(state) / performance_model.MODEL_FILENAME
         previous = self._latest_performance_model(before_round=state.round_index + 1)
         prior_instruction = (
-            f"Read `{previous}` as the prior model, retaining the evidence and "
-            f"explanation for any changed assumption or bound. "
+            f"Read prior model `{previous}`; retain evidence and explanations "
+            f"for changed assumptions or bounds. "
             if previous is not None
             else ""
         )
@@ -1955,23 +1952,22 @@ class PerfOptimizeWorkflow:
             prior_instruction += (
                 f"Read `{imported_model}` as read-only prior art and "
                 f"`{self.reuse_manifest_path}` for its source and selection scope. "
-                f"Retain its corrected assumptions where capture, build, hardware, "
+                f"Retain corrected assumptions where capture, build, hardware, "
                 f"workload and timing conditions match; do not silently replace them "
                 f"with the original SOL projection. Resolve citations in the source "
                 f"workspace. Source measurements do not establish this campaign's "
-                f"current performance: write a fresh model below and mark mismatches "
-                f"or missing evidence explicitly. "
+                f"performance; mark mismatches and missing evidence in the new model. "
             )
         return (
             prior_instruction
-            + f"Write `{path}` as the single current theoretical best performance "
-            f"model, even when SOL projection or kernel coverage is disabled. "
+            + f"Write `{path}` as the current theoretical best performance model, "
+            f"even when SOL projection or kernel coverage is disabled. "
             f"Cover every configured concurrency (use null for scalar mode), "
             f"the task's target metric, matching runtime/workload/timing scope, "
             f"measured performance, a supported best-case bound or explicit unknown, "
-            f"and an exhaustive non-overlapping gap decomposition. Every bound or "
-            f"blocker needs evidence; unknowns need the next discriminating test. "
-            f"Use this model for roadmap gain estimates and convergence. A stopped "
+            f"and an exhaustive non-overlapping gap decomposition. Support bounds "
+            f"and blockers with evidence; give unknowns the next discriminating test. "
+            f"Use this model for roadmap gains and convergence. A stopped "
             f"campaign or failed attempt alone does not establish convergence. "
             f"Summarize the model in `analysis.md` and link detailed evidence.\n\n"
         )
@@ -2216,9 +2212,9 @@ class PerfOptimizeWorkflow:
         previous = self._latest_kernel_ledger(before_round=round_no)
         prior = self.reuse_dir / reuse.PRIOR_KERNEL_LEDGER_NAME
         history = (
-            f"Read `{previous}` as the previous ledger, including replan updates. "
-            f"Carry forward its model revision history verbatim. For every changed "
-            f"model assumption, derivation, operating point or prediction, append "
+            f"Read previous ledger `{previous}`, including replan updates, and "
+            f"preserve its revision history verbatim. For each changed model "
+            f"assumption, derivation, operating point or prediction, append "
             f"a round {round_no} `model_revisions` entry with the exact `from` and "
             f"`to` values, reason, and supporting evidence. Preserve prior files. "
             if previous
@@ -2227,10 +2223,9 @@ class PerfOptimizeWorkflow:
         if previous is None and prior.is_file():
             history += (
                 f"Read `{prior}` as read-only prior art. Check its capture and "
-                f"operating conditions against the evidence being analyzed, cite "
-                f"any models you retain, and bind question references to this "
-                f"campaign's roadmap. Its revision history belongs to another "
-                f"campaign and remains in the prior artifact. "
+                f"operating conditions against this evidence, cite retained models, "
+                f"and bind question references to this campaign's roadmap. Leave "
+                f"its revision history in the prior artifact. "
             )
         return (
             f"Apply the **per-kernel coverage contract**: write `{ledger_path}` "
@@ -2239,9 +2234,8 @@ class PerfOptimizeWorkflow:
             f"and extend to {coverage['coverage_target_pct']}% coverage. Record "
             f"`coverage.gpu_busy_pct` and answer all four questions — eliminable? "
             f"faster? fusible? overlappable? — with roadmap references or cited "
-            f"evidence. Keep the detailed dispositions in the machine-readable "
-            f"ledger and link to them from the analysis. Maintain supporting "
-            f"per-kernel and per-region models in this ledger, using shared models where kernel "
+            f"evidence. Link detailed dispositions from the analysis. Maintain "
+            f"supporting per-kernel and per-region models, sharing models where kernel "
             f"boundaries change through fusion or elimination. {history}"
             f"Write `## Theoretical performance model` in "
             f"`{self._analysis_dir(state) / 'analysis.md'}` following the "
@@ -2635,17 +2629,16 @@ class PerfOptimizeWorkflow:
             return ""
         lock_path = shlex.quote(str(self.workspace.resolve() / ".local_runtime.lock"))
         return (
-            "**Concurrent local items — shared runtime protocol.** Other optimizer/evaluator "
-            "pairs are active in their own worktrees. Reasoning, source edits, CPU-only checks, "
-            "and offline result analysis may run concurrently outside the lock. Before any "
+            "**Concurrent local items — shared runtime protocol.** Sibling optimizer/evaluator "
+            "pairs use separate worktrees. Reasoning, edits, CPU-only checks and offline "
+            "analysis may run concurrently outside the lock. Before any "
             "build/install that changes the runtime, GPU test or microbenchmark, server/port "
             "operation, benchmark replay, or profiling capture, write an item-owned shell "
             "script under your attempt directory and run it in the foreground with "
             f'`flock -x --close -- {lock_path} bash "<runtime-session-script>"`. '
             "All local items use this exact lock file; never unlink it or substitute an "
-            "item-specific lock. If another item holds it, wait for the lock; never bypass "
-            "it or kill the holder. If flock fails or is unavailable, report the blocker "
-            "instead of running the session without it.\n\n"
+            "item-specific lock. Wait for the lock; never bypass it or kill the holder. "
+            "If flock fails or is unavailable, report the blocker and do not run.\n\n"
             "One locked script must own the complete runtime session: establish this "
             "candidate's build/install and PYTHONPATH, verify its import/build identity, "
             "launch, poll readiness, exercise/measure, and tear down. Re-establish and "
@@ -2654,10 +2647,9 @@ class PerfOptimizeWorkflow:
             "launch; tear down and wait for all owned server/profiler process groups before "
             "the script exits and releases the lock, including on failure or interruption. "
             "Do not background the flock wrapper or split a live server's lifecycle across "
-            "separate lock acquisitions. Later experiments may use another complete locked "
-            "session. All port inspection and stale-listener cleanup instructions apply "
-            "only after acquiring this lock: a busy port while waiting may belong to a "
-            "sibling, and you must never kill or benchmark that sibling's server.\n\n"
+            "separate lock acquisitions. Each later experiment needs a complete locked "
+            "session. Inspect ports and clean stale listeners only after acquiring this "
+            "lock; never kill or benchmark a sibling's server.\n\n"
         )
 
     def _run_benchmarker(self, state: WorkflowState) -> None:
@@ -2670,60 +2662,45 @@ class PerfOptimizeWorkflow:
                 else "mean over all configured concurrency points"
             )
             load_instruction = (
-                f"then run `benchmark_serving.py` **once per concurrency "
-                f"point {points}**, sequentially ascending, against the same "
-                f"server (Pareto-curve mode — do not relaunch between "
-                f"points). Use the **canonical `benchmark_serving.py` "
-                f"command in your system prompt** — fill in the paths and "
-                f"`benchmark` values, keep the other flags as given, and do "
-                f"not improvise. Pass "
+                f"run the canonical `benchmark_serving.py` command **once per "
+                f"concurrency point {points}**, sequentially ascending against "
+                f"the same server (Pareto-curve mode). Substitute paths and "
+                f"`benchmark` values; preserve all other flags. Pass "
                 f"`--result-dir {self.baseline_dir}/concurrency_<c>` for the "
-                f"run at point `<c>` so each point's result JSON lands under "
-                f"`baseline/`"
+                f"run at point `<c>`"
             )
             baseline_note = (
-                f"naming the target metric's per-point values and their "
-                f"**{mean_scope}** explicitly — this mean becomes the roadmap's "
+                f"reporting the target metric's per-point values and "
+                f"**{mean_scope}** — this mean becomes the roadmap's "
                 "`baseline.value` and the per-point rows become "
                 "`baseline.curve`. "
             )
         else:
             load_instruction = (
-                f"then run `benchmark_serving.py` at the single "
-                f"configured operating point from the `benchmark` block. Use the "
-                f"**canonical `benchmark_serving.py` command in your system "
-                f"prompt** — fill in the paths and `benchmark` values, keep the "
-                f"other flags as given, and do not improvise. Pass "
-                f"`--result-dir {self.baseline_dir}` so the result JSON lands "
-                f"under `baseline/`"
+                f"run the canonical `benchmark_serving.py` command at the "
+                f"configured operating point. Substitute paths and `benchmark` "
+                f"values; preserve all other flags. Pass "
+                f"`--result-dir {self.baseline_dir}`"
             )
             baseline_note = (
-                "naming the target metric's value explicitly — it becomes "
-                "the roadmap's `baseline.value`. "
+                "reporting the target metric's value — it becomes the roadmap's `baseline.value`. "
             )
         self.benchmarker(
             self._disagg_directive()
             + f"Workspace: {self.workspace}\n\n"
             + self._runtime_checkout_instruction(state)
-            + f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
+            + f"Read `{self.task_path}`: resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
-            f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as read-only reference, as your system prompt "
-            f"directs, so your Configuration/Notes are grounded in known "
-            f"TRT-LLM performance precedents.\n\n"
+            f"Load `perf-optimization-casebook` via `Skill` as read-only "
+            f"reference for Configuration/Notes.\n\n"
             f"Launch `trtllm-serve` with "
-            f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
-            f"tuning config — always passed in this workflow), poll it to "
-            f"readiness, {load_instruction}, and tear the server down "
-            f"(always).\n\n"
-            f"Do **all** of this within this single turn — poll readiness in "
-            f"the foreground and do not yield to a background poll.\n\n"
+            f"`--extra_llm_api_options {self.tuning_config_path}`, poll readiness "
+            f"in the foreground, {load_instruction}, and always tear the server "
+            f"down. Complete this lifecycle within this turn.\n\n"
             f"`Write` your baseline report to `{self.baseline_results_path}` "
-            f"using the required structure in your system prompt "
-            f"(Configuration / Metrics / Notes), {baseline_note}"
-            f"Record the **exact** serve and benchmark commands so every "
-            f"later stage can replay the same load.\n\n"
-            f"Before completing your turn, call `append_benchmarker_progress` "
+            f"using Configuration / Metrics / Notes, {baseline_note}"
+            f"Record exact serve and benchmark commands for later replay.\n\n"
+            f"Before finishing, call `append_benchmarker_progress` "
             f"with a `summary` of the commands you ran, the operating point, "
             f"the headline metrics, and the files you wrote."
         )
@@ -2738,22 +2715,19 @@ class PerfOptimizeWorkflow:
         )
         self.projector(
             f"Workspace: {self.workspace}\n\n"
-            f"You run once per campaign — your projection guides the "
-            f"Analyzer's roadmap ranking and the Reporter's headroom story "
-            f"for every later round.\n\n"
-            f"Read `{self.task_path}` — the `sol` block (optional `gpu` "
-            f"part-name hint) and the `benchmark` block "
-            f"— and `{self.baseline_results_path}` (or call "
+            f"Produce the campaign's initial SOL projection for roadmap ranking "
+            f"and reporting.\n\n"
+            f"Read `{self.task_path}` (`sol`, including its optional `gpu` "
+            f"part-name hint, and `benchmark`) and `{self.baseline_results_path}` "
+            f"(or call "
             f'`read_latest_progress` with `agent: "benchmarker"`) to recover '
             f"the measured baseline operating point, GPU, and headline "
-            f"metrics. The parallel mapping (tp/pp/ep) comes from "
-            f"`{self.tuning_config_path}` — the live tuning config every "
-            f"server in this workflow runs with.\n\n"
+            f"metrics. Read the parallel mapping (tp/pp/ep) from live tuning "
+            f"config `{self.tuning_config_path}`.\n\n"
             f"{projector_instruction(self.sol_methodology)}\n\n"
-            f"Do **all** of this within this single turn; the stage only "
-            f"counts as done once `sol_projection.md` is written.\n\n"
+            f"Complete this turn by writing `sol_projection.md`.\n\n"
             f"{output}\n\n"
-            f"Before completing your turn, call `append_projector_progress` "
+            f"Before finishing, call `append_projector_progress` "
             f"with a `summary` of the sources you used, the mapping, the "
             f"headline SOL ceiling and baseline-vs-SOL gap, and the files "
             f"you wrote."
@@ -2804,73 +2778,55 @@ class PerfOptimizeWorkflow:
         prior_roadmap_context = ""
         if self.prior_roadmap_path.is_file():
             prior_roadmap_context = (
-                f"The source run was itself a perf-optimize campaign: its "
-                f"roadmap is parked at `{self.prior_roadmap_path}` as "
-                f"**read-only prior art**. Its `accepted` / `failed` items "
-                f"and their `measured_gain_pct` describe *that* campaign's "
-                f"checkout, not this one — never copy its statuses, "
-                f"`current_best`, or ids into the roadmap you write. Use it "
-                f"the way you would use evidence: carry forward the pending "
-                f"items its findings still support, and do not re-propose "
-                f"what it recorded as failed unless this checkout changes "
-                f"the premise (say so in `evidence` when you do).\n\n"
+                f"Read source roadmap `{self.prior_roadmap_path}` as "
+                f"**read-only prior art**. Its statuses and `measured_gain_pct` "
+                f"describe the source checkout; never copy its statuses, "
+                f"`current_best`, or ids. Retain supported pending ideas. Re-propose "
+                f"failed work only if this checkout changes its premise, explaining "
+                f"the difference in `evidence`.\n\n"
             )
         projection_context = ""
         if self._sol_enabled():
             projection_context = (
-                f"Read `{self.sol_projection_path}` (imported with the rest) "
+                f"Read imported `{self.sol_projection_path}` "
                 f"as the initial theoretical model. Reconcile its assumptions "
                 f"with imported measurements into `performance_model.yaml`, "
-                f"the current basis for gap estimates and convergence. Any measured↔SOL "
-                f"correlation the source produced is already in "
-                f"`{analysis_dir}` — use it as the initial model and revise assumptions "
-                f"when the saved evidence warrants a correction.\n\n"
+                f"the current basis for gaps and convergence. Use the source's "
+                f"measured↔SOL correlation in `{analysis_dir}` where available; "
+                f"revise assumptions when saved evidence supports a correction.\n\n"
             )
         self.analyzer(
             self._disagg_directive() + f"Workspace: {self.workspace}\n"
             f"Round: 1 (**reused analysis** — no profiling this round)\n"
             f"Analysis directory (already populated): {analysis_dir}\n\n"
-            f"This campaign was launched with "
-            f"`--reuse-analysis {state.reuse_analysis_dir}`: a previous run's "
-            f"analysis has been imported into this workspace, so **round 1 "
-            f"skips profiling entirely**. Do **not** launch `trtllm-serve`, "
-            f"do **not** run nsys / ncu, and do **not** "
-            f"run the benchmark — every trace this round would have captured "
-            f"is already on disk, and re-deriving it is exactly the cost the "
-            f"reuse exists to avoid.\n\n"
-            f"Read `{self.task_path}` (the spec this campaign runs under), "
-            f"`{self.reuse_manifest_path}` (what was imported, and from "
-            f"where), `{findings_path}` **in full** plus the traces and "
-            f"summaries in `{analysis_dir}` plus preserved captures in "
-            f"`{profile_dir}` (read-only, including `{PROFILE_REPORT_NAME}` when "
-            f"present in the imported source), and "
-            f"`{self.baseline_results_path}` (the validated baseline "
-            f"measurement, imported or measured by this campaign — the anchor for the roadmap's `baseline` "
-            f"block).\n\n"
+            f"`--reuse-analysis {state.reuse_analysis_dir}` imported a previous "
+            f"run's analysis: **round 1 skips profiling entirely**. Do **not** "
+            f"launch `trtllm-serve`, do **not** run nsys / ncu, and do **not** "
+            f"run the benchmark. Plan from the saved evidence.\n\n"
+            f"Read `{self.task_path}`, `{self.reuse_manifest_path}` (import "
+            f"provenance), `{findings_path}` in full, traces and summaries in "
+            f"`{analysis_dir}`, and read-only captures in `{profile_dir}` "
+            f"(including `{PROFILE_REPORT_NAME}` when present). Use validated "
+            f"baseline `{self.baseline_results_path}` to seed the roadmap's "
+            f"`baseline`, whether imported or measured by this campaign.\n\n"
             + projection_context
             + prior_roadmap_context
             + self._performance_model_instruction(state)
             + self._kernel_ledger_instruction(state, reused=True)
-            + f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as your system prompt directs, and tag each "
-            f"roadmap item's `casebook_ref` with the matching *bottleneck "
-            f"signal → candidate pattern* row.\n\n"
-            f"Two checks you still owe — both read-only, neither needs a "
-            f"GPU: verify the imported analysis actually describes **this** "
-            f"task (same model/checkpoint, parallel mapping in "
+            + f"Load `perf-optimization-casebook` via `Skill`; tag each item's "
+            f"`casebook_ref` with the matching bottleneck signal → candidate pattern.\n\n"
+            f"Perform two read-only checks: verify the imported analysis fits "
+            f"this task (model/checkpoint, parallel mapping in "
             f"`{self.tuning_config_path}`, and operating point as "
             f"`{self.task_path}`), and run the **dormant-capability sweep** "
-            f"per your system prompt (checkpoint config + weight index, "
-            f"unset serving knobs, gated code paths — inspect files and "
-            f"`grep -rn`/`rg` under `{self._trtllm_hint()}`; launch "
-            f"nothing). Where the imported evidence does not fit this task, "
-            f"say so plainly rather than planning on it — a mismatch is a "
-            f"finding, not a blocker to hide.\n\n"
-            f"`Write` `{self.roadmap_path}` from scratch per the roadmap "
-            f"contract in your system prompt — the `baseline` block from "
+            f"(checkpoint config, weight index, unset serving knobs and gated "
+            f"code paths; inspect files and `grep -rn`/`rg` under "
+            f"`{self._trtllm_hint()}`). Report mismatches and exclude unsupported "
+            f"evidence from planning. Launch nothing.\n\n"
+            f"Write `{self.roadmap_path}` from scratch: `baseline` from "
             f"`{self.baseline_results_path}` (the target metric's value), "
-            f"`current_best` seeded equal to it, and `items` ordered by "
-            f"`expected_gain_pct` descending, each grounded in the imported "
+            f"`current_best` seeded equal, and `items` ordered by "
+            f"`expected_gain_pct` descending, grounded in imported "
             f"evidence with a quantified `expected_gain_rationale`."
             f"{self._baseline_curve_note()}\n\n"
             f"Preserve the imported analysis verbatim at "
@@ -2880,7 +2836,7 @@ class PerfOptimizeWorkflow:
             f"and `## Next actions`. Cite the imported source and capture identity; "
             f"state fit limitations and only capability findings that change the model "
             f"or next actions. Keep detailed derivations in linked artifacts.\n\n"
-            f"Before completing your turn, call `append_analyzer_progress` "
+            f"Before finishing, call `append_analyzer_progress` "
             f"with a `summary` naming the reuse source, which imported "
             f"artifacts you planned from, the fit check's outcome, and the "
             f"roadmap items you authored with their expected gains."
@@ -2922,10 +2878,10 @@ class PerfOptimizeWorkflow:
         coverage = self._kernel_coverage()
         if coverage is not None:
             ncu_scope = (
-                f"For the per-kernel coverage contract, enumerate every kernel "
+                f"For kernel coverage, enumerate every kernel "
                 f"at/above {coverage['min_share_pct']}% of GPU time and extend "
                 f"until {coverage['coverage_target_pct']}% is covered. Group "
-                f"honestly-shared rows and capture over bounded ncu passes, "
+                f"rows only when they share evidence. Use bounded ncu passes, "
                 f"re-filtering on still-missing stems. Preserve the kernel list, "
                 f"pass coverage, and the window's GPU busy share. The analyzer "
                 f"will author the kernel dispositions and ledger offline."
@@ -2942,15 +2898,15 @@ class PerfOptimizeWorkflow:
             f"Active runtime checkout: `{self._trtllm_repo_path()}`\n"
             f"Active tuning config: `{self.tuning_config_path}`\n\n"
             + measurement_context
-            + f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
-            f"recover the serving commands and operating point. Verify this "
+            + f"Read `{self.task_path}` and `{self.baseline_results_path}` for "
+            f"serving commands and operating points. Verify this "
             f"checkout's profiling knobs with `rg` via `Bash` under "
             f"`{self._trtllm_hint()}` and record the actual build, import path, "
             f"effective config, hardware, ranks, and exact commands.\n\n"
             f"Capture only the methods in `profile.methods`: relaunch "
             f"`trtllm-serve` with `--extra_llm_api_options {self.tuning_config_path}`, "
             f"replay the canonical benchmark load" + replay_note + f", and drive "
-            f"nsys from the canonical `nsys profile` command in your system prompt. "
+            f"nsys with the canonical `nsys profile` command. "
             f"{profile_ranks_note(self._profile_ranks())} Export reports with "
             f"`nsys export --type sqlite` and preserve `nsys_stats.txt`. Load "
             f"`internal-perf-nsight-system-analysis` (fully-qualified "
@@ -2961,25 +2917,24 @@ class PerfOptimizeWorkflow:
             f"Keep the **Run A2** GPU-metrics and backtrace captures separate "
             f"from the timing capture: use `--gpu-metrics-devices` / "
             f"`--gpu-metrics-frequency` for utilization, and the backtrace flags "
-            f"for call sites. Preserve each export; record unavailable auxiliary "
-            f"passes with a reason. For ncu load `perf-nsight-compute-analysis` "
+            f"for call sites. Preserve exports and explain unavailable auxiliary "
+            f"passes. For ncu load `perf-nsight-compute-analysis` "
             f"(fully-qualified `trtllm-agent-toolkit:perf-nsight-compute-analysis` "
-            f"if needed) as the capture methodology. {ncu_scope}\n\n"
+            f"if needed). {ncu_scope}\n\n"
             f"Poll readiness in the foreground and tear every server down before "
             f"completing this turn. Write `{profile_dir / PROFILE_REPORT_NAME}` with "
             f"a short capture summary, operating points and runtime identity, coverage "
             f"and limitations, plus links to raw evidence. Keep analytical conclusions "
-            f"for the analyzer. Write `{profile_dir / PROFILE_MANIFEST_NAME}` last "
-            f"using the manifest contract in your system prompt: a unique "
+            f"for the analyzer. Write `{profile_dir / PROFILE_MANIFEST_NAME}` last: "
+            f"a unique "
             f"`capture_id`, runtime provenance (`serve_command`, "
             f"`benchmark_command`, `config`, `build`, and `import_path`), and a "
             f"`methods` entry for every requested method. Each entry must be "
             f"`captured` with the command and relative nonempty artifacts, or "
             f"`unavailable` with an explicit reason. Partial work is not a "
-            f"completed capture. Preserve these artifacts for read-only reuse; "
-            f"the analyzer will write findings, SOL correlation, dispositions, "
-            f"and the roadmap in a separate directory.\n\n"
-            f"Before completing your turn, call `append_profiler_progress` "
+            f"completed capture. Preserve artifacts for read-only reuse; the "
+            f"analyzer writes findings, correlation, dispositions and roadmap separately.\n\n"
+            f"Before finishing, call `append_profiler_progress` "
             f"with a `summary` of capture quality and coverage, methods captured "
             f"or unavailable, the artifact paths, and server cleanup."
         )
@@ -3000,12 +2955,11 @@ class PerfOptimizeWorkflow:
         if round_no == 1:
             curve_note = self._baseline_curve_note()
             round_context = (
-                f"This is **round 1**: run the **dormant-capability sweep** "
-                f"per your system prompt (checkpoint config + weight index, "
+                f"Round 1: run the **dormant-capability sweep** "
+                f"(checkpoint config + weight index, "
                 f"unset serving knobs, gated code paths — record details in "
                 f"`dormant_capabilities.md` and link consequential findings from Next actions), "
-                f"then author `{self.roadmap_path}` from scratch "
-                f"per the roadmap contract in your system prompt — the `baseline` "
+                f"then write `{self.roadmap_path}` from scratch: `baseline` "
                 f"block from `{self.baseline_results_path}` (the target metric's "
                 f"value), `current_best` seeded equal to it, and `items` ordered "
                 f"by `expected_gain_pct` descending.{curve_note}"
@@ -3016,15 +2970,13 @@ class PerfOptimizeWorkflow:
                 "interpret that completed evidence without recapturing it"
             )
             round_context = (
-                f"This is **round {round_no}**: the roadmap at "
-                f"`{self.roadmap_path}` already exists, and {profile_reason}. "
-                f"This round rebuilds the analysis from its capture. "
+                f"Round {round_no}: update existing roadmap "
+                f"`{self.roadmap_path}`; {profile_reason}. "
                 f'Call `read_latest_progress` with `agent: "evaluator"` for '
-                f"the verdicts on the items that **failed**. Establish which "
+                f"failed-item verdicts. Establish which "
                 f"mechanism actually ran and what each experiment proved; a "
                 f"REJECT alone does not disprove the optimization premise. "
-                f"Analyze the saved evidence "
-                f"and update the roadmap in place: re-order / revise "
+                f"Rebuild analysis from the capture and update the roadmap in place: revise "
                 f"still-pending items, add newly exposed ones, mark stale "
                 f"pending items `obsolete`. Never rewrite accepted/failed "
                 f"history, `baseline`, `current_best`, or existing ids."
@@ -3037,11 +2989,11 @@ class PerfOptimizeWorkflow:
                 f'`read_latest_progress` with `agent: "projector"`) as '
                 f"the initial theoretical model. Reconcile its assumptions with "
                 f"the measured evidence into `performance_model.yaml`; use that "
-                f"single current model to rank roadmap items and bound expected "
+                f"current model to rank roadmap items and bound expected "
                 f"end-to-end gains. Preserve the original projection as provenance, "
-                f"not a competing headline ceiling. Run the offline **measured↔SOL "
-                f"correlation** per your system prompt: load the "
-                f"`internal-perf-sol-analysis` skill (via the `Skill` tool; "
+                f"not a competing ceiling. Run offline **measured↔SOL "
+                f"correlation**: load "
+                f"`internal-perf-sol-analysis` via `Skill` ("
                 f"fully-qualified "
                 f"`trtllm-agent-toolkit:internal-perf-sol-analysis` if the "
                 f"bare name is not found), build "
@@ -3054,12 +3006,10 @@ class PerfOptimizeWorkflow:
                 f"per-op evidence into the linked model derivations supporting "
                 f"`## Theoretical performance model` (or `Correlation "
                 f"unavailable: <reason>` when a precondition fails). If you "
-                f"leave the roadmap with no "
-                f"actionable pending item while projected headroom remains, "
-                f"explain that stop in `analysis.md`'s **Gap analysis** — every part "
+                f"leave no actionable pending item while projected headroom remains, "
+                f"explain the stop in `analysis.md`'s **Gap analysis**: every part "
                 f"of the gap gets a supported item, an evidence-backed constraint, "
-                f"or is marked unexplained. Keep it brief and link to the "
-                f"comparison's explanations and next tests.\n\n"
+                f"or is marked unexplained. Link explanations and next tests.\n\n"
             )
         import_context = ""
         if state.reanalyze_pending:
@@ -3090,8 +3040,8 @@ class PerfOptimizeWorkflow:
             f"`{analysis_dir}`; never modify `{profile_dir}`.\n\n"
             f"{round_context}\n\n"
             + projection_context
-            + f"Early on, **load the `perf-optimization-casebook` skill** as "
-            f"read-only reference via the `Skill` tool; tag each roadmap item's "
+            + f"Load `perf-optimization-casebook` via `Skill` as read-only reference; "
+            f"tag each roadmap item's "
             f"`casebook_ref` with the matching bottleneck signal → candidate "
             f"pattern.\n\n"
             f"Decompose the saved timeline with "
@@ -3107,12 +3057,13 @@ class PerfOptimizeWorkflow:
             f"time, busy/idle rungs, and the compute-absent split "
             f"(launch-starved / blocking / dependency-stalled) from that "
             f"pipeline, not from the `nsys stats` table alone.\n\n"
-            f"Read `{profile_dir / PROFILE_REPORT_NAME}` for capture coverage and "
-            f"limitations (legacy imports may lack it). Interpret the saved ncu reports (`server_ncu.ncu-rep` or the "
+            f"Read `{profile_dir / PROFILE_REPORT_NAME}` for coverage and "
+            f"limitations (legacy imports may lack it). Interpret saved ncu reports "
+            f"(`server_ncu.ncu-rep` or the "
             f"per-pass reports) and exports using "
             f"`perf-nsight-compute-analysis` (fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if needed) "
-            f"as the offline interpretation methodology: classify SOL%, bound "
+            f"to classify SOL%, bound "
             f"class, occupancy, and stalls. Respect unavailable methods and "
             f"capture caveats. If evidence is insufficient, name the needed "
             f"additional capture in findings; do not obtain it this turn.\n\n"
@@ -3125,7 +3076,7 @@ class PerfOptimizeWorkflow:
             f"`{self.roadmap_path}` with items ordered by expected benefit "
             f"and quantified `expected_gain_rationale` grounded across the "
             f"available analyses.\n\n"
-            f"Before completing your turn, call `append_analyzer_progress` "
+            f"Before finishing, call `append_analyzer_progress` "
             f"with a `summary` of the source capture, analyses regenerated, "
             f"evidence limitations, and roadmap items added / re-ordered / "
             f"marked obsolete with their expected gains."
@@ -3161,13 +3112,13 @@ class PerfOptimizeWorkflow:
         if self._sol_enabled():
             projection_context = (
                 f"`{self.sol_projection_path}` and any measured↔SOL "
-                f"correlation already in `{profiled_dir}` provide the standing "
-                f"comparison; new facts may correct the model. If you "
-                f"leave the roadmap with no actionable pending item while "
+                f"correlation in `{profiled_dir}` provide the standing comparison; "
+                f"revise the model when new facts warrant it. If you "
+                f"leave no actionable pending item while "
                 f"projected headroom remains, explain the stop in this round's "
                 f"**Gap analysis** — every part of the gap gets a supported item, "
-                f"an evidence-backed constraint, or is marked unexplained, "
-                f"with links to existing explanations and next tests.\n\n"
+                f"an evidence-backed constraint, or is marked unexplained. "
+                f"Link explanations and next tests.\n\n"
             )
         self.analyzer(
             self._disagg_directive() + f"Workspace: {self.workspace}\n"
@@ -3175,61 +3126,49 @@ class PerfOptimizeWorkflow:
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
             f"{attempted_note}; each ran in an isolated worktree that the "
-            f"orchestrator reset and removed. The campaign checkout and "
-            f"accepted tuning config remain unchanged, so the runtime is "
-            f"still the state the analysis in `{profiled_dir}` describes. "
-            f"Do **not** launch "
-            f"`trtllm-serve`, "
-            f"do **not** run nsys / ncu, and do **not** "
-            f"run the benchmark: a fresh profile of an unchanged build "
-            f"would reproduce those traces at full GPU cost. Plan from them "
-            f"instead.\n\n"
-            f"What *has* changed is the evidence. Call "
+            f"orchestrator reset and removed. The campaign checkout and accepted "
+            f"config are unchanged; `{profiled_dir}` still describes the runtime. "
+            f"Do **not** launch `trtllm-serve`, do **not** run nsys / ncu, and "
+            f"do **not** run the benchmark. Replan from standing evidence.\n\n"
+            f"Call "
             f'`read_latest_progress` with `agent: "evaluator"` (raise '
             f"`steps` until it reaches back through round "
             f"{state.round_index}) for each attempt's `decision`, "
             f"`reason_category`, and measured gain, and read the "
             f"`evaluation.md` files under `{prev_round_dir}`. Those verdicts "
-            f"describe attempts against **this** build. Determine which mechanism "
+            f"describe attempts against this build. Determine which mechanism "
             f"actually ran and what each outcome established. A performance "
             f"shortfall alone does not bound the bottleneck's recoverable time; "
             f"a functionality failure may expose an implementation bug. An "
             f"attempt the orchestrator auto-rejected for "
             f"violating the approach restriction never reached the "
             f"evaluator and has no `evaluation.md` — its "
-            f"`optimization_summary.md` is the record, and what it proves is "
-            f"about the item's *realizability* under this campaign's "
-            f"`optimize.approaches`, not about the bottleneck.\n\n"
+            f"`optimization_summary.md` records the item's realizability under "
+            f"`optimize.approaches`, without bounding the bottleneck.\n\n"
             + projection_context
             + self._performance_model_instruction(state)
             + self._kernel_ledger_instruction(state)
-            + f"Then update `{self.roadmap_path}` **in place** against that "
-            f"evidence: mark `obsolete` every pending item the round's "
+            + f"Update `{self.roadmap_path}` **in place**: mark `obsolete` "
+            f"pending items the "
             f"verdicts disprove or whose premise they undercut, revise the "
             f"`expected_gain_pct` / `evidence` of pending items the "
             f"measurements bound, re-order what survives, and add items the "
-            f"failures themselves imply (a REJECT often names the real "
-            f"constraint) — **load the `perf-optimization-casebook` skill** "
-            f"(via the `Skill` tool) as your system prompt directs before "
-            f"authoring any, and tag each new item's `casebook_ref` with the "
-            f"matching *bottleneck signal → candidate pattern* row. Never "
+            f"failures imply. Before authoring items, load `perf-optimization-casebook` "
+            f"via `Skill`; tag each new item's `casebook_ref` with the matching "
+            f"bottleneck signal → candidate pattern. Never "
             f"rewrite `accepted` / `failed` history, "
             f"`baseline`, `current_best`, or existing ids; new items get "
             f"fresh ids continuing the sequence.\n\n"
-            f"**If the evidence leaves nothing actionable, leave the roadmap "
-            f"with no actionable pending item and say so.** The orchestrator "
-            f"reads that as the campaign's end and closes the loop — the "
-            f"administrative stop; only the current model can establish convergence. "
-            f"Do not invent items to keep the "
-            f"loop alive; an unfounded item costs a full benchmark to "
-            f"disprove.\n\n"
-            f"`Write` `{analysis_dir / 'analysis.md'}` as this "
-            f"round's concise analysis: `## Result`, `## Theoretical performance "
+            f"If nothing is actionable, leave no actionable pending item and say so. "
+            f"The orchestrator will stop the campaign; only the current model can "
+            f"establish convergence. Do not invent items to keep the loop alive.\n\n"
+            f"Write `{analysis_dir / 'analysis.md'}` with `## Result`, "
+            f"`## Theoretical performance "
             f"model`, `## Gap analysis`, and `## Next actions`. Link the standing "
             f"capture and analysis (`{profiled_dir}`). Explain only experiment results "
             f"that change the model, gap attribution, or next actions; retain "
             f"standing measurement provenance and identify untested gaps.\n\n"
-            f"Before completing your turn, call `append_analyzer_progress` "
+            f"Before finishing, call `append_analyzer_progress` "
             f"with a `summary` naming the round that accepted nothing, the "
             f"verdicts you planned from, and the items you marked obsolete / "
             f"revised / added with their expected gains."
@@ -3252,39 +3191,36 @@ class PerfOptimizeWorkflow:
         if attempt_no > 1 and state.approach_violation:
             allowed = ", ".join(f"`{a}`" for a in self._allowed_approaches())
             retry_context = (
-                f"\n\nThis is a **retry** (attempt {attempt_no} of "
+                f"\n\n**Retry** (attempt {attempt_no} of "
                 f"{state.max_attempts_per_item}): the orchestrator "
                 f"auto-REJECTED the previous attempt **without evaluation** "
-                f"because {state.approach_violation}, and has already "
+                f"because {state.approach_violation}, and "
                 f"reverted the checkout and the tuning config to the last "
                 f"accepted state. There is no evaluator feedback for it. "
-                f"Re-implement the item strictly through the allowed "
-                f"approach(es) — {allowed} — per the approach restriction in "
-                f"your system prompt; if the item cannot be realized that "
-                f"way, make no change and record the blocker in your summary."
+                f"Re-implement using only {allowed}; if impossible, make no "
+                f"change and record the blocker in your summary."
             )
         elif attempt_no > 1:
             retry_context = (
-                f"\n\nThis is a **retry** (attempt {attempt_no} of "
+                f"\n\n**Retry** (attempt {attempt_no} of "
                 f"{state.max_attempts_per_item}): the Evaluator PUSHED BACK "
-                f"the previous attempt and the orchestrator has already "
+                f"the previous attempt and the orchestrator "
                 f"reverted the checkout and the tuning config to the last "
                 f"accepted state. First call `read_latest_progress` with "
                 f'`agent: "evaluator"` and read the previous attempt\'s '
-                f"`evaluation.md` under `{self._item_dir(state)}` — then fix "
-                f"the PUSH_BACK reason, not a different problem."
+                f"`evaluation.md` under `{self._item_dir(state)}`; fix "
+                f"the PUSH_BACK reason."
             )
         projection_context = ""
         if self._sol_enabled():
             projection_context = (
                 f"Also read `{self.sol_projection_path}` (or call "
                 f'`read_latest_progress` with `agent: "projector"`) as '
-                f"**context, not spec**: where the item leaves you a choice "
-                f"of realization variants or knob values, aim at the binding "
-                f"ceiling per the SOL guidance in your system prompt, and "
-                f"record the `SOL alignment:` line in your summary — the "
-                f"item's `how_to_apply` outranks the projection, and the "
-                f"projection never expands the item.\n\n"
+                f"initial provenance and **context, not spec**. Use the current "
+                f"`performance_model.yaml` and measured evidence to choose permitted "
+                f"implementation variants or knob values. Record `Model alignment:` "
+                f"in your summary. The item's `how_to_apply` governs scope; "
+                f"the projection never expands the item.\n\n"
             )
         verdict_context = ""
         if state.round_index > 0 or (state.item_execution == "serial" and state.item_index > 0):
@@ -3292,13 +3228,10 @@ class PerfOptimizeWorkflow:
             # item's REJECT can invalidate a premise this item's text
             # still carries — the re-profile only corrects it next round.
             verdict_context = (
-                f"Earlier items' verdicts may have corrected facts this "
-                f"item's text still relies on (the roadmap predates them): "
-                f"skim the completed items' `evaluation.md` files under "
-                f"`{self.rounds_dir}` — their Verdict / `Gap implication:` "
-                f"lines outrank this item's `evidence` where they conflict, "
-                f"and a premise they disprove is a blocker to record in "
-                f"your summary, not a claim to re-assert.\n\n"
+                f"Read completed items' `evaluation.md` files under `{self.rounds_dir}`. "
+                f"Their Verdict / `Gap implication:` lines outrank this item's "
+                f"`evidence` where they conflict; record a disproven premise as a "
+                f"blocker in your summary.\n\n"
             )
         (agent or self.optimizer)(
             self._disagg_directive()
@@ -3317,29 +3250,25 @@ class PerfOptimizeWorkflow:
             f"Inside the Slurm job script, before any Python command or "
             f"`trtllm-serve` launch:\n\n"
             f'`export PYTHONPATH="{repo}${{PYTHONPATH:+:$PYTHONPATH}}"`\n\n'
-            f"Read `{self.task_path}` and the roadmap item, then **load the "
-            f"`perf-optimization-casebook` skill** (via the `Skill` tool) as "
-            f"your system prompt directs and implement **exactly this one "
+            f"Read `{self.task_path}` and the roadmap item; load "
+            f"`perf-optimization-casebook` via `Skill`. Implement **exactly this one "
             f"item** following its `how_to_apply` and the matched casebook "
             f"case: `approach: config` → edit `{tuning_config}`; "
-            f"`approach: code` → edit the source under `{repo}` under "
-            f"the git discipline in your system prompt (active-runtime "
+            f"`approach: code` → edit source under `{repo}` (active-runtime "
             f"check first; locate code paths with shell `grep -rn`/`rg` via "
             f"`Bash`; never commit).\n\n"
             + projection_context
             + verdict_context
             + f"Then smoke-check: launch `trtllm-serve` with "
             f"`--extra_llm_api_options {tuning_config}`, poll to "
-            f"readiness in the foreground within this turn, send one "
-            f"completion request, and tear the server down (always). Do "
-            f"**not** run the full benchmark — measuring is the Evaluator's "
-            f"job.\n\n"
+            f"readiness in the foreground, send one completion request, and "
+            f"always tear down within this turn. Do **not** run the full "
+            f"benchmark; the Evaluator measures performance.\n\n"
             f"`Write` your summary to "
-            f"`{attempt_dir / 'optimization_summary.md'}` using the required "
-            f"structure in your system prompt (What changed / Files touched / "
+            f"`{attempt_dir / 'optimization_summary.md'}` with What changed / Files touched / "
             f"Mapping to the roadmap item / Expected gain / Smoke check / "
-            f"Risks).\n\n"
-            f"Before completing your turn, call `append_optimizer_progress` "
+            f"Risks.\n\n"
+            f"Before finishing, call `append_optimizer_progress` "
             f"with a `summary` of the item you implemented, what you changed, "
             f"the smoke-check result, and any risks or blockers."
         )
@@ -3371,27 +3300,24 @@ class PerfOptimizeWorkflow:
                 # the standing round analysis by several accepted items.
                 taxonomy_dir = previous_capture
             decompose = (
-                f"its `run_all.py` **comparative** — `--variant before` on the "
+                f"`run_all.py` **comparative** — `--variant before` on the "
                 f"`.sqlite` under `{state.last_nsys_dir}` and `--variant after` "
                 f"on this capture's, reusing `{taxonomy_dir / 'taxonomy.json'}` "
                 f"for both variants (fall back to "
                 f"`{previous_capture / 'taxonomy.json'}` when the separate "
-                f"analysis has no taxonomy) so both sides classify identically — into "
+                f"analysis has no taxonomy) for consistent classification — into "
                 f"`{profile_dir}/nsys_analysis`, whose `difference/rank-0/` "
                 f"holds the signed per-iteration and module-slice deltas "
-                f"(single-variant, compared by hand, only if that capture kept "
-                f"no `.sqlite`)"
+                f"(use single-variant and compare by hand only if the prior "
+                f"capture has no `.sqlite`)"
             )
             compare = (
                 f"report those deltas against the previous capture of the "
                 f"accepted state at `{state.last_nsys_dir}`"
             )
         else:
-            decompose = f"its `run_all.py` single-variant into `{profile_dir}/nsys_analysis`"
-            compare = (
-                "there is no previous capture to compare against — report "
-                "this capture's kernel picture on its own"
-            )
+            decompose = f"`run_all.py` single-variant into `{profile_dir}/nsys_analysis`"
+            compare = "report this capture's kernels; no previous capture is available"
         curve_note = ""
         if self._curve_mode() and self._curve_points():
             curve_note = (
@@ -3400,20 +3326,16 @@ class PerfOptimizeWorkflow:
             )
         return (
             f"**Accept-evidence duty — only if your verdict is APPROVE.** "
-            f"After your clean measurement and gate arithmetic, capture the "
-            f"candidate state per the accept-evidence procedure in your "
-            f"system prompt: tear down the measurement server, relaunch "
+            f"After clean measurement and gate arithmetic, tear down the "
+            f"measurement server and relaunch the candidate "
             f"under the canonical `nsys profile` wrap, replay the canonical "
             f"load once{curve_note}, tear down, and save the `.nsys-rep`, "
             f"the `nsys stats` output as `nsys_stats.txt`, and the replay "
-            f"log into `{profile_dir}`. Then **decompose that capture with "
-            f"the `internal-perf-nsight-system-analysis` skill** (via the `Skill` "
-            f"tool; fully-qualified "
+            f"log into `{profile_dir}`. Load `internal-perf-nsight-system-analysis` "
+            f"via `Skill` (fully-qualified "
             f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare "
-            f"name is not found) as your system prompt directs — `nsys "
-            f"export --type sqlite`, then {decompose} — so the mechanism check "
-            f"below rests on a measured per-iteration budget rather than an "
-            f"eyeballed one. In `evaluation.md`'s *Kernel "
+            f"name is not found). Run `nsys export --type sqlite`, then "
+            f"{decompose}. In `evaluation.md`'s *Kernel "
             f"evidence* section, {compare}, and state whether the item's "
             f"claimed mechanism is visible in the trace. On REJECT or "
             f"PUSH_BACK, skip the capture entirely.\n\n"
@@ -3469,14 +3391,13 @@ class PerfOptimizeWorkflow:
                     "`curve` (the per-point rows)"
                 )
             measure_instruction = (
-                f"then measure with the **canonical `benchmark_serving.py` "
-                f"command in your system prompt** once per concurrency point "
+                f"measure with the canonical `benchmark_serving.py` command "
+                f"once per concurrency point "
                 f"{points}, sequentially ascending over the same server, "
                 f"passing `--result-dir {attempt_dir}/concurrency_<c>` per "
                 f"point. Curve mode: apply the **Pareto gate** — per-point "
                 f"gains vs `current_best.curve` (same concurrency), "
-                f"{mean_rule} — per the acceptance gate in your "
-                f"system prompt"
+                f"{mean_rule}"
             )
             full_diff_note = (
                 f"the reference result JSONs for the full-metric diff are "
@@ -3492,9 +3413,8 @@ class PerfOptimizeWorkflow:
             )
         else:
             measure_instruction = (
-                f"then measure with the "
-                f"**canonical `benchmark_serving.py` command in your system "
-                f"prompt** at the configured operating point, passing "
+                f"measure with the canonical `benchmark_serving.py` command "
+                f"at the configured operating point, passing "
                 f"`--result-dir {attempt_dir}`. Compute `measured_gain_pct` "
                 f"against `current_best.value` per the measurement protocol, "
                 f"and apply the acceptance gate"
@@ -3511,9 +3431,7 @@ class PerfOptimizeWorkflow:
             )
         if attempt_no >= state.max_attempts_per_item:
             attempt_note = (
-                " This is the item's **final attempt**: PUSH_BACK is not "
-                "available (the orchestrator treats it as REJECT) — decide "
-                "APPROVE or REJECT."
+                " **Final attempt**: PUSH_BACK is treated as REJECT; decide APPROVE or REJECT."
             )
         else:
             attempt_note = ""
@@ -3523,8 +3441,7 @@ class PerfOptimizeWorkflow:
                 "**Correct the previous evaluator submission.** The orchestrator "
                 f"rejected its structured approval: {validation_feedback}\n"
                 "The candidate source, tuning config, and measurement artifacts "
-                "have been preserved. For this corrective turn, reuse valid "
-                "existing evidence and fix the report/arithmetic; repeat only "
+                "are preserved. Reuse valid evidence and fix the report/arithmetic; repeat only "
                 "checks or measurements whose evidence is missing or invalid. "
                 "Keep the candidate unchanged and append a corrected verdict.\n\n"
             )
@@ -3570,17 +3487,17 @@ class PerfOptimizeWorkflow:
             f"`{tuning_accepted}` for config edits), verify "
             f"functionality (launch `trtllm-serve` with "
             f"`--extra_llm_api_options {tuning_config}`, poll to "
-            f"readiness in the foreground within this turn, send completion "
+            f"readiness in the foreground, send completion "
             f"requests; targeted tests for code items — locate them with "
             f"shell `grep -rn`/`rg` via `Bash`), {measure_instruction}. "
-            f"Tear every server down (always).\n\n"
+            f"Always tear every server down within this turn.\n\n"
             f"`Write` your report to `{attempt_dir / 'evaluation.md'}` using "
-            f"the required structure (Change review / Functionality / "
-            f"Performance / Kernel evidence / Verdict), showing the gate "
+            f"Change review / Functionality / Performance / Kernel evidence / "
+            f"Verdict, showing gate "
             f"arithmetic and the full-metric diff — {full_diff_note}."
             f"{attempt_note}\n\n"
             f"{self._evaluator_capture_context(state)}"
-            f"Before completing your turn, call `append_evaluator_progress` "
+            f"Before finishing, call `append_evaluator_progress` "
             f"{progress_fields}."
         )
 
@@ -3589,16 +3506,15 @@ class PerfOptimizeWorkflow:
         accuracy = self._accuracy_block()
         if accuracy:
             accuracy_context = (
-                f"`task.yaml` **has** an `accuracy` block: run its `command` "
+                f"Run `task.yaml`'s `accuracy.command` "
                 f"verbatim against the live server, record the score under "
                 f"`{self.final_verification_dir}`, and compare it to "
-                f"`baseline_score` / `max_drop_pct` as your system prompt "
-                f"directs."
+                f"`baseline_score` / `max_drop_pct`."
             )
         else:
             accuracy_context = (
-                "`task.yaml` has **no** `accuracy` block: skip the accuracy "
-                'step entirely and note "accuracy: not configured" in your '
+                "No `accuracy` block: skip accuracy testing and note "
+                '"accuracy: not configured" in your '
                 "report."
             )
         if self._curve_mode():
@@ -3611,8 +3527,8 @@ class PerfOptimizeWorkflow:
             else:
                 mean_scope = "the **mean across concurrency points**"
             benchmark_instruction = (
-                f"run the **canonical `benchmark_serving.py` command in "
-                f"your system prompt** once per concurrency point {points}, "
+                f"run the canonical `benchmark_serving.py` command once per "
+                f"concurrency point {points}, "
                 f"sequentially ascending over the same server, with "
                 f"`--result-dir {self.final_verification_dir}/concurrency_<c>` "
                 f"per point"
@@ -3630,8 +3546,8 @@ class PerfOptimizeWorkflow:
             )
         else:
             benchmark_instruction = (
-                f"run the **canonical `benchmark_serving.py` command in "
-                f"your system prompt** at the configured operating point with "
+                f"run the canonical `benchmark_serving.py` command at the "
+                f"configured operating point with "
                 f"`--result-dir {self.final_verification_dir}`"
             )
             cumulative_instruction = (
@@ -3646,26 +3562,21 @@ class PerfOptimizeWorkflow:
             self._disagg_directive()
             + f"Workspace: {self.workspace}\n"
             + self._runtime_checkout_instruction(state)
-            + f"Campaign: the optimization loop is over ({state.round_index} "
-            f"round(s) ran); the system under test is the final accepted "
-            f"state.\n"
+            + f"Verify the final accepted state after {state.round_index} round(s).\n"
             f"Verification directory (write your artifacts here): "
             f"{self.final_verification_dir}\n\n"
-            f"You are the campaign's final verification. Ground yourself "
-            f"ONLY in `{self.task_path}`, `{self.roadmap_path}`, and your own "
+            f"Use ONLY `{self.task_path}`, `{self.roadmap_path}`, and your own "
             f"runs this turn — do not read other agents' reports or progress "
             f"entries.\n\n"
             f"Launch `trtllm-serve` with "
-            f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
-            f"tuning config), poll to readiness in the foreground within this "
+            f"`--extra_llm_api_options {self.tuning_config_path}`, poll readiness in "
+            f"the foreground within this "
             f"turn, {benchmark_instruction}, and send a few completion requests "
-            f"as a sanity check. {accuracy_context} Tear every server down "
-            f"(always).\n\n"
+            f"as a sanity check. {accuracy_context} Always tear every server down.\n\n"
             f"{cumulative_instruction}.\n\n"
             f"`Write` your report to `{self.verification_report_path}` using "
-            f"the required structure (Independent benchmark / Sanity / "
-            f"Accuracy / Conclusion).\n\n"
-            f"Before completing your turn, call `append_qa_progress` "
+            f"Independent benchmark / Sanity / Accuracy / Conclusion.\n\n"
+            f"Before finishing, call `append_qa_progress` "
             f"{progress_fields}."
         )
 
@@ -3703,8 +3614,8 @@ class PerfOptimizeWorkflow:
             f"with evidence. Preserve the old capture identity beside inherited "
             f"component measurements and never relabel them as final-build captures. "
             f"Leave unmodeled final components and unsupported bounds unknown with "
-            f"their next discriminating test. Missing final profiling means an "
-            f"unresolved comparison, not convergence. Reconcile all gap arithmetic "
+            f"their next discriminating test. Missing final profiling leaves the "
+            f"comparison unresolved. Reconcile all gap arithmetic "
             f"against this one final model.\n\n"
             f"Write `{self.final_analysis_dir / 'analysis.md'}` with only `## Result`, "
             f"`## Theoretical performance model`, `## Gap analysis`, and "
@@ -3717,8 +3628,8 @@ class PerfOptimizeWorkflow:
         self._stamp_progress(state)
         model_path = self._report_performance_model()
         model_read = (
-            f" `{model_path}` (the authoritative current model and gap accounting; "
-            f"check that its build and workload still match the final measurement), "
+            f" `{model_path}` (current model and gap accounting; verify its build "
+            f"and workload match the final measurement), "
             f"`{model_path.with_name('analysis.md')}` (its current analysis),"
             if model_path is not None
             else " `performance_model.yaml` (unavailable; report an unresolved "
@@ -3730,9 +3641,8 @@ class PerfOptimizeWorkflow:
             if focus:
                 pareto_headline = (
                     f" (curve mode with `optimize.focus_concurrencies` "
-                    f"{focus}: the ledger means and the headline score the "
-                    f"focus subset — say so wherever a mean is presented — "
-                    f"with every point still shown in the model table)"
+                    f"{focus}: label scored means and the headline as scoring this "
+                    f"subset; show every point in the model table)"
                 )
             else:
                 pareto_headline = (
@@ -3767,8 +3677,7 @@ class PerfOptimizeWorkflow:
             )
         if self._sol_enabled():
             projection_read = (
-                f" `{self.sol_projection_path}` (the Projector's SOL "
-                f"projection, retained as the original model assumptions; "
+                f" `{self.sol_projection_path}` (original SOL assumptions; "
                 f"use the latest validated `performance_model.yaml` for all "
                 f"current ceilings and remaining-gap arithmetic),"
             )
@@ -3784,11 +3693,7 @@ class PerfOptimizeWorkflow:
                 "was written — the section must say the ledger is "
                 "unavailable)"
             )
-            coverage_read = (
-                f" {ledger_name} (the final round's per-kernel disposition "
-                f"ledger — supporting evidence for the central model; link "
-                f"its detailed dispositions without reproducing the ledger),"
-            )
+            coverage_read = f" {ledger_name} (supporting kernel dispositions; link details),"
             coverage_read += (
                 " In **Theoretical performance model**, link to the "
                 "**Theoretical performance model** in the latest "
@@ -3796,7 +3701,7 @@ class PerfOptimizeWorkflow:
                 "Use a relative section link to its actual current-campaign "
                 "round anchor in Markdown and HTML, not an imported section "
                 "with the same heading. The analyzer "
-                "owns the full derivations and layer table; do not reproduce or "
+                "owns derivations and layer tables; do not reproduce or "
                 "re-derive them. Summarize the supported iteration bound, measured "
                 "performance, remaining headroom and unresolved gaps. If the "
                 "section is missing, say it is unavailable and link to the ledger. "
@@ -3865,7 +3770,7 @@ class PerfOptimizeWorkflow:
             f"gap{pareto_chart}. The cumulative improvement {headline_source}"
             f"{pareto_headline}. Distinguish hardware limits, scope limits, failed "
             f"attempts, measurement limits and unresolved gaps.\n\n"
-            f"Before completing your turn, call `append_reporter_progress` "
+            f"Before finishing, call `append_reporter_progress` "
             f"with a `summary` of the cumulative improvement headline, the "
             f"accepted/failed item counts, and confirmation that both files "
             f"were written."

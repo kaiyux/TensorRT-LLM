@@ -173,7 +173,7 @@ def test_analyzer_carries_the_nsys_timeline_decomposition():
     assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
     assert "nsys export --type sqlite" in prompt
     # Proactive by construction — it re-reads a trace already captured.
-    assert "costs no extra server launch" in prompt
+    assert "Never run a workload to fill missing evidence; analysis needs no GPU" in prompt
     # The roadmap's expected-gain grounding reads the split, not just shares.
     assert "compute-absent split" in prompt
     assert "faster kernels cannot recover launch-starved host time" in prompt
@@ -300,9 +300,9 @@ def test_mutating_roles_carry_git_discipline():
     assert "Never run `git commit`" in block
     assert "committing accepted items and reverting rejected attempts" in block
     assert "only the current roadmap item's changes" in block
-    assert "active runtime checkout from the turn instructions" in block
-    assert "prepend that exact checkout to `PYTHONPATH`" in block
-    assert "may differ from the active runtime checkout" in block
+    assert "prepend the turn's active runtime checkout to `PYTHONPATH`" in block
+    assert "in the launch environment and shell" in block
+    assert "an item, integration worktree or staged remote copy may use another path" in block
     assert "an editable install" not in block
 
 
@@ -336,13 +336,14 @@ def test_kernel_work_roles_prefer_existing_kernels():
     assert "flashinfer" in block
     assert "Other integrated providers" in block
     # Planning and implementing both record the search that came up empty.
-    assert "what you searched" in block
+    assert "record the search" in block
     # The preference is conditional: an empty search makes a new kernel the
     # encouraged realization, never a dropped item — the analyzer still
     # plans it, the optimizer falls back to writing instead of recording a
     # no-change blocker, and the evaluator judges it on the normal axes.
     assert "If none fits, plan a scoped **new kernel**" in block
-    assert "write a scoped kernel instead of recording a no-change blocker" in block
+    assert "If no suitable implementation exists, write a scoped kernel" in block
+    assert "Missing reuse alone does not dismiss an opportunity" in block
     assert "recorded search confirms none exists" in block
     assert "correctness, targeted-test and measured-gain checks" in block
     # The evaluator enforces reuse on the code-quality axis, gain or not.
@@ -371,7 +372,11 @@ def test_roadmap_touching_roles_carry_the_contract():
 def test_roadmap_contract_pins_ownership():
     for role in ("analyzer", "optimizer"):
         prompt = _norm(_ALL_PROMPTS[role])
-        assert re.search(r"The \*\*orchestrator\*\* owns (?:every )?lifecycle field", prompt), role
+        assert "The **orchestrator** owns" in prompt, role
+        ownership = prompt.split("The **orchestrator** owns", 1)[1].split(";", 1)[0]
+        ownership = ownership.split(".", 1)[0]
+        for field in ("status", "attempts", "measured_gain_pct", "current_best"):
+            assert field in ownership, (role, field)
 
 
 def test_roadmap_readers_do_not_receive_analyzer_authoring_duties():
@@ -379,7 +384,8 @@ def test_roadmap_readers_do_not_receive_analyzer_authoring_duties():
     for role in ("optimizer", "evaluator", "integrator", "qa", "reporter"):
         prompt = _ALL_PROMPTS[role]
         assert "Initialization and ids" not in prompt, role
-        assert "Do not initialize, reorder" in prompt, role
+        assert "Treat the roadmap as read-only" in prompt, role
+        assert "only the Analyzer authors or replans item content" in _norm(prompt), role
         assert "candidate-ready" in prompt, role
 
 
@@ -390,9 +396,10 @@ def test_evaluator_carries_the_expectation_gate():
     gate = _norm(EXPECTATION_GATE)
     assert "accept_fraction × expected_gain_pct" in gate
     assert "noise_floor_pct" in gate
-    # Gains accumulate: the reference is the last accepted measurement.
-    assert "last ACCEPTED measurement" in gate
-    assert "never the original baseline" in gate
+    # Serial gains accumulate; parallel candidates retain their frozen batch base.
+    assert "frozen reference named in your turn instructions" in gate
+    assert "`current_best` at the item's base" in gate
+    assert "not the original baseline unless still current best" in gate
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
     assert "accept_fraction" in prompt
     for category in ("code_quality", "functionality", "perf_shortfall"):
@@ -405,8 +412,8 @@ def test_expectation_gate_is_three_way():
     # terminal (saving the retries' benchmarks); final attempt coerces.
     assert "PUSH_BACK" in gate
     assert "REJECT" in gate
-    assert "premise is broken" in gate
-    assert "blocker is unresolvable" in gate
+    assert "broken premise" in gate
+    assert "unresolvable blocker" in gate
     assert "PUSH_BACK is treated as REJECT" in gate
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
     assert "`decision`: APPROVE | REJECT | PUSH_BACK" in prompt
@@ -441,19 +448,23 @@ def test_expectation_gate_carries_the_pareto_rule():
     assert "else noise_floor_pct" in gate
     assert "current_best.curve" in gate
     # Missing evidence blocks acceptance instead of bypassing regression checks.
-    assert "carries no `curve`" in gate
-    assert "the performance gate cannot pass" in gate
-    assert "never skip the per-point no-regress check" in gate
+    assert "The measurement protocol defines scored points and curve validity" in gate
+    protocol = _norm(MEASUREMENT_PROTOCOL)
+    assert "Both the measured and reference curves must be complete" in protocol
+    assert "Never replace a missing curve with a scalar comparison" in protocol
+    assert "An invalid or missing measurement never passes" in protocol
 
 
 def test_expectation_gate_carries_focus_scoring():
     gate = _norm(EXPECTATION_GATE)
     # The scored subset narrows the mean, never the no-regress veto.
-    assert "optimize.focus_concurrencies" in gate
-    assert "scored points" in gate
-    assert "Always measure and check regressions at **every** point" in gate
+    protocol = _norm(MEASUREMENT_PROTOCOL)
+    assert "optimize.focus_concurrencies" in protocol
+    assert "mean of gain_i over the SCORED points" in gate
+    assert "no point (scored or not) regresses beyond the bar" in gate
     # The ledger fields follow the scored mean.
-    assert "the **scored** mean" in gate
+    assert "Report `measured_gain_pct`, `measured_value` and any `curve` exactly as scored" in gate
+    assert "`measured_value` is the mean absolute value over those same points" in protocol
     # Roadmap-touching roles learn the ledger semantics from the contract.
     spec = _norm(ROADMAP_SPEC)
     assert "Focus scoring" in spec
@@ -467,9 +478,9 @@ def test_expectation_gate_carries_the_regression_budget():
     # The budget is owner-declared, never assumed, and defaults strict.
     assert "optimize.max_regression_pct" in gate
     assert "regression_bar" in gate
-    assert "owner-declared; never assume one" in gate
+    assert "optimize.max_regression_pct when task.yaml sets it, else noise_floor_pct" in gate
     # Used budgets must be surfaced, not buried in the mean.
-    assert "name the point, regression and budget" in gate
+    assert "name the point, signed regression and budget" in gate
     reporter = _norm(REPORTER_SYSTEM_PROMPT)
     assert "used regression budget, affected point and signed regression" in reporter
     assert "here and in the per-point table" in reporter
@@ -504,13 +515,14 @@ def test_measuring_roles_carry_the_measurement_protocol():
     assert "output_throughput" in protocol
     # Curve mode: one run per point over one server launch, per-point
     # result dirs, and the worked Pareto example.
-    assert "one run per `benchmark.concurrency` point" in protocol
-    assert "concurrency_<c>" in protocol
-    assert "Curve worked example" in protocol
-    assert "mean = +3.24%" in protocol
+    assert "Curve example" in protocol
+    assert "mean +3.24%" in protocol
     for role in ("benchmarker", "evaluator", "integrator", "qa"):
-        assert "Measurement protocol" in _ALL_PROMPTS[role], role
-        assert "one run per `benchmark.concurrency` point" in _norm(_ALL_PROMPTS[role]), role
+        assert MEASUREMENT_PROTOCOL in _ALL_PROMPTS[role], role
+        prompt = _norm(_ALL_PROMPTS[role])
+        assert "One run per concurrency point" in prompt, role
+        assert "launch one server and measure every configured" in prompt, role
+        assert "concurrency_<c>" in prompt, role
 
 
 def test_measuring_roles_carry_the_derived_metrics_reference():
@@ -527,9 +539,8 @@ def test_measuring_roles_carry_the_derived_metrics_reference():
 def test_server_roles_carry_the_tuning_config_supersede_note():
     note = _norm(TUNING_CONFIG_NOTE)
     assert "supersedes" in note
-    assert "**always** passes" in note
-    assert "turn instructions name the exact **active tuning config**" in note
-    assert "supersedes shorthand references" in note
+    assert "The turn's **active tuning config** path supersedes" in note
+    assert "Always serve with that exact path, including when its content is `{}`" in note
     assert "<workspace>/tuning/extra_llm_api_options.yaml" not in note
     for role in ("benchmarker", "profiler", "optimizer", "evaluator", "integrator", "qa"):
         assert "The active tuning config" in _ALL_PROMPTS[role], role
@@ -575,8 +586,10 @@ def test_all_launchers_verify_checkout_in_the_actual_runtime_environment():
         prompt = _ALL_PROMPTS[role]
         assert prompt.count(RUNTIME_CHECKOUT) == 1, role
         assert "tensorrt_llm.__file__" in prompt, role
-        assert "do not benchmark" in prompt, role
-        assert "allocated container using its staged checkout path" in _norm(prompt), role
+        assert "stop and record a blocker without benchmarking or claiming the change ran" in _norm(
+            prompt
+        ), role
+        assert "verify the staged path inside the allocated container" in _norm(prompt), role
 
 
 def test_integrator_has_a_complete_measured_acceptance_contract():
@@ -622,11 +635,11 @@ def test_parallel_slurm_and_disagg_prompts_require_distinct_node_allocations():
         prompt = _norm(getattr(slurm, role))
         assert "exclusive Slurm node allocation" in prompt
         assert "--exclusive" in prompt
-        assert "never attach to or reuse a sibling item's allocation" in prompt
+        assert "never reuse a sibling item's allocation" in prompt
         prompt = _norm(getattr(disagg, role))
         assert "`--exclusive`" in prompt
         assert "run-local copy's `slurm.extra_args`" in prompt
-        assert "keep the original harness config read-only" in prompt
+        assert "Keep the original harness config read-only" in prompt
         assert "integrator combines candidates only in its isolated integration config" in prompt
 
 
@@ -655,7 +668,10 @@ def test_reporter_reports_expected_vs_measured_and_future_work():
     assert "Expected gain | Measured gain and reference | Model consequence" in prompt
     assert "next actions by modeled excess or uncertainty resolved" in prompt
     assert "independent final metrics" in prompt
-    assert "This supplies the headline" in prompt
+    assert (
+        "independent final metrics, sanity and configured accuracy results for the headline"
+        in prompt
+    )
     assert "verification_report.md" in prompt
     assert "sanity/accuracy outcomes" in prompt
     assert "optimization_report.html" in prompt
@@ -879,14 +895,14 @@ def test_projector_prompt_targets_the_optimize_pipeline():
     # Guidance addresses this workflow's consumers — the Analyzer owns
     # the roadmap, while capture details belong to the profiler.
     assert "Analyzer" in prompt
-    assert "Analyzer later corrects these assumptions in performance_model.yaml" in prompt
+    assert "Analyzer later revises `performance_model.yaml`" in prompt
     assert "current model for gap accounting and convergence" in prompt
     assert "Profiler" not in prompt
     # Later stages' files are off-limits.
     assert "do not edit them or the inputs" in prompt
     # Curve mode: the ceiling is derived per configured point.
     assert "at every configured concurrency" in prompt
-    assert "Cover every configured point in ascending order" in prompt
+    assert "Cover all configured points in ascending order" in prompt
 
 
 def test_sol_analyzer_context_is_context_not_evidence() -> None:
@@ -949,9 +965,9 @@ def test_sol_optimizer_context_aims_at_current_model_without_scope_creep():
     assert "current `performance_model.yaml` and `analysis.md`" in block
     assert "`sol_projection.md` is initial provenance only" in block
     assert "current model's binding resource, operating point and exposed excess" in block
-    assert "a model never expands the item" in block
-    assert "Unclaimed headroom is the Analyzer's to plan" in block
-    assert "current measured evidence takes precedence over an older prediction" in block
+    assert "choose among variants allowed by `how_to_apply`" in block
+    assert "Stay within the roadmap item; leave new headroom for the Analyzer to plan" in block
+    assert "Current measured evidence takes precedence over older predictions" in block
     assert "Model alignment:" in block
     assert "current model_id/component, predicted effect on the scored metric" in block
     assert "Retain actual contrary evidence" in block
@@ -959,7 +975,7 @@ def test_sol_optimizer_context_aims_at_current_model_without_scope_creep():
     assert "without inventing a ceiling or declaring convergence" in block
     assert "SOL alignment:" not in block
     assert "bound the projection names" not in block
-    assert "Do not infer an end-to-end gain from a raw kernel-time share" in block
+    assert "Do not infer end-to-end gain from a raw kernel-time share" in block
 
 
 def test_sol_reporter_guidance_carries_remaining_gap_accountability():
@@ -1132,7 +1148,10 @@ def test_approach_restriction_note_only_built_for_real_restrictions():
     assert "tuning/extra_llm_api_options.yaml" in code_only
     assert "auto-rejects the attempt without any evaluation" in code_only
     # ... including the defaults-in-source loophole.
-    assert "the same violation in disguise" in code_only
+    assert (
+        "Implementing a config knob through source edits to a default or env-var fallback "
+        "is also prohibited" in code_only
+    )
     config_only = _norm(approach_restriction_note(("config",)))
     assert "git status --porcelain" in config_only
     assert "read-only for every role" in config_only
@@ -1712,10 +1731,10 @@ def test_analyzer_omits_other_roles_implementation_and_verdict_instructions() ->
     assert "**Evaluator**" not in prompt
     assert "Allowed roadmap approaches: `code`" in prompt
     assert "`config` is off-limits" in prompt
-    assert "what you searched" in prompt
+    assert "record the search" in prompt
     assert "how_to_apply" in prompt
     assert "Never apply optimizations" in prompt
-    assert "Curve worked example" not in prompt
+    assert "Curve example" not in prompt
 
 
 def test_analyzer_replan_preserves_measurements_and_history() -> None:
@@ -1794,14 +1813,17 @@ def test_sol_calibration_is_owned_by_profiler_and_snapshotted() -> None:
 def test_analyzer_can_reanalyze_saved_captures_without_runtime_access() -> None:
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     assert "**re-analysis of existing captures**" in prompt
-    assert "No new capture is required" in prompt
+    assert (
+        "Never apply optimizations or launch servers, benchmark workloads, profiler captures"
+        in prompt
+    )
     assert "verify capture provenance and availability" in prompt
     assert "nsys export --type sqlite" in prompt
     assert "nsys stats --report" in prompt
     assert "ncu --import <profile_dir>/server_ncu.ncu-rep" in prompt
     assert "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite" in prompt
     assert "taxonomy before quoting a single category number" in prompt
-    assert "Never run a workload to fill a missing file" in prompt
+    assert "Never run a workload to fill missing evidence" in prompt
     assert "Additional capture requested:" in prompt
     assert "without a runtime probe" in prompt
     assert "runtime.import_path" in prompt
@@ -1921,8 +1943,8 @@ def test_projector_records_initial_model_without_freezing_future_analysis():
     prompt = _norm(PROJECTOR_SYSTEM_PROMPT)
     assert "conditional on" in prompt
     assert "current model for gap accounting and convergence" in prompt
-    assert "Analyzer later corrects these assumptions" in prompt
-    assert "sol_projection.md remains initial provenance" in prompt
+    assert "Analyzer later revises `performance_model.yaml`" in prompt
+    assert "`sol_projection.md` remains initial provenance" in prompt
     assert "ceiling stays valid for every later round" not in prompt
 
 

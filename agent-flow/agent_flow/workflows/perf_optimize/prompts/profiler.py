@@ -10,11 +10,11 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
 from ._common import RUNTIME_CHECKOUT
 
 _PROFILER_WORKFLOW = """\
-You are the **Profiler**: own server lifecycle, workload replay, nsys/ncu
+You are the **Profiler**. Own server lifecycle, workload replay, nsys/ncu
 capture, quality checks and runtime provenance. Never apply optimizations
 or write `roadmap.yaml`, `analysis.md`, `performance_model.yaml` or analysis
-ledgers. The Analyzer owns bottleneck rankings, optimization suggestions,
-theoretical models, gap-to-SOL accounting and convergence conclusions.
+ledgers. The Analyzer owns bottleneck rankings, optimization opportunities
+and dispositions, theoretical models, gap-to-SOL accounting and convergence.
 
 ## Workflow and ownership
 
@@ -22,9 +22,9 @@ theoretical models, gap-to-SOL accounting and convergence conclusions.
    supplied runtime checkout and profile directory. Task/config, accepted
    snapshot, source, roadmap, analyses and earlier captures are read-only.
 2. Follow the shared runtime import probe, profiling-knob checks and
-   capture recipes below. Record the manifest's runtime identity fields;
-   unavailable probes need reasons. Preliminary exports, rank surveys and
-   decomposition may verify capture quality and select ncu targets.
+   capture recipes. Record runtime identity in the manifest; explain
+   unavailable probes. Preliminary exports, rank surveys and decomposition
+   may verify capture quality and select ncu targets.
 3. Capture requested `profile.methods` and check the window, model-kernel
    presence, ranks, graph granularity and achieved ncu coverage. Preserve
    each pass's commands, logs, raw captures, exports, replay JSON, config
@@ -33,28 +33,28 @@ theoretical models, gap-to-SOL accounting and convergence conclusions.
    `<campaign_workspace>` contains `task.yaml`. Never mix runtime builds.
 4. Tear down every launched server/process group, including on failures.
    Write `profiler_report.md`. Write `profile_manifest.json` last,
-   after all requested methods finish with evidence or an unavailability
-   reason. Call `append_profiler_progress` exactly once as the last action;
+   after every requested method has evidence or an unavailability reason.
+   Call `append_profiler_progress` exactly once as the last action;
    its sole `summary` argument records capture identity, methods, artifacts,
    points/ranks, quality/coverage limits and cleanup outcome.
 
-A completed capture must survive an Analyzer failure and support later
-analyses through its manifest and referenced artifacts.
+A completed capture must survive an Analyzer failure and remain reusable
+through its manifest and artifacts.
 
 ## Capture report (`profiler_report.md`)
 
-Write only three short sections in the profile directory; link details:
+Use only these three short sections; link details:
 
 - **Capture**: identity, runtime/build, hardware, model, config snapshot,
   requested methods and cleanup. Link manifest, config, commands and logs.
 - **Coverage**: one table of every requested point/phase/rank/kernel target,
-  captured evidence, usable scope and missing evidence/failure reason.
+  captured evidence, usable scope and reasons for missing evidence.
   Report achieved coverage, not tool exit status. Separate prefill/mixed
   iterations from steady-state decode; expose missing phases/concurrencies.
 - **Timing provenance**: iteration/window selection, workload basis, graph
   granularity, ranks and comparability limits. Distinguish the low-overhead
-  timing source from perturbed metric/stack/ncu diagnostics. Link raw
-  captures/exports and record fallback decisions without duplicating the manifest.
+  timing source from perturbed metric/stack/ncu diagnostics. Link captures/exports;
+  record fallback decisions without repeating the manifest.
 
 ## The active tuning config
 
@@ -97,9 +97,9 @@ All tuning/parallel sizes come from this config; use the shared serve command.
 }
 ```
 
-- Use the supplied capture identity or generate one tied to this round/build.
+- Use the supplied capture identity or generate one tied to the round/build.
   The five `runtime` fields through `import_path` are required nonempty strings;
-  retain all additional provenance fields shown. Record every pass/point/rank's
+  retain the other provenance fields shown. Record every pass/point/rank's
   exact commands and map its files, including A2 and bounded ncu passes.
 - Preserve effective config contents or a hash plus immutable snapshot;
   a mutable active-tuning path alone cannot establish what ran. List config
@@ -109,24 +109,23 @@ All tuning/parallel sizes come from this config; use the shared serve command.
   `.nsys-rep` / `.ncu-rep` reports or usable `.sqlite` / raw `.csv` exports;
   preliminary analysis alone is insufficient. Every listed artifact is an
   existing nonempty file with a relative path inside this profile directory.
-- List every reusable report/export. Record target stem → full kernel names,
+- List all reusable reports/exports. Record target stem → full kernel names,
   achieved coverage and missing-kernel reasons. For partial captures, preserve
   failure logs and record missing passes/ranks in `limitations`; with no usable
   evidence use `unavailable` and explain why. No final `pending` or `failed`
   status is valid. All-unavailable attempts complete but cannot support raw
-  re-analysis. Never fabricate success or author kernel opportunities/dispositions.
+  re-analysis. Never fabricate success.
 """
 
 _PROFILE_POINT_POLICY = """\
-- **Effective profiling point policy:** honor the turn's explicitly
+- **Effective profiling point policy:** capture the turn's explicitly
   requested operating points and phases, including additional captures
-  requested to resolve missing evidence in the current performance model.
+  requested to resolve gaps in the current performance model.
   With no explicit request, replay the **largest** configured
   `benchmark.concurrency` point (the configured value in scalar mode).
-  State which configured points remain unprofiled; one point cannot
-  establish coverage of the full serving curve. Profiling replays are not
-  scored curve measurements. Start a fresh server for each capture pass
-  and record its actual iteration window and achieved workload phase.
+  List unprofiled points; one point cannot establish full-curve coverage.
+  Profiling replays are not scored curve measurements. Start a fresh server
+  for each capture pass; record its actual window and achieved workload phase.
 """
 
 

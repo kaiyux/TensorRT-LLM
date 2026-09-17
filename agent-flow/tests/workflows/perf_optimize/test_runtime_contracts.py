@@ -120,7 +120,7 @@ def test_item_prompts_coordinate_only_shared_parallel_runtime(
                 assert "tear down and wait for all owned server/profiler process groups" in prompt
                 assert "before the script exits and releases the lock" in prompt
                 assert "never unlink" in prompt
-                assert "never kill or benchmark that sibling's server" in prompt
+                assert "never kill or benchmark a sibling's server" in prompt
 
 
 @pytest.mark.parametrize("execution", ["serial", "parallel"])

@@ -2569,7 +2569,8 @@ def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
         assert "nsys export --type sqlite" in prompt
         assert f"{profile_dir}/nsys_analysis" in prompt
         # The point of it: the mechanism check rests on a measured budget.
-        assert "rather than an eyeballed one" in prompt
+        assert "`run_all.py` single-variant" in prompt
+        assert "state whether the item's claimed mechanism is visible in the trace" in prompt
     finally:
         workflow.close()
 
@@ -2600,11 +2601,11 @@ def test_run_evaluator_marks_the_final_attempt(tmp_path, fake_git):
         )
         state = _evaluator_state(ws)
         workflow._run_evaluator(state)
-        assert "final attempt" not in recorder.messages[0]
+        assert "final attempt" not in recorder.messages[0].lower()
         state.attempt_index = 2  # attempt 3 of the default 3
         workflow._run_evaluator(state)
-        assert "final attempt" in recorder.messages[1]
-        assert "PUSH_BACK is not available" in recorder.messages[1]
+        assert "final attempt" in recorder.messages[1].lower()
+        assert "PUSH_BACK is treated as REJECT; decide APPROVE or REJECT" in recorder.messages[1]
     finally:
         workflow.close()
 
@@ -2649,8 +2650,8 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(
         # isolated from the campaign state, so the standing analysis still
         # describes the runtime.
         assert "isolated worktree" in message
-        assert "campaign checkout and accepted tuning config remain unchanged" in message
-        assert "runtime is still the state" in message
+        assert "The campaign checkout and accepted config are unchanged" in message
+        assert "still describes the runtime" in message
         assert "byte-identical" not in message
         # The three spends the round exists to avoid.
         assert "Do **not** launch `trtllm-serve`" in message
@@ -2660,12 +2661,12 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(
         assert str(ws / "rounds" / "round_1" / "analysis") in message
         assert 'read_latest_progress` with `agent: "evaluator"' in message
         # A plateau is a legitimate outcome; padding the roadmap is not.
-        assert "leave the roadmap with no actionable pending item" in message
+        assert "leave no actionable pending item" in message
         assert "Do not invent items to keep the loop alive" in message
         assert "A performance shortfall alone does not bound" in message
         if sol_enabled:
             assert "unexplained" in message
-            assert "links to existing explanations and next tests" in message
+            assert "Link explanations and next tests" in message
     finally:
         workflow.close()
 
@@ -3303,7 +3304,7 @@ def test_driving_prompts_reinforce_casebook_for_serving_analysis_roles(tmp_path)
     captured = _capture_driving_prompts(tmp_path)
     for role in ("benchmarker", "analyzer", "optimizer"):
         assert "perf-optimization-casebook" in captured[role], role
-        assert "`Skill` tool" in captured[role], role
+        assert "via `Skill`" in captured[role], role
 
 
 def test_optimizer_prompt_names_item_branch_and_attempt_dir(tmp_path):
@@ -3347,13 +3348,14 @@ def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
 
 def test_qa_prompt_conditions_accuracy_on_task_block(tmp_path):
     without = _capture_driving_prompts(tmp_path)["qa"]
-    assert "**no** `accuracy` block" in without
+    assert "No `accuracy` block: skip accuracy testing" in without
     assert "not configured" in without
 
     with_accuracy = _capture_driving_prompts(
         tmp_path, {"accuracy": {"command": "trtllm-eval ...", "baseline_score": 0.6}}
     )["qa"]
-    assert "**has** an `accuracy` block" in with_accuracy
+    assert "Run `task.yaml`'s `accuracy.command` verbatim against the live server" in with_accuracy
+    assert "compare it to `baseline_score` / `max_drop_pct`" in with_accuracy
 
 
 _FOCUS_EXTRA = {
@@ -3414,7 +3416,7 @@ def test_curve_prompts_without_focus_score_all_points(tmp_path):
 def test_optimizer_prompt_does_not_treat_parallel_siblings_as_earlier_verdicts(tmp_path):
     # First item of round 1: no earlier verdicts exist — no pointer.
     first = _capture_driving_prompts(tmp_path)["optimizer"]
-    assert "Earlier items' verdicts" not in first
+    assert "Read completed items' `evaluation.md` files" not in first
 
     # Parallel siblings run from one frozen base, so a sibling's verdict
     # cannot be assumed to exist when this prompt is authored.
@@ -3442,7 +3444,7 @@ def test_optimizer_prompt_does_not_treat_parallel_siblings_as_earlier_verdicts(t
         workflow.optimizer = original
         workflow.close()
     prompt = captured["optimizer"]
-    assert "Earlier items' verdicts" not in prompt
+    assert "Read completed items' `evaluation.md` files" not in prompt
 
     # Serial items really are ordered. A later item in the same round can
     # and should consume the completed predecessors' failure evidence.
@@ -3453,7 +3455,7 @@ def test_optimizer_prompt_does_not_treat_parallel_siblings_as_earlier_verdicts(t
         workflow._run_optimizer(state)
     finally:
         workflow.close()
-    assert "Earlier items' verdicts" in captured["optimizer"]
+    assert "Read completed items' `evaluation.md` files" in captured["optimizer"]
 
 
 def test_reporter_prompt_points_at_base_commit_and_inputs(tmp_path):
@@ -3484,8 +3486,9 @@ def test_projector_prompt_drives_the_sol_skill_over_optimize_artifacts(tmp_path)
     # no trace of the removed dlsim cross-check.
     assert "config.json" in prompt
     assert "dlsim" not in prompt
-    # Placement context: once per campaign, for the analyzer/reporter.
-    assert "once per campaign" in prompt
+    # Placement context: initial campaign projection, completed in this turn.
+    assert "campaign's initial SOL projection for roadmap ranking and reporting" in prompt
+    assert "Complete this turn by writing `sol_projection.md`" in prompt
     # The machine-readable peaks file is persisted for the analyzer's
     # per-round correlation.
     assert "sol_work/peaks.json" in prompt
@@ -3533,14 +3536,16 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     # An exhausted roadmap owes the remaining-gap attribution.
     assert "**Gap analysis**" in analyzer
     assert "marked unexplained" in analyzer
-    assert "Keep it brief and link to the comparison's explanations and next tests" in analyzer
+    assert "Link explanations and next tests" in analyzer
     optimizer = with_sol["optimizer"]
     assert "sol_projection.md" in optimizer
-    # Context, not spec: aim at the binding ceiling, never grow the item.
+    # Choose scoped variants using the current model and measured evidence.
     assert "context, not spec" in optimizer
-    assert "binding ceiling" in optimizer
+    assert "Use the current `performance_model.yaml` and measured evidence" in optimizer
+    assert "The item's `how_to_apply` governs scope" in optimizer
     assert "never expands the item" in optimizer
-    assert "SOL alignment:" in optimizer
+    assert "Model alignment:" in optimizer
+    assert "SOL alignment:" not in optimizer
     reporter = with_sol["reporter"]
     assert "sol_projection.md" in reporter
     # The section slots between Final Verification and the diff summary,

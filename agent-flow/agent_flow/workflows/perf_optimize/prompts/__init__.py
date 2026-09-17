@@ -221,13 +221,12 @@ def build_perf_optimize_prompts(
             + """
 ## Parallel campaign allocation isolation
 
-Each concurrent item must submit its own exclusive Slurm node allocation
-(use `--exclusive`) and stage files in its own job directory. The fixed
-port 8000 and GPU measurements require node isolation: never attach to or
-reuse a sibling item's allocation. Reuse your own allocation for your
-related smoke check, benchmark and capture work where possible. The
-integration stage receives a separate allocation after candidate workers
-finish. Honor the configured SSH boundary for every allocation.
+Each concurrent item needs its own exclusive Slurm node allocation
+(`--exclusive`) and job directory. Port 8000 and GPU measurements require
+node isolation: never reuse a sibling item's allocation. Reuse your own
+allocation for smoke checks, benchmarks and captures where possible.
+Integration gets a separate allocation after candidate workers finish.
+Honor the configured SSH boundary for every allocation.
 """
         )
         bundle = bundle.with_extensions(
